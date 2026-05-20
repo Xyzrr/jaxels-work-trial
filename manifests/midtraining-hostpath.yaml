@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: midtraining
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: midtraining-dev
+  namespace: midtraining
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gpu-dp-nwfln-6w5tz
+  containers:
+    - name: trainer
+      image: nvidia/cuda:12.8.0-base-ubuntu22.04
+      imagePullPolicy: IfNotPresent
+      command: ["bash", "-lc", "sleep infinity"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      env:
+        - name: HF_HOME
+          value: /workspace/.cache/huggingface
+        - name: TORCH_HOME
+          value: /workspace/.cache/torch
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      hostPath:
+        path: /home/johnkey/midtraining
+        type: DirectoryOrCreate

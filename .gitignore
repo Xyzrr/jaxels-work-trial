@@ -17,6 +17,9 @@ Thumbs.db
 *.p12
 credentials.json
 service-account*.json
+john-key
+john-key.pub
+kubeconfig.yaml
 
 # Python
 __pycache__/
@@ -125,4 +128,3 @@ slurm-*.err
 *.pid
 *.rank*
 *.hostfile
-
