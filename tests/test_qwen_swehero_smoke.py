@@ -66,6 +66,28 @@ class QwenSweHeroSmokeTests(unittest.TestCase):
         self.assertEqual(config.rope_scaling["type"], "yarn")
         self.assertEqual(config.rope_parameters["factor"], 4.0)
 
+    def test_yarn_config_accepts_explicit_context_length(self):
+        class Config:
+            rope_theta = 1_000_000.0
+            max_position_embeddings = smoke.QWEN_NATIVE_CONTEXT_LENGTH
+
+        config = Config()
+        smoke.maybe_enable_yarn(config, max_length=65_536)
+
+        self.assertEqual(config.rope_parameters["factor"], 2.0)
+        self.assertEqual(config.rope_scaling["factor"], 2.0)
+
+    def test_cosine_scheduler_accepts_explicit_lr_floor(self):
+        lr_lambda = smoke.build_cosine_with_min_lr_lambda(
+            4,
+            learning_rate=2.0,
+            min_learning_rate=1.0,
+            warmup_ratio=0.0,
+        )
+
+        self.assertEqual(lr_lambda(0), 1.0)
+        self.assertAlmostEqual(lr_lambda(4), 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

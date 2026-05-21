@@ -184,11 +184,17 @@ def effective_batch_config() -> dict[str, int]:
     }
 
 
-def build_cosine_with_min_lr_lambda(total_steps: int):
-    min_lr_ratio = MIN_LEARNING_RATE / LEARNING_RATE
+def build_cosine_with_min_lr_lambda(
+    total_steps: int,
+    *,
+    learning_rate: float = LEARNING_RATE,
+    min_learning_rate: float = MIN_LEARNING_RATE,
+    warmup_ratio: float = WARMUP_RATIO,
+):
+    min_lr_ratio = min_learning_rate / learning_rate
     warmup_steps = (
-        max(1, math.ceil(total_steps * WARMUP_RATIO))
-        if WARMUP_RATIO > 0 and total_steps > 1
+        max(1, math.ceil(total_steps * warmup_ratio))
+        if warmup_ratio > 0 and total_steps > 1
         else 0
     )
 
@@ -206,11 +212,16 @@ def build_cosine_with_min_lr_lambda(total_steps: int):
     return lr_lambda
 
 
-def maybe_enable_yarn(config: Any) -> None:
-    if not ENABLE_YARN or MAX_LENGTH <= QWEN_NATIVE_CONTEXT_LENGTH:
+def maybe_enable_yarn(
+    config: Any,
+    *,
+    max_length: int = MAX_LENGTH,
+    enable_yarn: bool = ENABLE_YARN,
+) -> None:
+    if not enable_yarn or max_length <= QWEN_NATIVE_CONTEXT_LENGTH:
         return
 
-    yarn_factor = MAX_LENGTH / QWEN_NATIVE_CONTEXT_LENGTH
+    yarn_factor = max_length / QWEN_NATIVE_CONTEXT_LENGTH
     rope_theta = getattr(config, "rope_theta", None)
     if rope_theta is None:
         rope_theta = getattr(config, "rope_scaling", {}).get("rope_theta", 1_000_000.0)
@@ -227,7 +238,7 @@ def maybe_enable_yarn(config: Any) -> None:
         "rope_theta": rope_theta,
         "rope_type": "yarn",
     }
-    config.max_position_embeddings = max(MAX_LENGTH, PAPER_CONTEXT_LENGTH)
+    config.max_position_embeddings = max(max_length, PAPER_CONTEXT_LENGTH)
 
 
 def main() -> None:
