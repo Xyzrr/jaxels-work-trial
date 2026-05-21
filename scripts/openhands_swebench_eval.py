@@ -171,13 +171,18 @@ def build_openhands_config(args: argparse.Namespace) -> str:
         f"api_key = {_toml_string(args.api_key)}",
         f"temperature = {args.temperature}",
         f"top_p = {args.top_p}",
-        f"top_k = {args.top_k}",
-        f"max_input_tokens = {args.max_input_tokens}",
-        f"timeout = {args.timeout}",
-        f"drop_params = {_toml_bool(args.drop_params)}",
-        f"disable_vision = {_toml_bool(args.disable_vision)}",
-        f"native_tool_calling = {_toml_bool(args.native_tool_calling)}",
     ]
+    if args.send_top_k_param:
+        config_lines.append(f"top_k = {args.top_k}")
+    config_lines.extend(
+        [
+            f"max_input_tokens = {args.max_input_tokens}",
+            f"timeout = {args.timeout}",
+            f"drop_params = {_toml_bool(args.drop_params)}",
+            f"disable_vision = {_toml_bool(args.disable_vision)}",
+            f"native_tool_calling = {_toml_bool(args.native_tool_calling)}",
+        ]
+    )
     if args.custom_llm_provider:
         config_lines.append(
             f"custom_llm_provider = {_toml_string(args.custom_llm_provider)}"
@@ -341,6 +346,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "api_key_source": args.api_key_source,
             "custom_llm_provider": args.custom_llm_provider,
             "native_tool_calling": args.native_tool_calling,
+            "send_top_k_param": args.send_top_k_param,
         },
         "dataset": {
             "name": args.dataset,
@@ -499,12 +505,15 @@ def summarize_report(report_path: Path) -> dict[str, Any]:
     resolved_ids = report.get("resolved_ids") or []
     unresolved_ids = report.get("unresolved_ids") or []
     error_ids = report.get("error_ids") or []
-    total = report.get("total_instances")
+    resolved = report.get("resolved_instances")
+    if resolved is None:
+        resolved = len(resolved_ids)
+    total = report.get("submitted_instances", report.get("total_instances"))
     if total is None:
         total = len(set(resolved_ids) | set(unresolved_ids) | set(error_ids))
-    pass_at_1 = None if not total else len(resolved_ids) / total
+    pass_at_1 = None if not total else resolved / total
     return {
-        "resolved": len(resolved_ids),
+        "resolved": resolved,
         "total": total,
         "pass_at_1": pass_at_1,
         "report_path": str(report_path),
@@ -599,6 +608,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env_float("TOP_P", PAPER_TOP_P),
     )
     parser.add_argument("--top-k", type=int, default=_env_int("TOP_K", PAPER_TOP_K))
+    parser.add_argument(
+        "--send-top-k-param",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("SEND_TOP_K_PARAM", True),
+        help=(
+            "Send top_k through OpenHands/LiteLLM. Disable for local "
+            "OpenAI-compatible servers that reject OpenHands' float-cast top_k."
+        ),
+    )
     parser.add_argument(
         "--max-input-tokens",
         type=int,

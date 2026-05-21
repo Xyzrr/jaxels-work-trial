@@ -70,6 +70,14 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("enable_llm_editor = false", config)
         self.assertNotIn("custom_llm_provider", config)
 
+    def test_generated_config_can_omit_client_top_k_for_strict_local_servers(self):
+        args = self._args("--no-send-top-k-param")
+        config = eval_script.build_openhands_config(args)
+
+        self.assertIn("temperature = 0.7", config)
+        self.assertIn("top_p = 0.8", config)
+        self.assertNotIn("top_k =", config)
+
     def test_write_scaffold_records_commands_without_leaking_real_api_key(self):
         args = self._args("--api-key", "sk-real-secret")
         paths, commands = eval_script.write_scaffold(args)
@@ -79,6 +87,7 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("sk-real-secret", paths.config_path.read_text())
         metadata = json.loads(paths.metadata_path.read_text())
         self.assertEqual(metadata["commands"]["serve_vllm"][8], "<redacted>")
+        self.assertTrue(metadata["model"]["send_top_k_param"])
         self.assertNotIn("sk-real-secret", paths.metadata_path.read_text())
         self.assertIn("--dataset", commands.run_infer)
         self.assertIn("princeton-nlp/SWE-bench_Verified", commands.run_infer)
@@ -104,6 +113,25 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(summary["resolved"], 2)
         self.assertEqual(summary["total"], 3)
         self.assertAlmostEqual(summary["pass_at_1"], 2 / 3)
+
+    def test_summarize_report_uses_submitted_instances_for_limited_runs(self):
+        report_path = Path(self.tempdir.name) / "report.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "total_instances": 500,
+                    "submitted_instances": 1,
+                    "resolved_instances": 0,
+                    "empty_patch_instances": 1,
+                }
+            )
+        )
+
+        summary = eval_script.summarize_report(report_path)
+
+        self.assertEqual(summary["resolved"], 0)
+        self.assertEqual(summary["total"], 1)
+        self.assertEqual(summary["pass_at_1"], 0)
 
 
 if __name__ == "__main__":
