@@ -1,32 +1,65 @@
-"""Run a tiny Qwen Coder smoke-training job on SWE-Hero trajectories.
+"""Run a paper-aligned Qwen Coder smoke-training job on SWE-HERO traces.
 
-The defaults mirror the GPU-pod smoke run used for the prototype:
+This intentionally keeps four prototype constraints:
 
-    MODEL_ID=Qwen/Qwen2.5-Coder-7B-Instruct
-    DATASET_ID=nvidia/SWE-Hero-openhands-trajectories
-    MAX_LENGTH=512 NUM_EXAMPLES=2 MAX_STEPS=3
+* the 7B Qwen2.5-Coder-Instruct model only;
+* a tiny streamed subset of ``nvidia/SWE-Hero-openhands-trajectories``;
+* no SWE-ZERO warm-start stage;
+* no SWE-bench evaluation.
 
-All core settings can be overridden with environment variables so this same
-script can be reused for slightly larger smoke tests without editing it.
+Within those limits, defaults follow the paper where practical: three training
+epochs, effective global batch size 32, cosine LR from 1e-5 toward 1e-8 with a
+0.1 warmup ratio, and assistant/action-only loss masking that excludes tool
+observations. The paper uses a 128k context; the default here uses Qwen's native
+32k context as a one-GPU smoke cap. Set ``MAX_LENGTH=131072`` to exercise the
+paper context length; YaRN is enabled automatically above 32k.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
-
-import torch
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from typing import Any
 
 
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-Coder-7B-Instruct")
 DATASET_ID = os.environ.get("DATASET_ID", "nvidia/SWE-Hero-openhands-trajectories")
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/workspace/qwen25-coder7b-swehero-smoke"))
-MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "512"))
+PAPER_CONTEXT_LENGTH = 131_072
+QWEN_NATIVE_CONTEXT_LENGTH = 32_768
+MAX_LENGTH = int(os.environ.get("MAX_LENGTH", str(QWEN_NATIVE_CONTEXT_LENGTH)))
 NUM_EXAMPLES = int(os.environ.get("NUM_EXAMPLES", "2"))
-MAX_STEPS = int(os.environ.get("MAX_STEPS", "3"))
+MAX_STREAMED_EXAMPLES = int(os.environ.get("MAX_STREAMED_EXAMPLES", "200"))
+NUM_TRAIN_EPOCHS = float(os.environ.get("NUM_TRAIN_EPOCHS", "3"))
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "0"))
+GLOBAL_BATCH_SIZE = int(os.environ.get("GLOBAL_BATCH_SIZE", "32"))
+PER_DEVICE_TRAIN_BATCH_SIZE = int(os.environ.get("PER_DEVICE_TRAIN_BATCH_SIZE", "1"))
+WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+GRADIENT_ACCUMULATION_STEPS = int(
+    os.environ.get(
+        "GRADIENT_ACCUMULATION_STEPS",
+        str(
+            max(
+                1,
+                math.ceil(
+                    GLOBAL_BATCH_SIZE / (PER_DEVICE_TRAIN_BATCH_SIZE * WORLD_SIZE)
+                ),
+            )
+        ),
+    )
+)
+LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "1e-5"))
+MIN_LEARNING_RATE = float(os.environ.get("MIN_LEARNING_RATE", "1e-8"))
+WARMUP_RATIO = float(os.environ.get("WARMUP_RATIO", "0.1"))
+MIN_TRAINABLE_TOKENS = int(os.environ.get("MIN_TRAINABLE_TOKENS", "1"))
+INCLUDE_MODEL_PATCH = os.environ.get("INCLUDE_MODEL_PATCH", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+ENABLE_YARN = os.environ.get("ENABLE_YARN", "1").lower() in {"1", "true", "yes"}
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "jaxels")
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "jaxels-midtraining")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", "qwen25-coder7b-swehero-smoke")
@@ -46,32 +79,156 @@ def load_env_file(path: str = ENV_FILE) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-def stringify_turn(turn: object) -> str:
-    if isinstance(turn, dict):
-        role = turn.get("role", "unknown")
-        content = turn.get("content", "")
-        if not isinstance(content, str):
-            content = json.dumps(content, ensure_ascii=False)
-        return f"<|{role}|>\n{content}"
-
-    return json.dumps(turn, ensure_ascii=False)
+def _stringify(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
-def format_example(example: dict[str, object]) -> str:
-    parts = []
+def turn_segments(turn: object) -> list[tuple[str, bool]]:
+    """Serialize one OpenHands turn into ``(text, is_trainable)`` segments.
+
+    Only assistant content and assistant tool calls are trainable. System/user
+    prompts and tool observations stay in the context but are masked out of the
+    loss, matching the paper's emphasis on learning action generation rather
+    than fitting execution outputs.
+    """
+
+    if not isinstance(turn, dict):
+        return [(json.dumps(turn, ensure_ascii=False) + "\n", False)]
+
+    role = _stringify(turn.get("role") or "unknown")
+    is_assistant = role == "assistant"
+    segments = [(f"<|{role}|>\n", False)]
+
+    content = _stringify(turn.get("content"))
+    if content:
+        segments.append((content.rstrip("\n") + "\n", is_assistant))
+
+    tool_calls = turn.get("tool_calls")
+    if tool_calls:
+        segments.append(("<|tool_calls|>\n", False))
+        segments.append((json.dumps(tool_calls, ensure_ascii=False) + "\n", is_assistant))
+
+    return segments
+
+
+def example_segments(
+    example: dict[str, object], *, include_model_patch: bool = INCLUDE_MODEL_PATCH
+) -> list[tuple[str, bool]]:
+    segments: list[tuple[str, bool]] = []
     trajectory = example.get("trajectory") or example.get("messages") or []
     if isinstance(trajectory, list):
-        parts.extend(stringify_turn(turn) for turn in trajectory)
+        for turn in trajectory:
+            segments.extend(turn_segments(turn))
     else:
-        parts.append(str(trajectory))
+        segments.append((_stringify(trajectory) + "\n", False))
 
     patch = example.get("model_patch")
-    if patch:
-        parts.append("<|final_patch|>\n" + str(patch))
-    return "\n\n".join(parts)
+    if include_model_patch and patch:
+        segments.append(("<|assistant_final_patch|>\n", False))
+        segments.append((_stringify(patch) + "\n", True))
+
+    return segments
+
+
+def encode_example(
+    tokenizer: Any,
+    example: dict[str, object],
+    *,
+    max_length: int = MAX_LENGTH,
+    include_model_patch: bool = INCLUDE_MODEL_PATCH,
+) -> dict[str, list[int]] | None:
+    input_ids: list[int] = []
+    labels: list[int] = []
+
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_token_id is not None:
+        input_ids.append(bos_token_id)
+        labels.append(-100)
+
+    for text, is_trainable in example_segments(
+        example, include_model_patch=include_model_patch
+    ):
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        input_ids.extend(token_ids)
+        labels.extend(token_ids if is_trainable else [-100] * len(token_ids))
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        input_ids.append(eos_token_id)
+        labels.append(eos_token_id if labels and labels[-1] != -100 else -100)
+
+    input_ids = input_ids[:max_length]
+    labels = labels[:max_length]
+
+    trainable_tokens = sum(label != -100 for label in labels)
+    if trainable_tokens < MIN_TRAINABLE_TOKENS:
+        return None
+
+    return {"input_ids": input_ids, "labels": labels}
+
+
+def effective_batch_config() -> dict[str, int]:
+    samples_per_optimizer_step = (
+        PER_DEVICE_TRAIN_BATCH_SIZE * WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS
+    )
+    return {
+        "global_batch_size": GLOBAL_BATCH_SIZE,
+        "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
+        "world_size": WORLD_SIZE,
+        "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+        "effective_global_batch_size": samples_per_optimizer_step,
+    }
+
+
+def build_cosine_with_min_lr_lambda(total_steps: int):
+    min_lr_ratio = MIN_LEARNING_RATE / LEARNING_RATE
+    warmup_steps = (
+        max(1, math.ceil(total_steps * WARMUP_RATIO))
+        if WARMUP_RATIO > 0 and total_steps > 1
+        else 0
+    )
+
+    def lr_lambda(current_step: int) -> float:
+        if total_steps <= 0:
+            return 1.0
+        if warmup_steps and current_step < warmup_steps:
+            return max(min_lr_ratio, (current_step + 1) / warmup_steps)
+
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, (current_step - warmup_steps) / decay_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return lr_lambda
+
+
+def maybe_enable_yarn(config: Any) -> None:
+    if not ENABLE_YARN or MAX_LENGTH <= QWEN_NATIVE_CONTEXT_LENGTH:
+        return
+
+    config.rope_scaling = {
+        "factor": MAX_LENGTH / QWEN_NATIVE_CONTEXT_LENGTH,
+        "original_max_position_embeddings": QWEN_NATIVE_CONTEXT_LENGTH,
+        "type": "yarn",
+    }
+    config.max_position_embeddings = max(MAX_LENGTH, PAPER_CONTEXT_LENGTH)
 
 
 def main() -> None:
+    import torch
+    from datasets import load_dataset
+    from transformers import (
+        AutoConfig,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        Trainer,
+        TrainingArguments,
+    )
+
     load_env_file()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -86,44 +243,77 @@ def main() -> None:
     print(f"model={MODEL_ID}")
     print(f"dataset={DATASET_ID}")
     print(f"wandb={'enabled' if use_wandb else 'disabled'}")
+    print(f"max_length={MAX_LENGTH}")
+    print(f"effective_batch={effective_batch_config()}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = max(MAX_LENGTH, PAPER_CONTEXT_LENGTH)
 
     raw = load_dataset(DATASET_ID, split="train", streaming=True)
-    texts = []
+    encoded_examples = []
+    streamed_examples = 0
     for example in raw:
-        text = format_example(example)
-        if len(text) > 200:
-            texts.append(text)
-        if len(texts) >= NUM_EXAMPLES:
+        streamed_examples += 1
+        encoded = encode_example(tokenizer, example)
+        if encoded is not None:
+            encoded_examples.append(encoded)
+        if len(encoded_examples) >= NUM_EXAMPLES:
+            break
+        if streamed_examples >= MAX_STREAMED_EXAMPLES:
             break
 
-    if not texts:
-        raise RuntimeError("No usable training examples found")
+    if not encoded_examples:
+        raise RuntimeError(
+            "No usable training examples found. Increase MAX_LENGTH or "
+            "MAX_STREAMED_EXAMPLES if assistant/action tokens were truncated."
+        )
 
-    tokenized = tokenizer(
-        texts,
-        truncation=True,
-        max_length=MAX_LENGTH,
-        padding="max_length",
-        return_tensors=None,
+    batch_config = effective_batch_config()
+    samples_per_optimizer_step = batch_config["effective_global_batch_size"]
+    items_per_epoch = max(
+        samples_per_optimizer_step,
+        math.ceil(len(encoded_examples) / samples_per_optimizer_step)
+        * samples_per_optimizer_step,
     )
-    tokenized["labels"] = [
-        [tok if mask else -100 for tok, mask in zip(ids, attention)]
-        for ids, attention in zip(tokenized["input_ids"], tokenized["attention_mask"])
-    ]
+    if MAX_STEPS > 0:
+        items_per_epoch = max(items_per_epoch, samples_per_optimizer_step * MAX_STEPS)
 
     class TinyDataset(torch.utils.data.Dataset):
         def __len__(self) -> int:
-            return len(tokenized["input_ids"])
+            return items_per_epoch
 
         def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-            return {key: torch.tensor(value[idx]) for key, value in tokenized.items()}
+            return encoded_examples[idx % len(encoded_examples)]
 
+    def collate(features: list[dict[str, list[int]]]) -> dict[str, torch.Tensor]:
+        max_batch_len = max(len(feature["input_ids"]) for feature in features)
+        input_ids = torch.full(
+            (len(features), max_batch_len),
+            tokenizer.pad_token_id,
+            dtype=torch.long,
+        )
+        attention_mask = torch.zeros((len(features), max_batch_len), dtype=torch.long)
+        labels = torch.full((len(features), max_batch_len), -100, dtype=torch.long)
+
+        for row, feature in enumerate(features):
+            length = len(feature["input_ids"])
+            input_ids[row, :length] = torch.tensor(feature["input_ids"], dtype=torch.long)
+            attention_mask[row, :length] = 1
+            labels[row, :length] = torch.tensor(feature["labels"], dtype=torch.long)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    maybe_enable_yarn(config)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
+        config=config,
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
         trust_remote_code=True,
@@ -131,13 +321,23 @@ def main() -> None:
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
+    steps_per_epoch = math.ceil(
+        items_per_epoch
+        / (PER_DEVICE_TRAIN_BATCH_SIZE * WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS)
+    )
+    total_steps = MAX_STEPS if MAX_STEPS > 0 else math.ceil(steps_per_epoch * NUM_TRAIN_EPOCHS)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, build_cosine_with_min_lr_lambda(total_steps)
+    )
+
     args = TrainingArguments(
         output_dir=str(OUT_DIR),
-        max_steps=MAX_STEPS,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        learning_rate=2e-5,
-        warmup_steps=0,
+        max_steps=MAX_STEPS if MAX_STEPS > 0 else -1,
+        num_train_epochs=NUM_TRAIN_EPOCHS,
+        per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        learning_rate=LEARNING_RATE,
         bf16=True,
         logging_steps=1,
         save_strategy="no",
@@ -148,7 +348,13 @@ def main() -> None:
         remove_unused_columns=False,
     )
 
-    trainer = Trainer(model=model, args=args, train_dataset=TinyDataset())
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=TinyDataset(),
+        data_collator=collate,
+        optimizers=(optimizer, lr_scheduler),
+    )
     result = trainer.train()
 
     losses = [
@@ -159,9 +365,37 @@ def main() -> None:
     summary = {
         "model": MODEL_ID,
         "dataset": DATASET_ID,
-        "num_examples": len(texts),
+        "paper_alignment": {
+            "kept": {
+                "base_model_family": "Qwen2.5-Coder-Instruct",
+                "training_epochs": NUM_TRAIN_EPOCHS,
+                "global_batch_size": GLOBAL_BATCH_SIZE,
+                "learning_rate_schedule": "cosine",
+                "peak_learning_rate": LEARNING_RATE,
+                "minimum_learning_rate": MIN_LEARNING_RATE,
+                "warmup_ratio": WARMUP_RATIO,
+                "loss_masking": "assistant/action tokens only; tool observations masked",
+            },
+            "intentional_deviations": [
+                "7B model only",
+                "tiny SWE-HERO subset only",
+                "SWE-ZERO stage skipped",
+                "evaluation skipped",
+                (
+                    "default max_length is Qwen native 32k for one-GPU smoke; "
+                    "set MAX_LENGTH=131072 for paper 128k context"
+                ),
+            ],
+        },
+        "num_unique_examples": len(encoded_examples),
+        "streamed_examples_scanned": streamed_examples,
+        "items_per_epoch": items_per_epoch,
         "max_length": MAX_LENGTH,
-        "max_steps": MAX_STEPS,
+        "max_steps": MAX_STEPS if MAX_STEPS > 0 else None,
+        "num_train_epochs": NUM_TRAIN_EPOCHS,
+        **batch_config,
+        "optimizer": "AdamW",
+        "lr_scheduler": "cosine_with_min_lr",
         "losses": losses,
         "first_loss": losses[0] if losses else None,
         "last_loss": losses[-1] if losses else None,
