@@ -1,26 +1,23 @@
-"""Run a short, paper-aligned SWE-HERO SFT job for Qwen2.5-Coder-7B.
+"""Launch the TorchTitan SWE-HERO direct-to-hero 7B training job.
 
-This is the next step after ``qwen_swehero_smoke.py``: it performs real
-optimizer updates, saves a reproducible run summary, and defaults to settings
-that should fit a single 80GB H100 in roughly a few minutes when model weights
-are already cached.
+This is the production entrypoint for the Qwen2.5-Coder-7B SWE-HERO
+scale-study run. It intentionally keeps the paper-facing recipe visible:
 
-The script intentionally preserves the paper-facing choices that matter for a
-direct-to-hero 7B scale study:
+* Qwen2.5-Coder-7B-Instruct initialized from the Hugging Face checkpoint;
+* public ``nvidia/SWE-Hero-openhands-trajectories`` traces as the current
+  canonical data source;
+* three SFT epochs, global batch size 32, cosine LR 1e-5 -> 1e-8 with 0.1
+  warmup;
+* 128k YaRN context extension from Qwen2.5's native 32k context;
+* assistant/action-only loss masking, with tool observations masked.
 
-* Qwen2.5-Coder-Instruct base model;
-* public ``nvidia/SWE-Hero-openhands-trajectories`` traces;
-* three SFT epochs;
-* effective global batch size 32 by gradient accumulation;
-* cosine LR from 1e-5 toward 1e-8 with 0.1 warmup ratio;
-* YaRN-capable 128k model context;
-* assistant/tool-call-only loss masking, with tool observations masked out.
-
-The runtime budget forces three material deviations from the paper recipe:
-
-* LoRA adapters are trained by default instead of full-model SFT;
-* only a small deterministic streamed subset is used;
-* training examples are truncated to a short token window by default.
+The important engineering deltas are explicit and recorded in the generated
+manifest: this uses TorchTitan distributed training, BF16 parameters/reductions
+with FP8 linear training where TorchTitan supports it, and length buckets with
+bucket-specific context parallelism instead of padding every example to 128k.
+TorchTitan's native varlen attention currently rejects CP, so CP stages use
+the supported SDPA/Flex attention path and get the padding reduction from
+bucketed sequence lengths.
 """
 
 from __future__ import annotations
@@ -30,10 +27,12 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -45,34 +44,41 @@ if __package__ is None or __package__ == "":
 from scripts import qwen_swehero_smoke as smoke
 
 
-DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-short-sft")
-DEFAULT_TRAIN_MAX_LENGTH = 8_192
-DEFAULT_NUM_EXAMPLES = 32
-DEFAULT_MAX_STREAMED_EXAMPLES = 512
-DEFAULT_LOGIT_CHUNK_SIZE = 1_024
-DEFAULT_LORA_TARGET_MODULES = (
-    "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
-)
+IGNORE_INDEX = -100
+
+MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
+DATASET_ID = "nvidia/SWE-Hero-openhands-trajectories"
+PAPER_CONTEXT_LENGTH = 131_072
+QWEN_NATIVE_CONTEXT_LENGTH = 32_768
+DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-torchtitan")
+DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
+DEFAULT_NUM_EXAMPLES = 64
+DEFAULT_MAX_STREAMED_EXAMPLES = 1_024
+DEFAULT_BUCKETS = (8_192, 16_384, 32_768, 65_536, PAPER_CONTEXT_LENGTH)
+DEFAULT_BUCKET_CP = {
+    8_192: 1,
+    16_384: 1,
+    32_768: 2,
+    65_536: 4,
+    PAPER_CONTEXT_LENGTH: 8,
+}
 
 
 @dataclass(frozen=True)
-class BatchConfig:
-    global_batch_size: int
-    per_device_train_batch_size: int
-    world_size: int
-    gradient_accumulation_steps: int
-    effective_global_batch_size: int
+class BucketStage:
+    bucket: int
+    cp_degree: int
+    example_count: int
+    steps: int
+    cumulative_steps: int
+    bucket_file: Path
 
 
 @dataclass(frozen=True)
-class TrainingPlan:
-    num_unique_examples: int
-    items_per_epoch: int
-    steps_per_epoch: int
-    total_optimizer_steps: int
-    max_steps_override: int | None
-    num_train_epochs: float
-    batch: BatchConfig
+class BucketPlan:
+    stages: tuple[BucketStage, ...]
+    total_steps: int
+    warmup_steps: int
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -92,211 +98,279 @@ def _env_float(name: str, default: float) -> float:
     return default if raw is None else float(raw)
 
 
-def _optional_int(raw: str | None) -> int | None:
-    if raw is None or raw == "":
-        return None
-    return int(raw)
+def _env_path(name: str, default: Path) -> Path:
+    raw = os.environ.get(name)
+    return default if raw is None else Path(raw)
 
 
-def effective_batch_config(
+def parse_bucket_list(raw: str | Iterable[int]) -> tuple[int, ...]:
+    if isinstance(raw, str):
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    else:
+        values = [int(part) for part in raw]
+    if not values:
+        raise ValueError("at least one sequence bucket is required")
+    if any(value <= 0 for value in values):
+        raise ValueError(f"bucket sizes must be positive: {values}")
+    values = sorted(set(values))
+    return tuple(values)
+
+
+def parse_bucket_cp_map(raw: str | Mapping[int, int]) -> dict[int, int]:
+    if isinstance(raw, Mapping):
+        parsed = {int(bucket): int(cp) for bucket, cp in raw.items()}
+    else:
+        parsed = {}
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                raise ValueError(
+                    "bucket CP map entries must look like '<bucket>:<cp>'"
+                )
+            bucket, cp = part.split(":", 1)
+            parsed[int(bucket.strip())] = int(cp.strip())
+    if not parsed:
+        raise ValueError("at least one bucket:cp entry is required")
+    bad = {bucket: cp for bucket, cp in parsed.items() if bucket <= 0 or cp <= 0}
+    if bad:
+        raise ValueError(f"bucket and CP values must be positive: {bad}")
+    return parsed
+
+
+def _format_bucket_cp_map(bucket_cp: Mapping[int, int]) -> str:
+    return ",".join(f"{bucket}:{bucket_cp[bucket]}" for bucket in sorted(bucket_cp))
+
+
+def choose_bucket(length: int, buckets: Iterable[int]) -> int:
+    if length <= 0:
+        raise ValueError("length must be positive")
+    for bucket in sorted(buckets):
+        if length <= bucket:
+            return bucket
+    raise ValueError(f"length {length} exceeds largest bucket {max(buckets)}")
+
+
+def validate_bucket_config(
     *,
+    buckets: tuple[int, ...],
+    bucket_cp: Mapping[int, int],
+    nproc_per_node: int,
+    attention_backend: str,
+) -> None:
+    missing = [bucket for bucket in buckets if bucket not in bucket_cp]
+    if missing:
+        raise ValueError(f"missing CP degree for buckets: {missing}")
+    for bucket in buckets:
+        cp = bucket_cp[bucket]
+        if nproc_per_node % cp != 0:
+            raise ValueError(
+                f"bucket {bucket} uses CP={cp}, which must divide "
+                f"--nproc-per-node={nproc_per_node}"
+            )
+        divisor = 2 * cp
+        if bucket % divisor != 0:
+            raise ValueError(
+                f"bucket {bucket} must be divisible by 2 * CP ({divisor}) "
+                "for TorchTitan context parallelism"
+            )
+    if attention_backend == "varlen" and any(bucket_cp[b] > 1 for b in buckets):
+        raise ValueError(
+            "TorchTitan VarlenAttention does not support Context Parallelism; "
+            "use --attention-backend sdpa/flex/flex_flash for bucketed CP."
+        )
+
+
+def _ceil_steps(example_count: int, epochs: float, global_batch_size: int) -> int:
+    if example_count <= 0:
+        return 0
+    return max(1, math.ceil(example_count * epochs / global_batch_size))
+
+
+def build_bucket_plan(
+    *,
+    bucket_counts: Mapping[int, int],
+    bucket_files: Mapping[int, Path],
+    bucket_cp: Mapping[int, int],
+    epochs: float,
     global_batch_size: int,
-    per_device_train_batch_size: int,
-    world_size: int,
-    gradient_accumulation_steps: int | None,
-) -> BatchConfig:
+    warmup_ratio: float,
+    max_steps: int = 0,
+) -> BucketPlan:
+    if epochs <= 0 and max_steps <= 0:
+        raise ValueError("epochs must be positive unless max_steps is set")
     if global_batch_size <= 0:
         raise ValueError("global_batch_size must be positive")
-    if per_device_train_batch_size <= 0:
-        raise ValueError("per_device_train_batch_size must be positive")
-    if world_size <= 0:
-        raise ValueError("world_size must be positive")
 
-    if gradient_accumulation_steps is None:
-        gradient_accumulation_steps = max(
-            1,
-            math.ceil(
-                global_batch_size / (per_device_train_batch_size * world_size)
-            ),
-        )
-    if gradient_accumulation_steps <= 0:
-        raise ValueError("gradient_accumulation_steps must be positive")
+    natural: list[tuple[int, int]] = []
+    for bucket in sorted(bucket_counts):
+        steps = _ceil_steps(bucket_counts[bucket], epochs, global_batch_size)
+        if steps > 0:
+            natural.append((bucket, steps))
+    if not natural:
+        raise ValueError("no non-empty buckets found")
 
-    effective_global_batch_size = (
-        per_device_train_batch_size * world_size * gradient_accumulation_steps
-    )
-    return BatchConfig(
-        global_batch_size=global_batch_size,
-        per_device_train_batch_size=per_device_train_batch_size,
-        world_size=world_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        effective_global_batch_size=effective_global_batch_size,
-    )
-
-
-def build_training_plan(
-    *,
-    num_unique_examples: int,
-    global_batch_size: int,
-    per_device_train_batch_size: int,
-    world_size: int,
-    gradient_accumulation_steps: int | None,
-    num_train_epochs: float,
-    max_steps: int,
-) -> TrainingPlan:
-    if num_unique_examples <= 0:
-        raise ValueError("num_unique_examples must be positive")
-    if num_train_epochs <= 0 and max_steps <= 0:
-        raise ValueError("num_train_epochs must be positive unless max_steps is set")
-
-    batch = effective_batch_config(
-        global_batch_size=global_batch_size,
-        per_device_train_batch_size=per_device_train_batch_size,
-        world_size=world_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-    )
-    items_per_epoch = max(
-        batch.effective_global_batch_size,
-        math.ceil(num_unique_examples / batch.effective_global_batch_size)
-        * batch.effective_global_batch_size,
-    )
     if max_steps > 0:
-        items_per_epoch = max(
-            items_per_epoch,
-            batch.effective_global_batch_size * max_steps,
+        remaining = max_steps
+        limited: list[tuple[int, int]] = []
+        for bucket, steps in natural:
+            if remaining <= 0:
+                break
+            stage_steps = min(steps, remaining)
+            limited.append((bucket, stage_steps))
+            remaining -= stage_steps
+        natural = limited
+
+    cumulative = 0
+    stages = []
+    for bucket, steps in natural:
+        cumulative += steps
+        stages.append(
+            BucketStage(
+                bucket=bucket,
+                cp_degree=bucket_cp[bucket],
+                example_count=bucket_counts[bucket],
+                steps=steps,
+                cumulative_steps=cumulative,
+                bucket_file=bucket_files[bucket],
+            )
         )
 
-    microbatches_per_epoch = math.ceil(
-        items_per_epoch / (per_device_train_batch_size * world_size)
+    warmup_steps = (
+        max(1, math.ceil(cumulative * warmup_ratio))
+        if warmup_ratio > 0 and cumulative > 1
+        else 0
     )
-    steps_per_epoch = math.ceil(
-        microbatches_per_epoch / batch.gradient_accumulation_steps
-    )
-    total_optimizer_steps = (
-        max_steps if max_steps > 0 else math.ceil(steps_per_epoch * num_train_epochs)
-    )
-
-    return TrainingPlan(
-        num_unique_examples=num_unique_examples,
-        items_per_epoch=items_per_epoch,
-        steps_per_epoch=steps_per_epoch,
-        total_optimizer_steps=total_optimizer_steps,
-        max_steps_override=max_steps if max_steps > 0 else None,
-        num_train_epochs=num_train_epochs,
-        batch=batch,
-    )
+    return BucketPlan(tuple(stages), cumulative, warmup_steps)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run a short SWE-HERO SFT job that keeps paper hyperparameters "
-            "where practical under a single-H100 runtime budget."
-        )
+        description="Materialize a bucketed SWE-HERO smoke subset and launch TorchTitan."
     )
+    parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", MODEL_ID))
     parser.add_argument(
-        "--model-id",
-        default=os.environ.get("MODEL_ID", smoke.MODEL_ID),
-        help="HF model id or local path for the Qwen2.5-Coder base model.",
-    )
-    parser.add_argument(
-        "--dataset-id",
-        default=os.environ.get("DATASET_ID", smoke.DATASET_ID),
-        help="HF dataset id or local dataset path for SWE-HERO traces.",
+        "--dataset-id", default=os.environ.get("DATASET_ID", DATASET_ID)
     )
     parser.add_argument(
         "--dataset-revision",
         default=os.environ.get("DATASET_REVISION"),
-        help="Optional HF dataset revision. Records the resolved SHA when available.",
+        help="Optional Hugging Face dataset revision to materialize.",
     )
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=Path(os.environ.get("OUT_DIR", str(DEFAULT_OUT_DIR))),
-        help="Run output directory. Defaults under /workspace to stay out of git.",
+        default=_env_path("OUT_DIR", DEFAULT_OUT_DIR),
+        help="Run folder on the pod. Bucket JSONL, manifests, and checkpoints live here.",
+    )
+    parser.add_argument(
+        "--hf-assets-path",
+        type=Path,
+        default=_env_path("HF_ASSETS_PATH", DEFAULT_HF_ASSETS_PATH),
+        help="Local directory containing Qwen tokenizer/config/safetensors assets.",
     )
     parser.add_argument(
         "--env-file",
         default=os.environ.get("ENV_FILE", smoke.ENV_FILE),
-        help="Optional dotenv-style file loaded before training.",
+        help="Optional dotenv-style file loaded before work starts.",
     )
     parser.add_argument(
-        "--model-context-length",
-        type=int,
-        default=_env_int("MODEL_CONTEXT_LENGTH", smoke.PAPER_CONTEXT_LENGTH),
-        help="Configured model context length. Defaults to the paper's 128k.",
+        "--download-hf-assets",
+        action="store_true",
+        default=_env_flag("DOWNLOAD_HF_ASSETS", False),
+        help="Download tokenizer/config/safetensors into --hf-assets-path parent first.",
     )
     parser.add_argument(
-        "--max-length",
-        type=int,
-        default=_env_int("MAX_LENGTH", DEFAULT_TRAIN_MAX_LENGTH),
-        help="Per-example training token window. Defaults shorter for <5min runs.",
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
+        help="Optional Hugging Face token for asset download.",
     )
     parser.add_argument(
         "--num-examples",
         type=int,
         default=_env_int("NUM_EXAMPLES", DEFAULT_NUM_EXAMPLES),
-        help="Number of usable streamed training traces to keep.",
+        help="Usable examples to keep for the current smoke run.",
     )
     parser.add_argument(
         "--max-streamed-examples",
         type=int,
         default=_env_int("MAX_STREAMED_EXAMPLES", DEFAULT_MAX_STREAMED_EXAMPLES),
-        help="Maximum raw streamed rows to scan while finding usable traces.",
+        help="Maximum raw streamed rows to inspect while finding usable examples.",
     )
     parser.add_argument(
         "--shuffle-buffer",
         type=int,
-        default=_env_int("SHUFFLE_BUFFER", 512),
-        help="Streaming shuffle buffer. Set 0 to keep dataset order.",
+        default=_env_int("SHUFFLE_BUFFER", 2_048),
+        help="Streaming shuffle buffer. Set 0 to keep HF order.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=_env_int("SEED", 17),
-        help="Seed for dataset shuffling and Trainer.",
+        help="Dataset shuffle and TorchTitan seed.",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=_env_int("MAX_LENGTH", PAPER_CONTEXT_LENGTH),
+        help="Maximum shifted input length. Defaults to the paper 128k context.",
+    )
+    parser.add_argument(
+        "--buckets",
+        default=os.environ.get(
+            "SWEHERO_BUCKETS", ",".join(str(b) for b in DEFAULT_BUCKETS)
+        ),
+        help="Comma-separated sequence buckets.",
+    )
+    parser.add_argument(
+        "--bucket-cp",
+        default=os.environ.get(
+            "SWEHERO_BUCKET_CP", _format_bucket_cp_map(DEFAULT_BUCKET_CP)
+        ),
+        help="Comma-separated '<bucket>:<context-parallel-degree>' entries.",
+    )
+    parser.add_argument(
+        "--min-trainable-tokens",
+        type=int,
+        default=_env_int("MIN_TRAINABLE_TOKENS", 1),
+        help="Drop examples with fewer trainable shifted labels than this.",
+    )
+    parser.add_argument(
+        "--include-model-patch",
+        action="store_true",
+        default=_env_flag("INCLUDE_MODEL_PATCH", False),
+        help="Also train on the model_patch field when present.",
     )
     parser.add_argument(
         "--num-train-epochs",
         type=float,
         default=_env_float("NUM_TRAIN_EPOCHS", 3.0),
-        help="SFT epochs over the retained subset. Paper uses up to 3.",
+        help="SFT epochs over the materialized subset. Paper uses up to 3.",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
         default=_env_int("MAX_STEPS", 0),
-        help="Optional optimizer-step cap. 0 means derive from epochs.",
+        help="Optional total optimizer-step cap across all bucket stages.",
     )
     parser.add_argument(
         "--global-batch-size",
         type=int,
         default=_env_int("GLOBAL_BATCH_SIZE", 32),
-        help="Target global batch size. Paper uses 32.",
+        help="Paper global batch size is 32.",
     )
     parser.add_argument(
-        "--per-device-train-batch-size",
+        "--local-batch-size",
         type=int,
-        default=_env_int("PER_DEVICE_TRAIN_BATCH_SIZE", 1),
-        help="Microbatch size per GPU.",
-    )
-    parser.add_argument(
-        "--world-size",
-        type=int,
-        default=_env_int("WORLD_SIZE", 1),
-        help="Number of data-parallel workers. Single-H100 default is 1.",
-    )
-    parser.add_argument(
-        "--gradient-accumulation-steps",
-        type=int,
-        default=_optional_int(os.environ.get("GRADIENT_ACCUMULATION_STEPS")),
-        help="Override accumulation. Defaults to ceil(global batch / microbatch).",
+        default=_env_int("LOCAL_BATCH_SIZE", 1),
+        help="TorchTitan local microbatch size per data-parallel rank.",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
         default=_env_float("LEARNING_RATE", 1e-5),
-        help="Peak learning rate. Paper uses 1e-5.",
+        help="Peak AdamW learning rate. Paper uses 1e-5.",
     )
     parser.add_argument(
         "--min-learning-rate",
@@ -314,115 +388,123 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--weight-decay",
         type=float,
         default=_env_float("WEIGHT_DECAY", 0.0),
-        help="AdamW weight decay. The paper does not report this; default is 0.",
+        help="AdamW weight decay. The paper does not report this.",
     )
     parser.add_argument(
-        "--train-mode",
-        choices=("lora", "full"),
-        default=os.environ.get("TRAIN_MODE", "lora"),
-        help="LoRA is the default single-H100 <5min compromise; full is paper-closer but heavy.",
-    )
-    parser.add_argument(
-        "--lora-rank",
-        type=int,
-        default=_env_int("LORA_RANK", 16),
-        help="LoRA adapter rank used when --train-mode=lora.",
-    )
-    parser.add_argument(
-        "--lora-alpha",
+        "--max-grad-norm",
         type=float,
-        default=_env_float("LORA_ALPHA", 32.0),
-        help="LoRA alpha used when --train-mode=lora.",
+        default=_env_float("MAX_GRAD_NORM", 1.0),
     )
     parser.add_argument(
-        "--lora-dropout",
-        type=float,
-        default=_env_float("LORA_DROPOUT", 0.05),
-        help="LoRA dropout used when --train-mode=lora.",
+        "--attention-backend",
+        choices=("sdpa", "flex", "flex_flash", "varlen"),
+        default=os.environ.get("ATTENTION_BACKEND", "sdpa"),
+        help="Use sdpa/flex/flex_flash for CP. Varlen is allowed only when CP=1.",
     )
     parser.add_argument(
-        "--lora-target-modules",
-        default=os.environ.get("LORA_TARGET_MODULES", DEFAULT_LORA_TARGET_MODULES),
-        help="Comma-separated module names for LoRA injection.",
-    )
-    parser.add_argument(
-        "--attn-implementation",
-        default=os.environ.get("ATTN_IMPLEMENTATION", "sdpa"),
-        help="Transformers attention implementation, e.g. sdpa or flash_attention_2.",
-    )
-    parser.add_argument(
-        "--logit-chunk-size",
-        type=int,
-        default=_env_int("LOGIT_CHUNK_SIZE", DEFAULT_LOGIT_CHUNK_SIZE),
-        help="Chunk size for memory-bounded lm_head/cross-entropy.",
-    )
-    parser.add_argument(
-        "--logging-steps",
-        type=int,
-        default=_env_int("LOGGING_STEPS", 1),
-        help="Trainer logging interval.",
-    )
-    parser.add_argument(
-        "--include-model-patch",
-        action="store_true",
-        default=_env_flag("INCLUDE_MODEL_PATCH", False),
-        help="Also train on model_patch as a final assistant patch. Off by default.",
-    )
-    parser.add_argument(
-        "--disable-yarn",
-        action="store_true",
-        default=not _env_flag("ENABLE_YARN", True),
-        help="Disable YaRN context extension even when model context exceeds 32k.",
-    )
-    parser.add_argument(
-        "--no-gradient-checkpointing",
-        action="store_true",
-        default=not _env_flag("GRADIENT_CHECKPOINTING", True),
-        help="Disable gradient checkpointing.",
-    )
-    parser.add_argument(
-        "--local-files-only",
-        action="store_true",
-        default=_env_flag("LOCAL_FILES_ONLY", False),
-        help="Do not fetch model/tokenizer files from the network.",
-    )
-    parser.add_argument(
-        "--dry-run-tokenize-only",
-        action="store_true",
-        default=_env_flag("DRY_RUN_TOKENIZE_ONLY", False),
-        help="Load/tokenize data and write metadata without loading the model.",
-    )
-    parser.add_argument(
-        "--save-final",
+        "--enable-fp8",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("SAVE_FINAL", True),
-        help="Save final adapter/model and tokenizer under the output directory.",
+        default=_env_flag("ENABLE_FP8", True),
+        help="Use TorchTitan float8 linear training where safe and supported.",
+    )
+    parser.add_argument(
+        "--fp8-recipe",
+        choices=("rowwise", "rowwise_with_gw_hp"),
+        default=os.environ.get("FP8_RECIPE", "rowwise"),
+    )
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("COMPILE", True),
+        help="Torch compile model/loss. Keep enabled for FP8 performance.",
+    )
+    parser.add_argument(
+        "--activation-checkpoint-mode",
+        choices=("full", "selective", "memory_budget", "none"),
+        default=os.environ.get("ACTIVATION_CHECKPOINT_MODE", "full"),
+    )
+    parser.add_argument(
+        "--chunked-ce-chunks",
+        type=int,
+        default=_env_int("CHUNKED_CE_CHUNKS", 8),
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=_env_int("CHECKPOINT_INTERVAL", 25),
+    )
+    parser.add_argument(
+        "--checkpoint-async-mode",
+        choices=("disabled", "async", "async_with_pinned_mem"),
+        default=os.environ.get("CHECKPOINT_ASYNC_MODE", "async"),
+    )
+    parser.add_argument(
+        "--metrics-log-freq",
+        type=int,
+        default=_env_int("METRICS_LOG_FREQ", 1),
     )
     parser.add_argument(
         "--enable-wandb",
         action="store_true",
         default=_env_flag("ENABLE_WANDB", False),
-        help=(
-            "Enable Weights & Biases logging when WANDB_API_KEY is present. "
-            "Disabled by default so logging permissions cannot block smoke training."
-        ),
-    )
-    parser.add_argument(
-        "--wandb-entity",
-        default=os.environ.get("WANDB_ENTITY", smoke.WANDB_ENTITY),
-        help="Weights & Biases entity when WANDB_API_KEY is present.",
     )
     parser.add_argument(
         "--wandb-project",
         default=os.environ.get("WANDB_PROJECT", smoke.WANDB_PROJECT),
-        help="Weights & Biases project when WANDB_API_KEY is present.",
     )
     parser.add_argument(
         "--wandb-run-name",
-        default=os.environ.get(
-            "WANDB_RUN_NAME", "qwen25-coder7b-swehero-short-sft"
-        ),
-        help="Weights & Biases run name when WANDB_API_KEY is present.",
+        default=os.environ.get("WANDB_RUN_NAME", "qwen25-coder7b-swehero-tt"),
+    )
+    parser.add_argument(
+        "--nproc-per-node",
+        type=int,
+        default=_env_int("NPROC_PER_NODE", 8),
+        help="GPU processes per node. Target pod is 8xH100.",
+    )
+    parser.add_argument(
+        "--torchrun-bin",
+        default=os.environ.get("TORCHRUN_BIN", "torchrun"),
+    )
+    parser.add_argument(
+        "--log-rank",
+        default=os.environ.get("LOG_RANK", "0"),
+        help="Ranks TorchTitan should log. Passed through LOG_RANK.",
+    )
+    parser.add_argument(
+        "--torchrun-log-rank-filter",
+        default=os.environ.get("TORCHRUN_LOG_RANK_FILTER", "0"),
+        help="Optional torchrun --local-ranks-filter value.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=_env_flag("DRY_RUN", False),
+        help="Materialize data and print torchrun commands without launching.",
+    )
+    parser.add_argument(
+        "--prepare-data-only",
+        action="store_true",
+        default=_env_flag("PREPARE_DATA_ONLY", False),
+        help="Materialize bucket files and exit.",
+    )
+    parser.add_argument(
+        "--skip-data-prep",
+        action="store_true",
+        default=_env_flag("SKIP_DATA_PREP", False),
+        help="Reuse existing manifest/bucket files under --out-dir/data.",
+    )
+    parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        default=_env_flag("OVERWRITE_OUTPUT", False),
+        help="Remove --out-dir before materializing a fresh run.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=_env_flag("RESUME", False),
+        help="Reuse an existing checkpoint folder in --out-dir/torchtitan.",
     )
     return parser.parse_args(argv)
 
@@ -439,61 +521,6 @@ def _run_git(args: list[str]) -> str | None:
         return None
 
 
-def _rank_from_env() -> int:
-    return int(os.environ.get("RANK", "0"))
-
-
-def _local_rank_from_env() -> int:
-    return int(os.environ.get("LOCAL_RANK", "0"))
-
-
-def _world_size_from_env() -> int:
-    return int(os.environ.get("WORLD_SIZE", "1"))
-
-
-def _is_main_process_from_env() -> bool:
-    return _rank_from_env() == 0
-
-
-def _select_cuda_device(torch: Any) -> str | None:
-    if not torch.cuda.is_available():
-        return None
-
-    local_rank = _local_rank_from_env()
-    torch.cuda.set_device(local_rank)
-    return f"cuda:{local_rank}"
-
-
-def _collect_cuda_summaries(torch: Any) -> list[dict[str, Any]] | None:
-    if not torch.cuda.is_available():
-        return None
-
-    device_index = torch.cuda.current_device()
-    summary = {
-        "rank": _rank_from_env(),
-        "local_rank": _local_rank_from_env(),
-        "world_size": _world_size_from_env(),
-        "device_index": device_index,
-        "device_name": torch.cuda.get_device_name(device_index),
-        "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(device_index),
-        "max_memory_reserved_bytes": torch.cuda.max_memory_reserved(device_index),
-    }
-
-    distributed = getattr(torch, "distributed", None)
-    if (
-        distributed is not None
-        and distributed.is_available()
-        and distributed.is_initialized()
-    ):
-        summaries: list[dict[str, Any] | None] = [
-            None
-        ] * distributed.get_world_size()
-        distributed.all_gather_object(summaries, summary)
-        return [item for item in summaries if item is not None]
-
-    return [summary]
-
-
 def _dataset_revision_info(dataset_id: str, revision: str | None) -> dict[str, Any]:
     try:
         from huggingface_hub import HfApi
@@ -508,7 +535,6 @@ def _dataset_revision_info(dataset_id: str, revision: str | None) -> dict[str, A
             serialized_card_data = card_data.to_dict()
         else:
             serialized_card_data = {"repr": repr(card_data)}
-
         return {
             "requested_revision": revision,
             "resolved_sha": getattr(info, "sha", None),
@@ -522,9 +548,41 @@ def _dataset_revision_info(dataset_id: str, revision: str | None) -> dict[str, A
         }
 
 
+def _hash_file(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tokenizer_metadata(tokenizer: Any, hf_assets_path: Path) -> dict[str, Any]:
+    tokenizer_config_path = hf_assets_path / "tokenizer_config.json"
+    config: dict[str, Any] = {}
+    if tokenizer_config_path.exists():
+        config = json.loads(tokenizer_config_path.read_text())
+    chat_template = config.get("chat_template")
+    return {
+        "hf_assets_path": str(hf_assets_path),
+        "tokenizer_json_sha256": _hash_file(hf_assets_path / "tokenizer.json"),
+        "tokenizer_config_sha256": _hash_file(tokenizer_config_path),
+        "chat_template_sha256": hashlib.sha256(
+            chat_template.encode("utf-8")
+        ).hexdigest()
+        if isinstance(chat_template, str)
+        else None,
+        "bos_id": getattr(tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None)),
+        "eos_id": getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None)),
+        "pad_id": infer_pad_token_id(tokenizer, hf_assets_path),
+        "trace_serializer": "OpenHands role markers; assistant content/tool_calls trainable; tool observations masked",
+    }
+
+
 def _package_versions() -> dict[str, str | None]:
     versions: dict[str, str | None] = {}
-    for package_name in ("torch", "transformers", "datasets", "peft"):
+    for package_name in ("torch", "torchtitan", "datasets", "tokenizers", "torchao"):
         try:
             module = __import__(package_name)
             versions[package_name] = getattr(module, "__version__", None)
@@ -533,69 +591,202 @@ def _package_versions() -> dict[str, str | None]:
     return versions
 
 
-def _tokenizer_metadata(tokenizer: Any) -> dict[str, Any]:
-    chat_template = getattr(tokenizer, "chat_template", None)
+def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
     return {
-        "name_or_path": getattr(tokenizer, "name_or_path", None),
-        "model_max_length": getattr(tokenizer, "model_max_length", None),
-        "pad_token": getattr(tokenizer, "pad_token", None),
-        "pad_token_id": getattr(tokenizer, "pad_token_id", None),
-        "eos_token": getattr(tokenizer, "eos_token", None),
-        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
-        "chat_template_sha256": hashlib.sha256(
-            chat_template.encode("utf-8")
-        ).hexdigest()
-        if isinstance(chat_template, str)
-        else None,
-        "trace_serializer": "OpenHands role markers from qwen_swehero_smoke.example_segments",
+        "kept": {
+            "base_model": args.model_id,
+            "dataset": args.dataset_id,
+            "epochs": args.num_train_epochs,
+            "global_batch_size": args.global_batch_size,
+            "lr_schedule": "cosine",
+            "peak_lr": args.learning_rate,
+            "min_lr": args.min_learning_rate,
+            "warmup_ratio": args.warmup_ratio,
+            "context_length": PAPER_CONTEXT_LENGTH,
+            "loss_masking": "assistant content and assistant tool calls only",
+            "swe_zero_stage": "skipped for direct-to-hero",
+        },
+        "paper_caveats": [
+            "The paper reports direct-to-hero as a 32B ablation; this 7B run is a scale-study extension.",
+            "The public Hugging Face SWE-HERO release is used as canonical even though its row count differs from the paper wording.",
+        ],
+        "intentional_engineering_deltas": [
+            "TorchTitan distributed full-model SFT replaces the earlier local Transformers smoke script.",
+            "BF16 remains the precision-sensitive base dtype; FP8 is applied only to TorchTitan linear layers selected by its converter.",
+            "Length buckets with per-bucket CP replace static 128k padding.",
+            "TorchTitan VarlenAttention currently does not support CP, so CP buckets use the supported SDPA/Flex attention path.",
+            f"This smoke run materializes {args.num_examples} examples while the filtered production dataset is being prepared.",
+        ],
     }
 
 
-def _parameter_counts(model: Any) -> dict[str, int]:
-    total = 0
-    trainable = 0
-    for param in model.parameters():
-        count = param.numel()
-        total += count
-        if param.requires_grad:
-            trainable += count
+def _stringify(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def qwen_openhands_turn_segments(turn: object) -> list[tuple[str, bool]]:
+    if not isinstance(turn, dict):
+        return [(json.dumps(turn, ensure_ascii=False) + "\n", False)]
+
+    role = _stringify(turn.get("role") or "unknown")
+    is_assistant = role == "assistant"
+    segments: list[tuple[str, bool]] = [(f"<|{role}|>\n", False)]
+
+    content = _stringify(turn.get("content"))
+    if content:
+        segments.append((content.rstrip("\n") + "\n", is_assistant))
+
+    tool_calls = turn.get("tool_calls")
+    if tool_calls:
+        segments.append(("<|tool_calls|>\n", False))
+        segments.append((json.dumps(tool_calls, ensure_ascii=False) + "\n", is_assistant))
+
+    return segments
+
+
+def qwen_openhands_segments(
+    example: dict[str, object],
+    *,
+    include_model_patch: bool = False,
+) -> list[tuple[str, bool]]:
+    segments: list[tuple[str, bool]] = []
+    trajectory = example.get("trajectory") or example.get("messages") or []
+    if isinstance(trajectory, list):
+        for turn in trajectory:
+            segments.extend(qwen_openhands_turn_segments(turn))
+    else:
+        segments.append((_stringify(trajectory) + "\n", False))
+
+    patch = example.get("model_patch")
+    if include_model_patch and patch:
+        segments.append(("<|assistant_final_patch|>\n", False))
+        segments.append((_stringify(patch) + "\n", True))
+
+    return segments
+
+
+def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
+    try:
+        return list(tokenizer.encode(text, add_bos=False, add_eos=False))
+    except TypeError:
+        return list(tokenizer.encode(text, add_special_tokens=False))
+
+
+def encode_swehero_example(
+    tokenizer: Any,
+    example: dict[str, object],
+    *,
+    max_length: int,
+    min_trainable_tokens: int,
+    include_model_patch: bool = False,
+) -> dict[str, Any] | None:
+    token_ids: list[int] = []
+    labels: list[int] = []
+
+    bos_id = getattr(tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None))
+    if bos_id is not None:
+        token_ids.append(int(bos_id))
+        labels.append(IGNORE_INDEX)
+
+    for text, is_trainable in qwen_openhands_segments(
+        example, include_model_patch=include_model_patch
+    ):
+        ids = _tokenize_text(tokenizer, text)
+        token_ids.extend(ids)
+        labels.extend(ids if is_trainable else [IGNORE_INDEX] * len(ids))
+
+    eos_id = getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None))
+    if eos_id is not None:
+        token_ids.append(int(eos_id))
+        labels.append(int(eos_id) if labels and labels[-1] != IGNORE_INDEX else IGNORE_INDEX)
+
+    token_ids = token_ids[: max_length + 1]
+    labels = labels[: max_length + 1]
+    if len(token_ids) < 2:
+        return None
+
+    shifted_input_ids = token_ids[:-1]
+    shifted_labels = labels[1:]
+    trainable_tokens = sum(label != IGNORE_INDEX for label in shifted_labels)
+    if trainable_tokens < min_trainable_tokens:
+        return None
+
     return {
-        "total_parameters": total,
-        "trainable_parameters": trainable,
+        "input_ids": shifted_input_ids,
+        "labels": shifted_labels,
+        "length": len(shifted_input_ids),
+        "trainable_tokens": trainable_tokens,
     }
 
 
-def _paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
-    kept = {
-        "base_model_family": "Qwen2.5-Coder-Instruct",
-        "dataset": "nvidia/SWE-Hero-openhands-trajectories compatible schema",
-        "training_epochs": args.num_train_epochs,
-        "global_batch_size": args.global_batch_size,
-        "learning_rate_schedule": "cosine",
-        "peak_learning_rate": args.learning_rate,
-        "minimum_learning_rate": args.min_learning_rate,
-        "warmup_ratio": args.warmup_ratio,
-        "model_context_length": args.model_context_length,
-        "loss_masking": "assistant content/tool-call tokens only; tool observations masked",
-        "swe_zero_stage": "skipped intentionally for direct-to-hero",
-    }
-    deviations = [
-        "7B direct-to-hero is a scale-study extension; the paper's direct-to-hero ablation is reported for 32B.",
-        f"trains {args.train_mode} parameters instead of confirmed full-model paper SFT",
-        f"uses {args.num_examples} streamed traces instead of the full SWE-HERO corpus",
-        f"uses {args.max_length} training tokens per example instead of 128k full trajectories",
-        "skips SWE-bench Verified evaluation for the short training test",
-    ]
-    return {"kept": kept, "intentional_deviations": deviations}
+def infer_pad_token_id(tokenizer: Any, hf_assets_path: Path) -> int:
+    for attr in ("pad_id", "pad_token_id"):
+        value = getattr(tokenizer, attr, None)
+        if value is not None:
+            return int(value)
+
+    tokenizer_config_path = hf_assets_path / "tokenizer_config.json"
+    if tokenizer_config_path.exists():
+        config = json.loads(tokenizer_config_path.read_text())
+        pad_token = config.get("pad_token") or config.get("eos_token")
+        if isinstance(pad_token, dict):
+            pad_token = pad_token.get("content")
+        if isinstance(pad_token, str):
+            token_to_id = getattr(tokenizer, "token_to_id", None)
+            if callable(token_to_id):
+                pad_id = token_to_id(pad_token)
+                if pad_id is not None:
+                    return int(pad_id)
+
+    eos_id = getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None))
+    if eos_id is None:
+        raise RuntimeError("Could not infer pad token id from tokenizer assets")
+    return int(eos_id)
 
 
-def _load_encoded_examples(args: argparse.Namespace, tokenizer: Any) -> tuple[list[dict[str, list[int]]], int]:
+def _example_id(example: Mapping[str, object], fallback_index: int) -> str:
+    for key in ("instance_id", "problem_statement_id", "task_id", "id"):
+        value = example.get(key)
+        if value:
+            return str(value)
+    return f"stream_row_{fallback_index}"
+
+
+def _load_manifest(out_dir: Path) -> dict[str, Any]:
+    manifest_path = out_dir / "data" / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"{manifest_path} does not exist; run without --skip-data-prep first"
+        )
+    return json.loads(manifest_path.read_text())
+
+
+def materialize_smoke_subset(args: argparse.Namespace) -> dict[str, Any]:
     from datasets import load_dataset
+    from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
-    load_kwargs: dict[str, Any] = {
-        "split": "train",
-        "streaming": True,
+    data_dir = args.out_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    buckets = parse_bucket_list(args.buckets)
+
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=str(args.hf_assets_path))
+    pad_token_id = infer_pad_token_id(tokenizer, args.hf_assets_path)
+
+    bucket_paths = {
+        bucket: data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets
     }
+    handles = {bucket: path.open("w") for bucket, path in bucket_paths.items()}
+    bucket_counts: Counter[int] = Counter()
+    skipped: Counter[str] = Counter()
+    length_histogram: Counter[int] = Counter()
+    streamed_examples = 0
+    usable_examples = 0
+
+    load_kwargs: dict[str, Any] = {"split": "train", "streaming": True}
     if args.dataset_revision:
         load_kwargs["revision"] = args.dataset_revision
 
@@ -603,404 +794,318 @@ def _load_encoded_examples(args: argparse.Namespace, tokenizer: Any) -> tuple[li
     if args.shuffle_buffer > 0:
         raw = raw.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
 
-    encoded_examples = []
-    streamed_examples = 0
-    for example in raw:
-        streamed_examples += 1
-        encoded = smoke.encode_example(
-            tokenizer,
-            example,
-            max_length=args.max_length,
-            include_model_patch=args.include_model_patch,
-        )
-        if encoded is not None:
-            encoded_examples.append(encoded)
-        if len(encoded_examples) >= args.num_examples:
-            break
-        if streamed_examples >= args.max_streamed_examples:
-            break
+    try:
+        for example in raw:
+            streamed_examples += 1
+            encoded = encode_swehero_example(
+                tokenizer,
+                example,
+                max_length=min(args.max_length, max(buckets)),
+                min_trainable_tokens=args.min_trainable_tokens,
+                include_model_patch=args.include_model_patch,
+            )
+            if encoded is None:
+                skipped["not_enough_trainable_tokens"] += 1
+            else:
+                try:
+                    bucket = choose_bucket(encoded["length"], buckets)
+                except ValueError:
+                    skipped["too_long_for_largest_bucket"] += 1
+                else:
+                    record = {
+                        **encoded,
+                        "bucket": bucket,
+                        "source_id": _example_id(example, streamed_examples),
+                    }
+                    handles[bucket].write(json.dumps(record) + "\n")
+                    bucket_counts[bucket] += 1
+                    rounded_length = int(math.ceil(encoded["length"] / 1024) * 1024)
+                    length_histogram[rounded_length] += 1
+                    usable_examples += 1
 
-    if not encoded_examples:
+            if usable_examples >= args.num_examples:
+                break
+            if streamed_examples >= args.max_streamed_examples:
+                break
+    finally:
+        for handle in handles.values():
+            handle.close()
+
+    if usable_examples == 0:
         raise RuntimeError(
-            "No usable training examples found. Increase --max-length, "
-            "--max-streamed-examples, or disable shuffling if the retained "
-            "rows contain no assistant/action tokens before truncation."
+            "No usable SWE-HERO examples were materialized. Increase "
+            "--max-streamed-examples, reduce --min-trainable-tokens, or inspect "
+            "the dataset schema."
         )
-    return encoded_examples, streamed_examples
 
-
-def _build_optimizer(torch: Any, model: Any, args: argparse.Namespace) -> Any:
-    trainable_params = [param for param in model.parameters() if param.requires_grad]
-    optimizer_kwargs = {
-        "lr": args.learning_rate,
-        "betas": (0.9, 0.999),
-        "eps": 1e-8,
-        "weight_decay": args.weight_decay,
+    manifest = {
+        "created_at_unix": time.time(),
+        "model_id": args.model_id,
+        "dataset_id": args.dataset_id,
+        "dataset_revision": _dataset_revision_info(
+            args.dataset_id, args.dataset_revision
+        ),
+        "paper_alignment": paper_alignment(args),
+        "tokenizer": _tokenizer_metadata(tokenizer, args.hf_assets_path),
+        "pad_token_id": pad_token_id,
+        "max_length": args.max_length,
+        "buckets": list(buckets),
+        "bucket_files": {
+            str(bucket): str(path) for bucket, path in bucket_paths.items()
+        },
+        "bucket_counts": {str(bucket): bucket_counts[bucket] for bucket in buckets},
+        "length_histogram_rounded_to_1024": {
+            str(length): count for length, count in sorted(length_histogram.items())
+        },
+        "num_usable_examples": usable_examples,
+        "streamed_examples_scanned": streamed_examples,
+        "skipped": dict(skipped),
+        "include_model_patch": args.include_model_patch,
+        "git": {
+            "branch": _run_git(["branch", "--show-current"]),
+            "commit": _run_git(["rev-parse", "HEAD"]),
+            "status_short": _run_git(["status", "--short"]),
+        },
+        "software_versions": _package_versions(),
     }
-    try:
-        return torch.optim.AdamW(trainable_params, fused=True, **optimizer_kwargs)
-    except TypeError:
-        return torch.optim.AdamW(trainable_params, **optimizer_kwargs)
+    (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    return manifest
 
 
-def _apply_lora(model: Any, args: argparse.Namespace) -> Any:
-    if args.train_mode != "lora":
-        return model
+def _bucket_files_from_manifest(manifest: Mapping[str, Any]) -> dict[int, Path]:
+    return {
+        int(bucket): Path(path)
+        for bucket, path in manifest.get("bucket_files", {}).items()
+    }
 
-    try:
-        from peft import LoraConfig, TaskType, get_peft_model
-    except ImportError as exc:
-        raise RuntimeError(
-            "--train-mode=lora requires peft. Install peft in the training "
-            "environment or rerun with --train-mode=full if memory permits."
-        ) from exc
 
-    target_modules = [
-        module.strip()
-        for module in args.lora_target_modules.split(",")
-        if module.strip()
+def _bucket_counts_from_manifest(manifest: Mapping[str, Any]) -> dict[int, int]:
+    return {
+        int(bucket): int(count)
+        for bucket, count in manifest.get("bucket_counts", {}).items()
+    }
+
+
+def download_hf_assets_if_requested(args: argparse.Namespace) -> None:
+    if not args.download_hf_assets:
+        return
+    repo_root = Path(__file__).resolve().parents[1]
+    local_dir = args.hf_assets_path.parent
+    command = [
+        sys.executable,
+        str(repo_root / "torchtitan" / "scripts" / "download_hf_assets.py"),
+        "--repo_id",
+        args.model_id,
+        "--local_dir",
+        str(local_dir),
+        "--assets",
+        "tokenizer",
+        "config",
+        "safetensors",
+        "index",
     ]
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
+    if args.hf_token:
+        command.extend(["--hf_token", args.hf_token])
+    subprocess.run(command, check=True)
+
+
+def build_stage_env(
+    args: argparse.Namespace,
+    *,
+    stage: BucketStage,
+    total_steps: int,
+    warmup_steps: int,
+    pad_token_id: int,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    repo_root = Path(__file__).resolve().parents[1]
+    pythonpath_entries = [str(repo_root / "torchtitan"), str(repo_root)]
+    if env.get("PYTHONPATH"):
+        pythonpath_entries.append(env["PYTHONPATH"])
+    env.update(
+        {
+            "PYTHONPATH": os.pathsep.join(pythonpath_entries),
+            "TOKENIZERS_PARALLELISM": "false",
+            "CUDA_DEVICE_MAX_CONNECTIONS": env.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING": env.get(
+                "TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"
+            ),
+            "LOG_RANK": args.log_rank,
+            "SWEHERO_MODEL_ID": args.model_id,
+            "SWEHERO_DATASET_ID": args.dataset_id,
+            "SWEHERO_BUCKET_FILE": str(stage.bucket_file),
+            "SWEHERO_BUCKET_SEQ_LEN": str(stage.bucket),
+            "SWEHERO_BUCKET_CP": str(stage.cp_degree),
+            "SWEHERO_TOTAL_STEPS": str(total_steps),
+            "SWEHERO_CUMULATIVE_STEPS": str(stage.cumulative_steps),
+            "SWEHERO_WARMUP_STEPS": str(warmup_steps),
+            "SWEHERO_HF_ASSETS_PATH": str(args.hf_assets_path),
+            "SWEHERO_TORCHTITAN_DUMP_FOLDER": str(args.out_dir / "torchtitan"),
+            "SWEHERO_PAD_TOKEN_ID": str(pad_token_id),
+            "SWEHERO_SEED": str(args.seed),
+            "SWEHERO_GLOBAL_BATCH_SIZE": str(args.global_batch_size),
+            "SWEHERO_LOCAL_BATCH_SIZE": str(args.local_batch_size),
+            "SWEHERO_LEARNING_RATE": repr(args.learning_rate),
+            "SWEHERO_MIN_LEARNING_RATE": repr(args.min_learning_rate),
+            "SWEHERO_WEIGHT_DECAY": repr(args.weight_decay),
+            "SWEHERO_MAX_GRAD_NORM": repr(args.max_grad_norm),
+            "SWEHERO_ATTENTION_BACKEND": args.attention_backend,
+            "SWEHERO_ENABLE_FP8": "1" if args.enable_fp8 else "0",
+            "SWEHERO_FP8_RECIPE": args.fp8_recipe,
+            "SWEHERO_COMPILE": "1" if args.compile else "0",
+            "SWEHERO_AC_MODE": args.activation_checkpoint_mode,
+            "SWEHERO_CHUNKED_CE_CHUNKS": str(args.chunked_ce_chunks),
+            "SWEHERO_CHECKPOINT_INTERVAL": str(args.checkpoint_interval),
+            "SWEHERO_CHECKPOINT_ASYNC_MODE": args.checkpoint_async_mode,
+            "SWEHERO_METRICS_LOG_FREQ": str(args.metrics_log_freq),
+            "SWEHERO_ENABLE_WANDB": "1" if args.enable_wandb else "0",
+            "WANDB_PROJECT": args.wandb_project,
+            "WANDB_RUN_NAME": args.wandb_run_name,
+        }
     )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-    return model
+    return env
 
 
-def _base_causal_lm(model: Any) -> Any:
-    if hasattr(model, "module"):
-        model = model.module
-    if hasattr(model, "get_base_model"):
-        return model.get_base_model()
-    return model
+def build_torchrun_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        args.torchrun_bin,
+        "--nproc_per_node",
+        str(args.nproc_per_node),
+        "--rdzv_backend",
+        "c10d",
+        "--rdzv_endpoint",
+        "localhost:0",
+        "--tee",
+        "3",
+    ]
+    if args.torchrun_log_rank_filter:
+        command.extend(["--local-ranks-filter", args.torchrun_log_rank_filter])
+    command.extend(
+        [
+            "-m",
+            "torchtitan.train",
+            "--module",
+            "swehero",
+            "--config",
+            "qwen25_coder7b_direct_to_hero",
+        ]
+    )
+    return command
+
+
+def run_stage(args: argparse.Namespace, stage: BucketStage, plan: BucketPlan, pad_token_id: int) -> None:
+    env = build_stage_env(
+        args,
+        stage=stage,
+        total_steps=plan.total_steps,
+        warmup_steps=plan.warmup_steps,
+        pad_token_id=pad_token_id,
+    )
+    command = build_torchrun_command(args)
+    print(
+        "Launching bucket "
+        f"{stage.bucket} (CP={stage.cp_degree}, examples={stage.example_count}, "
+        f"target_step={stage.cumulative_steps})"
+    )
+    subprocess.run(command, check=True, env=env, cwd=Path(__file__).resolve().parents[1])
+
+
+def _write_launcher_plan(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+) -> None:
+    launcher_plan = {
+        "stages": [
+            {
+                **asdict(stage),
+                "bucket_file": str(stage.bucket_file),
+                "torchrun_command": build_torchrun_command(args),
+                "env_overrides": {
+                    key: value
+                    for key, value in build_stage_env(
+                        args,
+                        stage=stage,
+                        total_steps=plan.total_steps,
+                        warmup_steps=plan.warmup_steps,
+                        pad_token_id=int(manifest["pad_token_id"]),
+                    ).items()
+                    if key.startswith("SWEHERO_")
+                    or key in {"LOG_RANK", "WANDB_PROJECT", "WANDB_RUN_NAME"}
+                },
+            }
+            for stage in plan.stages
+        ],
+        "total_steps": plan.total_steps,
+        "warmup_steps": plan.warmup_steps,
+        "manifest": str(args.out_dir / "data" / "manifest.json"),
+    }
+    (args.out_dir / "launcher_plan.json").write_text(
+        json.dumps(launcher_plan, indent=2)
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     smoke.load_env_file(args.env_file)
+
+    args.buckets = ",".join(str(b) for b in parse_bucket_list(args.buckets))
+    buckets = parse_bucket_list(args.buckets)
+    bucket_cp = parse_bucket_cp_map(args.bucket_cp)
+    validate_bucket_config(
+        buckets=buckets,
+        bucket_cp=bucket_cp,
+        nproc_per_node=args.nproc_per_node,
+        attention_backend=args.attention_backend,
+    )
+
+    if args.max_length > PAPER_CONTEXT_LENGTH:
+        raise ValueError(
+            f"--max-length={args.max_length} exceeds paper context {PAPER_CONTEXT_LENGTH}"
+        )
+    if args.max_length > max(buckets):
+        raise ValueError("--max-length cannot exceed the largest bucket")
+
+    if args.overwrite_output and args.out_dir.exists():
+        shutil.rmtree(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    import torch
-    from transformers import (
-        AutoConfig,
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        Trainer,
-        TrainingArguments,
-        set_seed,
-    )
+    tt_dump = args.out_dir / "torchtitan"
+    checkpoint_dir = tt_dump / "checkpoint"
+    if checkpoint_dir.exists() and not (args.resume or args.dry_run):
+        raise RuntimeError(
+            f"{checkpoint_dir} already exists. Pass --resume to continue or "
+            "--overwrite-output to start fresh."
+        )
 
-    set_seed(args.seed)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    cuda_device = _select_cuda_device(torch)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    download_hf_assets_if_requested(args)
 
-    use_wandb = args.enable_wandb and bool(os.environ.get("WANDB_API_KEY"))
-    if use_wandb:
-        os.environ.setdefault("WANDB_ENTITY", args.wandb_entity)
-        os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
-        os.environ.setdefault("WANDB_RUN_NAME", args.wandb_run_name)
+    if args.skip_data_prep:
+        manifest = _load_manifest(args.out_dir)
     else:
-        os.environ.setdefault("WANDB_DISABLED", "true")
+        manifest = materialize_smoke_subset(args)
 
-    print(f"model={args.model_id}")
-    print(f"dataset={args.dataset_id}")
-    print(f"train_mode={args.train_mode}")
-    print(f"model_context_length={args.model_context_length}")
-    print(f"train_max_length={args.max_length}")
-    print(f"wandb={'enabled' if use_wandb else 'disabled'}")
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_id,
-        trust_remote_code=True,
-        local_files_only=args.local_files_only,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.model_max_length = max(args.model_context_length, args.max_length)
-
-    encoded_examples, streamed_examples = _load_encoded_examples(args, tokenizer)
-    plan = build_training_plan(
-        num_unique_examples=len(encoded_examples),
+    bucket_counts = _bucket_counts_from_manifest(manifest)
+    bucket_files = _bucket_files_from_manifest(manifest)
+    plan = build_bucket_plan(
+        bucket_counts=bucket_counts,
+        bucket_files=bucket_files,
+        bucket_cp=bucket_cp,
+        epochs=args.num_train_epochs,
         global_batch_size=args.global_batch_size,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        world_size=args.world_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.num_train_epochs,
+        warmup_ratio=args.warmup_ratio,
         max_steps=args.max_steps,
     )
-    print(f"training_plan={json.dumps(asdict(plan), indent=2)}")
+    _write_launcher_plan(args, plan, manifest)
 
-    class ShortSweHeroDataset(torch.utils.data.Dataset):
-        def __len__(self) -> int:
-            return plan.items_per_epoch
-
-        def __getitem__(self, idx: int) -> dict[str, list[int]]:
-            return encoded_examples[idx % len(encoded_examples)]
-
-    def collate(features: list[dict[str, list[int]]]) -> dict[str, torch.Tensor]:
-        max_batch_len = max(len(feature["input_ids"]) for feature in features)
-        input_ids = torch.full(
-            (len(features), max_batch_len),
-            tokenizer.pad_token_id,
-            dtype=torch.long,
-        )
-        attention_mask = torch.zeros((len(features), max_batch_len), dtype=torch.long)
-        labels = torch.full((len(features), max_batch_len), -100, dtype=torch.long)
-
-        for row, feature in enumerate(features):
-            length = len(feature["input_ids"])
-            input_ids[row, :length] = torch.tensor(
-                feature["input_ids"], dtype=torch.long
-            )
-            attention_mask[row, :length] = 1
-            labels[row, :length] = torch.tensor(feature["labels"], dtype=torch.long)
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-    common_summary = {
-        "model": args.model_id,
-        "dataset": args.dataset_id,
-        "dataset_revision": _dataset_revision_info(
-            args.dataset_id, args.dataset_revision
-        ),
-        "paper_alignment": _paper_alignment(args),
-        "tokenizer": _tokenizer_metadata(tokenizer),
-        "num_unique_examples": len(encoded_examples),
-        "streamed_examples_scanned": streamed_examples,
-        "training_plan": asdict(plan),
-        "max_length": args.max_length,
-        "model_context_length": args.model_context_length,
-        "optimizer": {
-            "name": "AdamW",
-            "learning_rate": args.learning_rate,
-            "min_learning_rate": args.min_learning_rate,
-            "warmup_ratio": args.warmup_ratio,
-            "weight_decay": args.weight_decay,
-            "betas": [0.9, 0.999],
-            "eps": 1e-8,
-        },
-        "lr_scheduler": "cosine_with_min_lr",
-        "loss_implementation": "chunked_causal_lm",
-        "logit_chunk_size": args.logit_chunk_size,
-        "git": {
-            "branch": _run_git(["branch", "--show-current"])
-            or os.environ.get("SOURCE_GIT_BRANCH"),
-            "commit": _run_git(["rev-parse", "HEAD"])
-            or os.environ.get("SOURCE_GIT_COMMIT"),
-            "status_short": _run_git(["status", "--short"])
-            or os.environ.get("SOURCE_GIT_STATUS"),
-        },
-        "software_versions": _package_versions(),
-        "distributed": {
-            "rank": _rank_from_env(),
-            "local_rank": _local_rank_from_env(),
-            "world_size": _world_size_from_env(),
-            "cuda_device": cuda_device,
-        },
-        "wandb": {
-            "enabled": use_wandb,
-            "entity": os.environ.get("WANDB_ENTITY") if use_wandb else None,
-            "project": os.environ.get("WANDB_PROJECT") if use_wandb else None,
-            "run_name": os.environ.get("WANDB_RUN_NAME") if use_wandb else None,
-        },
-    }
-
-    if args.dry_run_tokenize_only:
-        summary = {
-            **common_summary,
-            "dry_run_tokenize_only": True,
-            "losses": [],
-            "train_runtime": None,
-        }
-        if _is_main_process_from_env():
-            (args.out_dir / "train_result.json").write_text(
-                json.dumps(summary, indent=2)
-            )
-            print(json.dumps(summary, indent=2))
+    print(json.dumps({"bucket_plan": [asdict(stage) for stage in plan.stages]}, default=str, indent=2))
+    if args.prepare_data_only or args.dry_run:
+        print(f"Wrote launcher plan to {args.out_dir / 'launcher_plan.json'}")
         return
 
-    config = AutoConfig.from_pretrained(
-        args.model_id,
-        trust_remote_code=True,
-        local_files_only=args.local_files_only,
-    )
-    smoke.maybe_enable_yarn(
-        config,
-        max_length=args.model_context_length,
-        enable_yarn=not args.disable_yarn,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        config=config,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=args.attn_implementation,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-        local_files_only=args.local_files_only,
-    )
-    model.config.use_cache = False
-    if cuda_device is not None:
-        model.to(cuda_device)
-    if not args.no_gradient_checkpointing:
-        try:
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-        except TypeError:
-            model.gradient_checkpointing_enable()
-    model = _apply_lora(model, args)
-    if not args.no_gradient_checkpointing and hasattr(
-        model, "enable_input_require_grads"
-    ):
-        model.enable_input_require_grads()
-
-    optimizer = _build_optimizer(torch, model, args)
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        smoke.build_cosine_with_min_lr_lambda(
-            plan.total_optimizer_steps,
-            learning_rate=args.learning_rate,
-            min_learning_rate=args.min_learning_rate,
-            warmup_ratio=args.warmup_ratio,
-        ),
-    )
-
-    training_args = TrainingArguments(
-        output_dir=str(args.out_dir / "trainer"),
-        max_steps=args.max_steps if args.max_steps > 0 else -1,
-        num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=plan.batch.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        bf16=True,
-        logging_steps=args.logging_steps,
-        save_strategy="no",
-        report_to=["wandb"] if use_wandb else [],
-        run_name=args.wandb_run_name if use_wandb else None,
-        do_train=True,
-        dataloader_num_workers=0,
-        remove_unused_columns=False,
-        seed=args.seed,
-    )
-
-    class ChunkedCausalLMTrainer(Trainer):
-        def compute_loss(
-            self,
-            model,
-            inputs,
-            return_outputs: bool = False,
-            num_items_in_batch=None,
-        ):
-            labels = inputs.pop("labels")
-            causal_lm = _base_causal_lm(model)
-            if not hasattr(causal_lm, "model") or not hasattr(causal_lm, "lm_head"):
-                outputs = model(**inputs, labels=labels, use_cache=False)
-                return (outputs.loss, outputs) if return_outputs else outputs.loss
-
-            outputs = causal_lm.model(**inputs, use_cache=False)
-            hidden_states = outputs.last_hidden_state
-            shifted_hidden_states = hidden_states[:, :-1, :].reshape(
-                -1, hidden_states.shape[-1]
-            )
-            shifted_labels = labels[:, 1:].reshape(-1)
-
-            loss_sum = shifted_hidden_states.new_zeros(())
-            token_count = shifted_hidden_states.new_zeros(())
-            for start in range(
-                0, shifted_hidden_states.shape[0], args.logit_chunk_size
-            ):
-                end = min(
-                    start + args.logit_chunk_size,
-                    shifted_hidden_states.shape[0],
-                )
-                label_chunk = shifted_labels[start:end]
-                valid_tokens = label_chunk.ne(-100).sum()
-                if valid_tokens.item() == 0:
-                    continue
-
-                logits = causal_lm.lm_head(shifted_hidden_states[start:end])
-                loss_sum = loss_sum + torch.nn.functional.cross_entropy(
-                    logits.float(),
-                    label_chunk,
-                    ignore_index=-100,
-                    reduction="sum",
-                )
-                token_count = token_count + valid_tokens
-
-            loss = loss_sum / token_count.clamp_min(1)
-            if return_outputs:
-                return loss, outputs
-            return loss
-
-    trainer = ChunkedCausalLMTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=ShortSweHeroDataset(),
-        data_collator=collate,
-        optimizers=(optimizer, lr_scheduler),
-    )
-    started_at = time.time()
-    result = trainer.train()
-    wall_time = time.time() - started_at
-
-    if args.save_final and trainer.is_world_process_zero():
-        save_dir = args.out_dir / ("adapter" if args.train_mode == "lora" else "model")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        model_to_save = trainer.model
-        if hasattr(trainer, "accelerator"):
-            model_to_save = trainer.accelerator.unwrap_model(model_to_save)
-        model_to_save.save_pretrained(save_dir)
-        tokenizer.save_pretrained(args.out_dir / "tokenizer")
-
-    losses = [
-        entry["loss"]
-        for entry in trainer.state.log_history
-        if "loss" in entry and isinstance(entry["loss"], float)
-    ]
-    cuda_summary = _collect_cuda_summaries(torch)
-
-    summary = {
-        **common_summary,
-        "dry_run_tokenize_only": False,
-        "train_mode": args.train_mode,
-        "lora": {
-            "rank": args.lora_rank,
-            "alpha": args.lora_alpha,
-            "dropout": args.lora_dropout,
-            "target_modules": [
-                module.strip()
-                for module in args.lora_target_modules.split(",")
-                if module.strip()
-            ],
-        }
-        if args.train_mode == "lora"
-        else None,
-        **_parameter_counts(model),
-        "gradient_checkpointing": not args.no_gradient_checkpointing,
-        "attn_implementation": args.attn_implementation,
-        "losses": losses,
-        "first_loss": losses[0] if losses else None,
-        "last_loss": losses[-1] if losses else None,
-        "train_runtime": result.metrics.get("train_runtime"),
-        "wall_time_seconds": wall_time,
-        "cuda": cuda_summary,
-        "save_final": args.save_final,
-    }
-    if trainer.is_world_process_zero():
-        (args.out_dir / "train_result.json").write_text(json.dumps(summary, indent=2))
-        print(json.dumps(summary, indent=2))
+    pad_token_id = int(manifest["pad_token_id"])
+    for stage in plan.stages:
+        run_stage(args, stage, plan, pad_token_id)
 
 
 if __name__ == "__main__":

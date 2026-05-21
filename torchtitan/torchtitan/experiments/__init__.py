@@ -10,6 +10,7 @@ _supported_experiments = frozenset(
         "graph_trainer.deepseek_v3",
         "graph_trainer.qwen3",
         "transformers_modeling_backend",
+        "swehero",
         "autoparallel.llama3",
         "autoparallel.local_map_deepseek_v3",
         "ft.llama3",

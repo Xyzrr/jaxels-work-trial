@@ -1,120 +1,148 @@
-import os
+import tempfile
 import unittest
-from unittest import mock
+from pathlib import Path
 
 from scripts import qwen_swehero_train as train
 
 
-class QwenSweHeroTrainPlanTests(unittest.TestCase):
-    def test_default_short_run_keeps_paper_batch_and_epoch_count(self):
+class FakeTokenizer:
+    bos_id = None
+    eos_id = None
+
+    def encode(self, text, **kwargs):
+        return [ord(ch) for ch in text]
+
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids)
+
+
+class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
+    def test_defaults_track_paper_hyperparameters_and_target_pod(self):
         args = train.parse_args([])
-        plan = train.build_training_plan(
-            num_unique_examples=args.num_examples,
-            global_batch_size=args.global_batch_size,
-            per_device_train_batch_size=args.per_device_train_batch_size,
-            world_size=args.world_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            num_train_epochs=args.num_train_epochs,
-            max_steps=args.max_steps,
-        )
 
-        self.assertEqual(args.model_context_length, train.smoke.PAPER_CONTEXT_LENGTH)
-        self.assertEqual(args.max_length, train.DEFAULT_TRAIN_MAX_LENGTH)
-        self.assertEqual(args.train_mode, "lora")
-        self.assertFalse(args.enable_wandb)
-        self.assertEqual(plan.batch.global_batch_size, 32)
-        self.assertEqual(plan.batch.effective_global_batch_size, 32)
-        self.assertEqual(plan.batch.gradient_accumulation_steps, 32)
-        self.assertEqual(plan.items_per_epoch, 32)
-        self.assertEqual(plan.steps_per_epoch, 1)
-        self.assertEqual(plan.total_optimizer_steps, 3)
+        self.assertEqual(args.model_id, train.MODEL_ID)
+        self.assertEqual(args.dataset_id, train.DATASET_ID)
+        self.assertEqual(args.max_length, train.PAPER_CONTEXT_LENGTH)
+        self.assertEqual(args.num_train_epochs, 3.0)
+        self.assertEqual(args.global_batch_size, 32)
+        self.assertEqual(args.learning_rate, 1e-5)
+        self.assertEqual(args.min_learning_rate, 1e-8)
+        self.assertEqual(args.warmup_ratio, 0.1)
+        self.assertEqual(args.nproc_per_node, 8)
+        self.assertTrue(args.enable_fp8)
+        self.assertEqual(args.attention_backend, "sdpa")
+        self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
 
-    def test_plan_pads_partial_epoch_to_effective_global_batch(self):
-        plan = train.build_training_plan(
-            num_unique_examples=33,
-            global_batch_size=32,
-            per_device_train_batch_size=1,
-            world_size=1,
-            gradient_accumulation_steps=None,
-            num_train_epochs=3,
-            max_steps=0,
-        )
+    def test_choose_bucket_ceilings(self):
+        buckets = (8, 16, 32)
 
-        self.assertEqual(plan.items_per_epoch, 64)
-        self.assertEqual(plan.steps_per_epoch, 2)
-        self.assertEqual(plan.total_optimizer_steps, 6)
+        self.assertEqual(train.choose_bucket(1, buckets), 8)
+        self.assertEqual(train.choose_bucket(8, buckets), 8)
+        self.assertEqual(train.choose_bucket(9, buckets), 16)
+        self.assertEqual(train.choose_bucket(17, buckets), 32)
+        with self.assertRaises(ValueError):
+            train.choose_bucket(33, buckets)
 
-    def test_max_steps_override_extends_epoch_length(self):
-        plan = train.build_training_plan(
-            num_unique_examples=8,
-            global_batch_size=32,
-            per_device_train_batch_size=1,
-            world_size=1,
-            gradient_accumulation_steps=None,
-            num_train_epochs=3,
-            max_steps=4,
-        )
-
-        self.assertEqual(plan.items_per_epoch, 128)
-        self.assertEqual(plan.steps_per_epoch, 4)
-        self.assertEqual(plan.total_optimizer_steps, 4)
-        self.assertEqual(plan.max_steps_override, 4)
-
-    def test_paper_alignment_declares_short_run_deviations(self):
-        args = train.parse_args([])
-        alignment = train._paper_alignment(args)
-
-        self.assertEqual(
-            alignment["kept"]["model_context_length"],
-            train.smoke.PAPER_CONTEXT_LENGTH,
-        )
-        self.assertIn(
-            "7B direct-to-hero is a scale-study extension",
-            alignment["intentional_deviations"][0],
-        )
-        self.assertTrue(
-            any(
-                "LoRA" in deviation or "lora" in deviation
-                for deviation in alignment["intentional_deviations"]
+    def test_bucket_plan_uses_epochs_and_cumulative_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bucket_files = {
+                8192: Path(tmp) / "bucket_8192.jsonl",
+                32768: Path(tmp) / "bucket_32768.jsonl",
+            }
+            plan = train.build_bucket_plan(
+                bucket_counts={8192: 33, 32768: 1},
+                bucket_files=bucket_files,
+                bucket_cp={8192: 1, 32768: 2},
+                epochs=3.0,
+                global_batch_size=32,
+                warmup_ratio=0.1,
             )
+
+        self.assertEqual(plan.total_steps, 5)
+        self.assertEqual(plan.warmup_steps, 1)
+        self.assertEqual([stage.bucket for stage in plan.stages], [8192, 32768])
+        self.assertEqual([stage.steps for stage in plan.stages], [4, 1])
+        self.assertEqual([stage.cumulative_steps for stage in plan.stages], [4, 5])
+        self.assertEqual([stage.cp_degree for stage in plan.stages], [1, 2])
+
+    def test_varlen_attention_is_rejected_when_any_bucket_uses_cp(self):
+        with self.assertRaisesRegex(ValueError, "VarlenAttention"):
+            train.validate_bucket_config(
+                buckets=(8192, 32768),
+                bucket_cp={8192: 1, 32768: 2},
+                nproc_per_node=8,
+                attention_backend="varlen",
+            )
+
+    def test_encode_masks_user_system_and_tool_observations(self):
+        example = {
+            "trajectory": [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "please fix it"},
+                {
+                    "role": "assistant",
+                    "content": "RUN_TESTS",
+                    "tool_calls": [
+                        {"name": "execute_bash", "arguments": {"cmd": "pytest"}}
+                    ],
+                },
+                {"role": "tool", "content": "secret failing output"},
+                {"role": "assistant", "content": "DONE"},
+            ]
+        }
+
+        encoded = train.encode_swehero_example(
+            FakeTokenizer(),
+            example,
+            max_length=4096,
+            min_trainable_tokens=1,
         )
 
-    def test_torchrun_rank_env_drives_cuda_device_selection(self):
-        class FakeCuda:
-            def __init__(self):
-                self.selected_device = None
+        self.assertIsNotNone(encoded)
+        trainable_text = FakeTokenizer().decode(
+            label
+            for label in encoded["labels"]
+            if label != train.IGNORE_INDEX
+        )
+        self.assertIn("RUN_TESTS", trainable_text)
+        self.assertIn("execute_bash", trainable_text)
+        self.assertIn("DONE", trainable_text)
+        self.assertNotIn("please fix it", trainable_text)
+        self.assertNotIn("system prompt", trainable_text)
+        self.assertNotIn("secret failing output", trainable_text)
+        self.assertNotIn("<|assistant|>", trainable_text)
 
-            def is_available(self):
-                return True
+    def test_stage_environment_and_torchrun_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            args = train.parse_args(["--out-dir", str(out_dir)])
+            stage = train.BucketStage(
+                bucket=32768,
+                cp_degree=2,
+                example_count=4,
+                steps=1,
+                cumulative_steps=3,
+                bucket_file=out_dir / "data" / "bucket_32768.jsonl",
+            )
+            env = train.build_stage_env(
+                args,
+                stage=stage,
+                total_steps=5,
+                warmup_steps=1,
+                pad_token_id=151643,
+            )
+            command = train.build_torchrun_command(args)
 
-            def set_device(self, local_rank):
-                self.selected_device = local_rank
-
-        class FakeTorch:
-            cuda = FakeCuda()
-
-        with mock.patch.dict(os.environ, {"LOCAL_RANK": "6"}, clear=False):
-            device = train._select_cuda_device(FakeTorch)
-
-        self.assertEqual(device, "cuda:6")
-        self.assertEqual(FakeTorch.cuda.selected_device, 6)
-
-    def test_main_process_detection_uses_global_rank(self):
-        with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False):
-            self.assertTrue(train._is_main_process_from_env())
-
-        with mock.patch.dict(os.environ, {"RANK": "3"}, clear=False):
-            self.assertFalse(train._is_main_process_from_env())
-
-    def test_base_causal_lm_unwraps_ddp_before_peft(self):
-        class PeftLikeModel:
-            def get_base_model(self):
-                return "base"
-
-        class DdpLikeWrapper:
-            module = PeftLikeModel()
-
-        self.assertEqual(train._base_causal_lm(DdpLikeWrapper()), "base")
+        self.assertEqual(env["SWEHERO_BUCKET_CP"], "2")
+        self.assertEqual(env["SWEHERO_BUCKET_SEQ_LEN"], "32768")
+        self.assertEqual(env["SWEHERO_ENABLE_FP8"], "1")
+        self.assertEqual(env["SWEHERO_CUMULATIVE_STEPS"], "3")
+        self.assertIn("-m", command)
+        self.assertIn("torchtitan.train", command)
+        self.assertIn("--module", command)
+        self.assertIn("swehero", command)
+        self.assertIn("--config", command)
+        self.assertIn("qwen25_coder7b_direct_to_hero", command)
 
 
 if __name__ == "__main__":
