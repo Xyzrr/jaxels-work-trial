@@ -2,6 +2,10 @@
 
 Build a prototype mid-training pipeline for a future 100B-500B open source coding model. The pipeline consumes SWE traces.
 
+# Mode
+
+Ship prototype ASAP: skip post-task validation, parent-branch merges, and PR ceremony unless explicitly asked. When done, commit task changes and push the current branch.
+
 # Current Baseline
 
 Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HERO" (arXiv:2604.01496):
