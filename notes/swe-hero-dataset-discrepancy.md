@@ -135,6 +135,17 @@ Use one of these only with an explicit caveat that it is not the exact paper tra
    - Pros: closest public unique-instance count.
    - Cons: still not 13.2k, uses an early post-paper upload, and includes license labels later removed from the public card/current data.
 
+Implemented local preparation workflow:
+
+- Script: `scripts/prepare_swehero_historical_one_rollout.py`
+- Default output: `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`
+- Source revision: `5b2ed21270ad773a50163e2999c510f0cbb92cfa`
+- Output shape from the 2026-05-21 run: 12,633 selected rows from 35,934 public rows and 12,633 unique instances.
+- Training path: pass the output directory as `--dataset-id`.
+
+The script applies the paper filters observable from public columns and records
+the missing `test_patch`-overlap filter caveat in the generated `metadata.json`.
+
 ## Request To Authors
 
 If we need the exact paper rows, ask NVIDIA for the training manifest rather than another natural-language clarification.
