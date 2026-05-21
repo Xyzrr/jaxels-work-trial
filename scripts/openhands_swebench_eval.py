@@ -526,6 +526,12 @@ def run_eval(args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands)
     env["USE_HINT_TEXT"] = "false"
     env["ITERATIVE_EVAL_MODE"] = "false"
     env["ENABLE_LLM_EDITOR"] = "false"
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(args.openhands_dir)
+        if not existing_pythonpath
+        else f"{args.openhands_dir}{os.pathsep}{existing_pythonpath}"
+    )
 
     run_command(commands.run_infer, cwd=args.openhands_dir, env=env)
     if not paths.expected_output_jsonl.exists():
