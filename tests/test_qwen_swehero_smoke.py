@@ -49,6 +49,10 @@ class QwenSweHeroSmokeTests(unittest.TestCase):
         self.assertEqual(config["effective_global_batch_size"], 32)
         self.assertEqual(config["gradient_accumulation_steps"], 32)
 
+    def test_default_context_length_matches_paper(self):
+        self.assertEqual(smoke.MAX_LENGTH, smoke.PAPER_CONTEXT_LENGTH)
+        self.assertEqual(smoke.MAX_LENGTH, 131_072)
+
 
 if __name__ == "__main__":
     unittest.main()

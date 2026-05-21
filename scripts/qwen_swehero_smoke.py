@@ -9,10 +9,9 @@ This intentionally keeps four prototype constraints:
 
 Within those limits, defaults follow the paper where practical: three training
 epochs, effective global batch size 32, cosine LR from 1e-5 toward 1e-8 with a
-0.1 warmup ratio, and assistant/action-only loss masking that excludes tool
-observations. The paper uses a 128k context; the default here uses Qwen's native
-32k context as a one-GPU smoke cap. Set ``MAX_LENGTH=131072`` to exercise the
-paper context length; YaRN is enabled automatically above 32k.
+0.1 warmup ratio, assistant/action-only loss masking that excludes tool
+observations, and the paper's 128k context length. YaRN is enabled automatically
+above Qwen's native 32k context.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ DATASET_ID = os.environ.get("DATASET_ID", "nvidia/SWE-Hero-openhands-trajectorie
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/workspace/qwen25-coder7b-swehero-smoke"))
 PAPER_CONTEXT_LENGTH = 131_072
 QWEN_NATIVE_CONTEXT_LENGTH = 32_768
-MAX_LENGTH = int(os.environ.get("MAX_LENGTH", str(QWEN_NATIVE_CONTEXT_LENGTH)))
+MAX_LENGTH = int(os.environ.get("MAX_LENGTH", str(PAPER_CONTEXT_LENGTH)))
 NUM_EXAMPLES = int(os.environ.get("NUM_EXAMPLES", "2"))
 MAX_STREAMED_EXAMPLES = int(os.environ.get("MAX_STREAMED_EXAMPLES", "200"))
 NUM_TRAIN_EPOCHS = float(os.environ.get("NUM_TRAIN_EPOCHS", "3"))
@@ -375,16 +374,13 @@ def main() -> None:
                 "minimum_learning_rate": MIN_LEARNING_RATE,
                 "warmup_ratio": WARMUP_RATIO,
                 "loss_masking": "assistant/action tokens only; tool observations masked",
+                "context_length": PAPER_CONTEXT_LENGTH,
             },
             "intentional_deviations": [
                 "7B model only",
                 "tiny SWE-HERO subset only",
                 "SWE-ZERO stage skipped",
                 "evaluation skipped",
-                (
-                    "default max_length is Qwen native 32k for one-GPU smoke; "
-                    "set MAX_LENGTH=131072 for paper 128k context"
-                ),
             ],
         },
         "num_unique_examples": len(encoded_examples),
