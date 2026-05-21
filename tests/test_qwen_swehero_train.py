@@ -19,6 +19,7 @@ class QwenSweHeroTrainPlanTests(unittest.TestCase):
         self.assertEqual(args.model_context_length, train.smoke.PAPER_CONTEXT_LENGTH)
         self.assertEqual(args.max_length, train.DEFAULT_TRAIN_MAX_LENGTH)
         self.assertEqual(args.train_mode, "lora")
+        self.assertFalse(args.enable_wandb)
         self.assertEqual(plan.batch.global_batch_size, 32)
         self.assertEqual(plan.batch.effective_global_batch_size, 32)
         self.assertEqual(plan.batch.gradient_accumulation_steps, 32)

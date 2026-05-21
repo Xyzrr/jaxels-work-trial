@@ -33,6 +33,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -398,6 +399,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Save final adapter/model and tokenizer under the output directory.",
     )
     parser.add_argument(
+        "--enable-wandb",
+        action="store_true",
+        default=_env_flag("ENABLE_WANDB", False),
+        help=(
+            "Enable Weights & Biases logging when WANDB_API_KEY is present. "
+            "Disabled by default so logging permissions cannot block smoke training."
+        ),
+    )
+    parser.add_argument(
         "--wandb-entity",
         default=os.environ.get("WANDB_ENTITY", smoke.WANDB_ENTITY),
         help="Weights & Biases entity when WANDB_API_KEY is present.",
@@ -434,10 +444,20 @@ def _dataset_revision_info(dataset_id: str, revision: str | None) -> dict[str, A
         from huggingface_hub import HfApi
 
         info = HfApi().dataset_info(dataset_id, revision=revision)
+        card_data = getattr(info, "card_data", None)
+        if card_data is None:
+            serialized_card_data: dict[str, Any] = {}
+        elif isinstance(card_data, Mapping):
+            serialized_card_data = dict(card_data)
+        elif hasattr(card_data, "to_dict"):
+            serialized_card_data = card_data.to_dict()
+        else:
+            serialized_card_data = {"repr": repr(card_data)}
+
         return {
             "requested_revision": revision,
             "resolved_sha": getattr(info, "sha", None),
-            "card_data": dict(getattr(info, "card_data", {}) or {}),
+            "card_data": serialized_card_data,
         }
     except Exception as exc:
         return {
@@ -624,7 +644,7 @@ def main(argv: list[str] | None = None) -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    use_wandb = bool(os.environ.get("WANDB_API_KEY"))
+    use_wandb = args.enable_wandb and bool(os.environ.get("WANDB_API_KEY"))
     if use_wandb:
         os.environ.setdefault("WANDB_ENTITY", args.wandb_entity)
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
@@ -717,9 +737,12 @@ def main(argv: list[str] | None = None) -> None:
         "loss_implementation": "chunked_causal_lm",
         "logit_chunk_size": args.logit_chunk_size,
         "git": {
-            "branch": _run_git(["branch", "--show-current"]),
-            "commit": _run_git(["rev-parse", "HEAD"]),
-            "status_short": _run_git(["status", "--short"]),
+            "branch": _run_git(["branch", "--show-current"])
+            or os.environ.get("SOURCE_GIT_BRANCH"),
+            "commit": _run_git(["rev-parse", "HEAD"])
+            or os.environ.get("SOURCE_GIT_COMMIT"),
+            "status_short": _run_git(["status", "--short"])
+            or os.environ.get("SOURCE_GIT_STATUS"),
         },
         "software_versions": _package_versions(),
         "wandb": {
