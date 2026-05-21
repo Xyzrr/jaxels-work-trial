@@ -6,16 +6,26 @@
 
 # This file applies the PT-D parallelisms (except pipeline parallelism) and various
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
-    DataParallelMeshDims,
     fully_shard,
     MixedPrecisionPolicy,
 )
+
+try:
+    from torch.distributed.fsdp import DataParallelMeshDims
+except ImportError:
+
+    class DataParallelMeshDims(NamedTuple):
+        """Compatibility shim for PyTorch builds without exported full-DTensor FSDP axes."""
+
+        shard: str | tuple[str, ...] | None = None
+        replicate: str | None = None
 
 from torchtitan.config import (
     ActivationCheckpointConfig,
@@ -182,15 +192,23 @@ def apply_fsdp(
         # Group them together in one FSDP unit to avoid duplicate all-gathers.
         modules = [
             m
-            for m in (model.tok_embeddings, model.norm, model.lm_head)
+            for m in (model.tok_embeddings, model.lm_head)
             if m is not None
         ]
-        # pyrefly: ignore [no-matching-overload]
-        fully_shard(
-            modules,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
-        )
+        if modules:
+            # pyrefly: ignore [no-matching-overload]
+            fully_shard(
+                modules,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
+        if model.norm is not None:
+            # pyrefly: ignore [no-matching-overload]
+            fully_shard(
+                model.norm,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
     else:
         if model.tok_embeddings is not None:
             # pyrefly: ignore [no-matching-overload]
@@ -201,10 +219,17 @@ def apply_fsdp(
             )
         # As an optimization, do not reshard_after_forward the last layers
         # by default since FSDP would prefetch them immediately.
-        if model.norm is not None and model.lm_head is not None:
+        if model.norm is not None:
             # pyrefly: ignore [no-matching-overload]
             fully_shard(
-                [model.norm, model.lm_head],
+                model.norm,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
+        if model.lm_head is not None:
+            # pyrefly: ignore [no-matching-overload]
+            fully_shard(
+                model.lm_head,
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )

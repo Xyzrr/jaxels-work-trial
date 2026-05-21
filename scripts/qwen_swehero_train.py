@@ -12,9 +12,10 @@ scale-study run. It intentionally keeps the paper-facing recipe visible:
 * assistant/action-only loss masking, with tool observations masked.
 
 The important engineering deltas are explicit and recorded in the generated
-manifest: this uses TorchTitan distributed training, BF16 parameters/reductions
-with FP8 linear training where TorchTitan supports it, and length buckets with
-bucket-specific context parallelism instead of padding every example to 128k.
+manifest: this uses TorchTitan distributed training, BF16 mixed-precision
+FSDP parameters/reductions plus FP8 linear training where TorchTitan supports
+it, and length buckets with bucket-specific context parallelism instead of
+padding every example to 128k.
 TorchTitan's native varlen attention currently rejects CP, so CP stages use
 the supported SDPA/Flex attention path and get the padding reduction from
 bucketed sequence lengths.
@@ -612,7 +613,7 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "intentional_engineering_deltas": [
             "TorchTitan distributed full-model SFT replaces the earlier local Transformers smoke script.",
-            "BF16 remains the precision-sensitive base dtype; FP8 is applied only to TorchTitan linear layers selected by its converter.",
+            "FSDP uses BF16 mixed-precision parameters/reductions; FP8 is applied only to TorchTitan linear layers selected by its converter.",
             "Length buckets with per-bucket CP replace static 128k padding.",
             "TorchTitan VarlenAttention currently does not support CP, so CP buckets use the supported SDPA/Flex attention path.",
             f"This smoke run materializes {args.num_examples} examples while the filtered production dataset is being prepared.",

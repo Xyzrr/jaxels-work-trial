@@ -116,7 +116,9 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
             beta2=0.999,
             eps=1e-8,
             weight_decay=_env_float("SWEHERO_WEIGHT_DECAY", 0.0),
-            implementation="fused_opt_states_bf16",
+            implementation=_env(  # type: ignore[arg-type]
+                "SWEHERO_OPTIMIZER_IMPL", "foreach"
+            ),
         ),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=warmup_steps,
@@ -130,13 +132,20 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
             seq_len=seq_len,
             steps=cumulative_steps,
             max_norm=_env_float("SWEHERO_MAX_GRAD_NORM", 1.0),
-            dtype="bfloat16",
-            mixed_precision_param="bfloat16",
-            mixed_precision_reduce="float32",
+            dtype=_env("SWEHERO_TRAINING_DTYPE", "float32"),  # type: ignore[arg-type]
+            mixed_precision_param=_env(  # type: ignore[arg-type]
+                "SWEHERO_MP_PARAM_DTYPE", "bfloat16"
+            ),
+            mixed_precision_reduce=_env(  # type: ignore[arg-type]
+                "SWEHERO_MP_REDUCE_DTYPE", "bfloat16"
+            ),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
             data_parallel_shard_degree=-1,
+            fsdp_reshard_after_forward=_env(  # type: ignore[arg-type]
+                "SWEHERO_FSDP_RESHARD_AFTER_FORWARD", "never"
+            ),
             tensor_parallel_degree=1,
             pipeline_parallel_degree=1,
             context_parallel_degree=cp_degree,
@@ -167,6 +176,7 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
         ),
         debug=DebugConfig(
             seed=_env_int("SWEHERO_SEED", 17),
+            detect_anomaly=_env_bool("SWEHERO_DETECT_ANOMALY", False),
             print_config=True,
             save_config_file="config.json",
         ),
