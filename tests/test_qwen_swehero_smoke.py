@@ -53,6 +53,19 @@ class QwenSweHeroSmokeTests(unittest.TestCase):
         self.assertEqual(smoke.MAX_LENGTH, smoke.PAPER_CONTEXT_LENGTH)
         self.assertEqual(smoke.MAX_LENGTH, 131_072)
 
+    def test_yarn_config_sets_current_and_legacy_rope_shapes(self):
+        class Config:
+            rope_theta = 1_000_000.0
+            max_position_embeddings = smoke.QWEN_NATIVE_CONTEXT_LENGTH
+
+        config = Config()
+        smoke.maybe_enable_yarn(config)
+
+        self.assertEqual(config.max_position_embeddings, smoke.PAPER_CONTEXT_LENGTH)
+        self.assertEqual(config.rope_parameters["rope_type"], "yarn")
+        self.assertEqual(config.rope_scaling["type"], "yarn")
+        self.assertEqual(config.rope_parameters["factor"], 4.0)
+
 
 if __name__ == "__main__":
     unittest.main()

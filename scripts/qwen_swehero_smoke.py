@@ -53,6 +53,7 @@ LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "1e-5"))
 MIN_LEARNING_RATE = float(os.environ.get("MIN_LEARNING_RATE", "1e-8"))
 WARMUP_RATIO = float(os.environ.get("WARMUP_RATIO", "0.1"))
 MIN_TRAINABLE_TOKENS = int(os.environ.get("MIN_TRAINABLE_TOKENS", "1"))
+LOGIT_CHUNK_SIZE = int(os.environ.get("LOGIT_CHUNK_SIZE", "512"))
 INCLUDE_MODEL_PATCH = os.environ.get("INCLUDE_MODEL_PATCH", "0").lower() in {
     "1",
     "true",
@@ -209,10 +210,22 @@ def maybe_enable_yarn(config: Any) -> None:
     if not ENABLE_YARN or MAX_LENGTH <= QWEN_NATIVE_CONTEXT_LENGTH:
         return
 
+    yarn_factor = MAX_LENGTH / QWEN_NATIVE_CONTEXT_LENGTH
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_theta = getattr(config, "rope_scaling", {}).get("rope_theta", 1_000_000.0)
+
     config.rope_scaling = {
-        "factor": MAX_LENGTH / QWEN_NATIVE_CONTEXT_LENGTH,
+        "factor": yarn_factor,
         "original_max_position_embeddings": QWEN_NATIVE_CONTEXT_LENGTH,
+        "rope_theta": rope_theta,
         "type": "yarn",
+    }
+    config.rope_parameters = {
+        "factor": yarn_factor,
+        "original_max_position_embeddings": QWEN_NATIVE_CONTEXT_LENGTH,
+        "rope_theta": rope_theta,
+        "rope_type": "yarn",
     }
     config.max_position_embeddings = max(MAX_LENGTH, PAPER_CONTEXT_LENGTH)
 
@@ -347,7 +360,46 @@ def main() -> None:
         remove_unused_columns=False,
     )
 
-    trainer = Trainer(
+    class ChunkedCausalLMTrainer(Trainer):
+        def compute_loss(
+            self,
+            model,
+            inputs,
+            return_outputs: bool = False,
+            num_items_in_batch=None,
+        ):
+            labels = inputs.pop("labels")
+            outputs = model.model(**inputs, use_cache=False)
+            hidden_states = outputs.last_hidden_state
+            shifted_hidden_states = hidden_states[:, :-1, :].reshape(
+                -1, hidden_states.shape[-1]
+            )
+            shifted_labels = labels[:, 1:].reshape(-1)
+
+            loss_sum = shifted_hidden_states.new_zeros(())
+            token_count = shifted_hidden_states.new_zeros(())
+            for start in range(0, shifted_hidden_states.shape[0], LOGIT_CHUNK_SIZE):
+                end = min(start + LOGIT_CHUNK_SIZE, shifted_hidden_states.shape[0])
+                label_chunk = shifted_labels[start:end]
+                valid_tokens = label_chunk.ne(-100).sum()
+                if valid_tokens.item() == 0:
+                    continue
+
+                logits = model.lm_head(shifted_hidden_states[start:end])
+                loss_sum = loss_sum + torch.nn.functional.cross_entropy(
+                    logits.float(),
+                    label_chunk,
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                token_count = token_count + valid_tokens
+
+            loss = loss_sum / token_count.clamp_min(1)
+            if return_outputs:
+                return loss, outputs
+            return loss
+
+    trainer = ChunkedCausalLMTrainer(
         model=model,
         args=args,
         train_dataset=TinyDataset(),
@@ -392,6 +444,8 @@ def main() -> None:
         **batch_config,
         "optimizer": "AdamW",
         "lr_scheduler": "cosine_with_min_lr",
+        "loss_implementation": "chunked_causal_lm",
+        "logit_chunk_size": LOGIT_CHUNK_SIZE,
         "losses": losses,
         "first_loss": losses[0] if losses else None,
         "last_loss": losses[-1] if losses else None,
