@@ -439,6 +439,61 @@ def _run_git(args: list[str]) -> str | None:
         return None
 
 
+def _rank_from_env() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def _local_rank_from_env() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def _world_size_from_env() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _is_main_process_from_env() -> bool:
+    return _rank_from_env() == 0
+
+
+def _select_cuda_device(torch: Any) -> str | None:
+    if not torch.cuda.is_available():
+        return None
+
+    local_rank = _local_rank_from_env()
+    torch.cuda.set_device(local_rank)
+    return f"cuda:{local_rank}"
+
+
+def _collect_cuda_summaries(torch: Any) -> list[dict[str, Any]] | None:
+    if not torch.cuda.is_available():
+        return None
+
+    device_index = torch.cuda.current_device()
+    summary = {
+        "rank": _rank_from_env(),
+        "local_rank": _local_rank_from_env(),
+        "world_size": _world_size_from_env(),
+        "device_index": device_index,
+        "device_name": torch.cuda.get_device_name(device_index),
+        "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(device_index),
+        "max_memory_reserved_bytes": torch.cuda.max_memory_reserved(device_index),
+    }
+
+    distributed = getattr(torch, "distributed", None)
+    if (
+        distributed is not None
+        and distributed.is_available()
+        and distributed.is_initialized()
+    ):
+        summaries: list[dict[str, Any] | None] = [
+            None
+        ] * distributed.get_world_size()
+        distributed.all_gather_object(summaries, summary)
+        return [item for item in summaries if item is not None]
+
+    return [summary]
+
+
 def _dataset_revision_info(dataset_id: str, revision: str | None) -> dict[str, Any]:
     try:
         from huggingface_hub import HfApi
@@ -619,6 +674,8 @@ def _apply_lora(model: Any, args: argparse.Namespace) -> Any:
 
 
 def _base_causal_lm(model: Any) -> Any:
+    if hasattr(model, "module"):
+        model = model.module
     if hasattr(model, "get_base_model"):
         return model.get_base_model()
     return model
@@ -641,6 +698,7 @@ def main(argv: list[str] | None = None) -> None:
 
     set_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
+    cuda_device = _select_cuda_device(torch)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -745,6 +803,12 @@ def main(argv: list[str] | None = None) -> None:
             or os.environ.get("SOURCE_GIT_STATUS"),
         },
         "software_versions": _package_versions(),
+        "distributed": {
+            "rank": _rank_from_env(),
+            "local_rank": _local_rank_from_env(),
+            "world_size": _world_size_from_env(),
+            "cuda_device": cuda_device,
+        },
         "wandb": {
             "enabled": use_wandb,
             "entity": os.environ.get("WANDB_ENTITY") if use_wandb else None,
@@ -760,8 +824,11 @@ def main(argv: list[str] | None = None) -> None:
             "losses": [],
             "train_runtime": None,
         }
-        (args.out_dir / "train_result.json").write_text(json.dumps(summary, indent=2))
-        print(json.dumps(summary, indent=2))
+        if _is_main_process_from_env():
+            (args.out_dir / "train_result.json").write_text(
+                json.dumps(summary, indent=2)
+            )
+            print(json.dumps(summary, indent=2))
         return
 
     config = AutoConfig.from_pretrained(
@@ -784,7 +851,8 @@ def main(argv: list[str] | None = None) -> None:
         local_files_only=args.local_files_only,
     )
     model.config.use_cache = False
-    model.to("cuda")
+    if cuda_device is not None:
+        model.to(cuda_device)
     if not args.no_gradient_checkpointing:
         try:
             model.gradient_checkpointing_enable(
@@ -887,10 +955,13 @@ def main(argv: list[str] | None = None) -> None:
     result = trainer.train()
     wall_time = time.time() - started_at
 
-    if args.save_final:
+    if args.save_final and trainer.is_world_process_zero():
         save_dir = args.out_dir / ("adapter" if args.train_mode == "lora" else "model")
         save_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(save_dir)
+        model_to_save = trainer.model
+        if hasattr(trainer, "accelerator"):
+            model_to_save = trainer.accelerator.unwrap_model(model_to_save)
+        model_to_save.save_pretrained(save_dir)
         tokenizer.save_pretrained(args.out_dir / "tokenizer")
 
     losses = [
@@ -898,13 +969,7 @@ def main(argv: list[str] | None = None) -> None:
         for entry in trainer.state.log_history
         if "loss" in entry and isinstance(entry["loss"], float)
     ]
-    cuda_summary = None
-    if torch.cuda.is_available():
-        cuda_summary = {
-            "device_name": torch.cuda.get_device_name(0),
-            "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(0),
-            "max_memory_reserved_bytes": torch.cuda.max_memory_reserved(0),
-        }
+    cuda_summary = _collect_cuda_summaries(torch)
 
     summary = {
         **common_summary,
@@ -933,8 +998,9 @@ def main(argv: list[str] | None = None) -> None:
         "cuda": cuda_summary,
         "save_final": args.save_final,
     }
-    (args.out_dir / "train_result.json").write_text(json.dumps(summary, indent=2))
-    print(json.dumps(summary, indent=2))
+    if trainer.is_world_process_zero():
+        (args.out_dir / "train_result.json").write_text(json.dumps(summary, indent=2))
+        print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

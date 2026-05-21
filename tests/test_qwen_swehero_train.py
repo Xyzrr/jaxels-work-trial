@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest import mock
 
 from scripts import qwen_swehero_train as train
 
@@ -76,6 +78,43 @@ class QwenSweHeroTrainPlanTests(unittest.TestCase):
                 for deviation in alignment["intentional_deviations"]
             )
         )
+
+    def test_torchrun_rank_env_drives_cuda_device_selection(self):
+        class FakeCuda:
+            def __init__(self):
+                self.selected_device = None
+
+            def is_available(self):
+                return True
+
+            def set_device(self, local_rank):
+                self.selected_device = local_rank
+
+        class FakeTorch:
+            cuda = FakeCuda()
+
+        with mock.patch.dict(os.environ, {"LOCAL_RANK": "6"}, clear=False):
+            device = train._select_cuda_device(FakeTorch)
+
+        self.assertEqual(device, "cuda:6")
+        self.assertEqual(FakeTorch.cuda.selected_device, 6)
+
+    def test_main_process_detection_uses_global_rank(self):
+        with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False):
+            self.assertTrue(train._is_main_process_from_env())
+
+        with mock.patch.dict(os.environ, {"RANK": "3"}, clear=False):
+            self.assertFalse(train._is_main_process_from_env())
+
+    def test_base_causal_lm_unwraps_ddp_before_peft(self):
+        class PeftLikeModel:
+            def get_base_model(self):
+                return "base"
+
+        class DdpLikeWrapper:
+            module = PeftLikeModel()
+
+        self.assertEqual(train._base_causal_lm(DdpLikeWrapper()), "base")
 
 
 if __name__ == "__main__":
