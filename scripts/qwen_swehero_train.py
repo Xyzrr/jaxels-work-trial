@@ -76,6 +76,9 @@ QWEN_ROPE_THETA = 1_000_000.0
 QWEN_YARN_BETA_FAST = 32.0
 QWEN_YARN_BETA_SLOW = 1.0
 MATERIALIZED_DATA_SCHEMA_VERSION = 1
+RUN_SPEC_SCHEMA_VERSION = 1
+RUN_SPEC_FILENAME = "run_spec.json"
+RUN_SPEC_SHA256_FILENAME = "run_spec.sha256"
 RESUME_CONTRACT_SCHEMA_VERSION = 1
 RESUME_CONTRACT_FILENAME = "resume_contract.json"
 RESUME_ARG_FIELDS = (
@@ -112,6 +115,52 @@ RESUME_ARG_FIELDS = (
     "chunked_ce_chunks",
     "nproc_per_node",
 )
+RUN_SPEC_ARG_FIELDS = (
+    "model_id",
+    "dataset_id",
+    "dataset_path",
+    "source_dataset_id",
+    "source_dataset_revision",
+    "build_dataset_if_missing",
+    "source_dataset_rows_per_shard",
+    "source_dataset_build_batch_size",
+    "hf_assets_path",
+    "num_examples",
+    "max_streamed_examples",
+    "shuffle_buffer",
+    "seed",
+    "max_length",
+    "long_example_policy",
+    "buckets",
+    "bucket_cp",
+    "min_trainable_tokens",
+    "include_model_patch",
+    "num_train_epochs",
+    "max_steps",
+    "global_batch_size",
+    "local_batch_size",
+    "learning_rate",
+    "min_learning_rate",
+    "warmup_ratio",
+    "weight_decay",
+    "max_grad_norm",
+    "attention_backend",
+    "enable_fp8",
+    "fp8_recipe",
+    "compile",
+    "activation_checkpoint_mode",
+    "chunked_ce_chunks",
+    "checkpoint_interval",
+    "checkpoint_async_mode",
+    "metrics_log_freq",
+    "enable_wandb",
+    "wandb_project",
+    "wandb_run_name",
+    "nproc_per_node",
+    "torchrun_bin",
+    "log_rank",
+    "torchrun_log_rank_filter",
+)
 RESUME_STAGE_ENV_KEYS = (
     "SWEHERO_MODEL_ID",
     "SWEHERO_DATASET_ID",
@@ -138,6 +187,17 @@ RESUME_STAGE_ENV_KEYS = (
     "SWEHERO_COMPILE",
     "SWEHERO_AC_MODE",
     "SWEHERO_CHUNKED_CE_CHUNKS",
+)
+LAUNCH_STAGE_ENV_KEYS = (
+    *RESUME_STAGE_ENV_KEYS,
+    "SWEHERO_CHECKPOINT_INTERVAL",
+    "SWEHERO_CHECKPOINT_ASYNC_MODE",
+    "SWEHERO_METRICS_LOG_FREQ",
+    "SWEHERO_LOAD_DATALOADER_STATE",
+    "SWEHERO_ENABLE_WANDB",
+    "LOG_RANK",
+    "WANDB_PROJECT",
+    "WANDB_RUN_NAME",
 )
 
 
@@ -392,6 +452,14 @@ def _resume_contract_path(out_dir: Path) -> Path:
     return out_dir / RESUME_CONTRACT_FILENAME
 
 
+def _run_spec_path(out_dir: Path) -> Path:
+    return out_dir / RUN_SPEC_FILENAME
+
+
+def _run_spec_sha256_path(out_dir: Path) -> Path:
+    return out_dir / RUN_SPEC_SHA256_FILENAME
+
+
 def _checkpoint_step(path: Path) -> int | None:
     match = re.fullmatch(r"step-(\d+)", path.name)
     return int(match.group(1)) if match else None
@@ -479,6 +547,20 @@ def _jsonable(value: object) -> object:
             for key, item in sorted(value.items(), key=lambda entry: str(entry[0]))
         }
     return value
+
+
+def _canonical_json_text(payload: Mapping[str, Any]) -> str:
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    tmp_path.write_text(text)
+    os.replace(tmp_path, path)
 
 
 def _resume_manifest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -2044,6 +2126,138 @@ def build_torchrun_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
+def _stage_env_overrides(
+    args: argparse.Namespace,
+    *,
+    stage: BucketStage,
+    total_steps: int,
+    warmup_steps: int,
+    pad_token_id: int,
+    load_dataloader_state: bool = False,
+) -> dict[str, str]:
+    env = build_stage_env(
+        args,
+        stage=stage,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        pad_token_id=pad_token_id,
+        load_dataloader_state=load_dataloader_state,
+    )
+    return {
+        key: env[key]
+        for key in LAUNCH_STAGE_ENV_KEYS
+        if key in env
+    }
+
+
+def _stage_launch_record(
+    args: argparse.Namespace,
+    stage: BucketStage,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+    *,
+    load_dataloader_state: bool = False,
+) -> dict[str, Any]:
+    return {
+        **asdict(stage),
+        "bucket_file": str(stage.bucket_file),
+        "torchrun_command": build_torchrun_command(args),
+        "env_overrides": _stage_env_overrides(
+            args,
+            stage=stage,
+            total_steps=plan.total_steps,
+            warmup_steps=plan.warmup_steps,
+            pad_token_id=int(manifest["pad_token_id"]),
+            load_dataloader_state=load_dataloader_state,
+        ),
+    }
+
+
+def build_run_spec(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": RUN_SPEC_SCHEMA_VERSION,
+        "launcher": "scripts/qwen_swehero_train.py",
+        "recipe": "qwen2.5-coder-7b-direct-to-hero-torchtitan",
+        "paper_alignment": paper_alignment(args),
+        "args": {
+            field: _jsonable(getattr(args, field))
+            for field in RUN_SPEC_ARG_FIELDS
+        },
+        "paths": {
+            "out_dir": str(args.out_dir),
+            "data_manifest": str(args.out_dir / "data" / "manifest.json"),
+            "launcher_plan": str(args.out_dir / "launcher_plan.json"),
+            "resume_contract": str(_resume_contract_path(args.out_dir)),
+            "torchtitan_dump": str(args.out_dir / "torchtitan"),
+        },
+        "manifest": _resume_manifest_contract(manifest),
+        "plan": {
+            "total_steps": plan.total_steps,
+            "warmup_steps": plan.warmup_steps,
+            "stages": [
+                _stage_launch_record(args, stage, plan, manifest)
+                for stage in plan.stages
+            ],
+        },
+    }
+
+
+def write_or_validate_run_spec(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+    *,
+    require_existing: bool = False,
+) -> bool:
+    spec_path = _run_spec_path(args.out_dir)
+    sha_path = _run_spec_sha256_path(args.out_dir)
+    actual = build_run_spec(args, plan, manifest)
+
+    if spec_path.exists():
+        if not sha_path.exists():
+            raise RuntimeError(
+                f"Immutable run spec checksum is missing: {sha_path}"
+            )
+        existing_text = spec_path.read_text()
+        expected_sha = sha_path.read_text().strip()
+        actual_sha = _sha256_text(existing_text)
+        if expected_sha != actual_sha:
+            raise RuntimeError(
+                f"Immutable run spec checksum mismatch for {spec_path}: "
+                f"{actual_sha} != {expected_sha}"
+            )
+        expected = json.loads(existing_text)
+        diffs = _contract_diffs(expected, actual)
+        if diffs:
+            preview = "\n".join(f"- {diff}" for diff in diffs[:20])
+            extra = "" if len(diffs) <= 20 else f"\n... and {len(diffs) - 20} more"
+            raise RuntimeError(
+                "Current launch does not match the immutable run spec:\n"
+                f"{preview}{extra}"
+            )
+        return False
+
+    if require_existing:
+        raise RuntimeError(
+            f"--resume requires an immutable run spec at {spec_path}. "
+            "Start a fresh run with the current launcher so future resumes can "
+            "prove they match the original launch."
+        )
+    if sha_path.exists():
+        raise RuntimeError(
+            f"Run spec checksum exists without {spec_path}: {sha_path}"
+        )
+
+    spec_text = _canonical_json_text(actual)
+    _write_text_atomic(spec_path, spec_text)
+    _write_text_atomic(sha_path, _sha256_text(spec_text) + "\n")
+    return True
+
+
 def run_stage(
     args: argparse.Namespace,
     stage: BucketStage,
@@ -2079,31 +2293,21 @@ def _write_launcher_plan(
     dataloader_resume_flags = dataloader_resume_flags or {}
     launcher_plan = {
         "stages": [
-            {
-                **asdict(stage),
-                "bucket_file": str(stage.bucket_file),
-                "torchrun_command": build_torchrun_command(args),
-                "env_overrides": {
-                    key: value
-                    for key, value in build_stage_env(
-                        args,
-                        stage=stage,
-                        total_steps=plan.total_steps,
-                        warmup_steps=plan.warmup_steps,
-                        pad_token_id=int(manifest["pad_token_id"]),
-                        load_dataloader_state=dataloader_resume_flags.get(
-                            stage.cumulative_steps, False
-                        ),
-                    ).items()
-                    if key.startswith("SWEHERO_")
-                    or key in {"LOG_RANK", "WANDB_PROJECT", "WANDB_RUN_NAME"}
-                },
-            }
+            _stage_launch_record(
+                args,
+                stage,
+                plan,
+                manifest,
+                load_dataloader_state=dataloader_resume_flags.get(
+                    stage.cumulative_steps, False
+                ),
+            )
             for stage in plan.stages
         ],
         "total_steps": plan.total_steps,
         "warmup_steps": plan.warmup_steps,
         "manifest": str(args.out_dir / "data" / "manifest.json"),
+        "run_spec": str(_run_spec_path(args.out_dir)),
     }
     (args.out_dir / "launcher_plan.json").write_text(
         json.dumps(launcher_plan, indent=2)
@@ -2172,6 +2376,12 @@ def main(argv: list[str] | None = None) -> None:
         global_batch_size=args.global_batch_size,
         warmup_ratio=args.warmup_ratio,
         max_steps=args.max_steps,
+    )
+    write_or_validate_run_spec(
+        args,
+        plan,
+        manifest,
+        require_existing=resume_state is not None,
     )
     if resume_state is not None:
         validate_resume_contract(args, plan, manifest)

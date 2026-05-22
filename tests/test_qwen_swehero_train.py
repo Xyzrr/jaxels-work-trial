@@ -1,4 +1,6 @@
 import ast
+import contextlib
+import io
 import json
 import os
 import sys
@@ -394,6 +396,84 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual([stage.bucket for stage in stages], [32768])
 
+    def test_run_spec_is_written_once_with_checksum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            with patch.dict(os.environ, {"SWEHERO_SECRET": "do-not-record"}):
+                written = train.write_or_validate_run_spec(args, plan, manifest)
+                written_again = train.write_or_validate_run_spec(args, plan, manifest)
+
+            spec_path = args.out_dir / train.RUN_SPEC_FILENAME
+            sha_path = args.out_dir / train.RUN_SPEC_SHA256_FILENAME
+            spec_text = spec_path.read_text()
+            spec_sha = sha_path.read_text().strip()
+            spec = json.loads(spec_text)
+
+        self.assertTrue(written)
+        self.assertFalse(written_again)
+        self.assertEqual(spec_sha, train._sha256_text(spec_text))
+        self.assertEqual(spec["schema_version"], train.RUN_SPEC_SCHEMA_VERSION)
+        self.assertEqual(spec["args"]["max_length"], 32768)
+        self.assertEqual(spec["manifest"], train._resume_manifest_contract(manifest))
+        self.assertEqual(spec["plan"]["total_steps"], plan.total_steps)
+        first_env = spec["plan"]["stages"][0]["env_overrides"]
+        self.assertEqual(first_env["SWEHERO_BUCKET_SEQ_LEN"], "8192")
+        self.assertNotIn("SWEHERO_SECRET", first_env)
+
+    def test_run_spec_rejects_changed_launch_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            train.write_or_validate_run_spec(args, plan, manifest)
+            changed = train.parse_args(
+                [
+                    "--out-dir",
+                    str(args.out_dir),
+                    "--dataset-path",
+                    str(args.dataset_path),
+                    "--hf-assets-path",
+                    str(args.hf_assets_path),
+                    "--buckets",
+                    args.buckets,
+                    "--bucket-cp",
+                    args.bucket_cp,
+                    "--max-length",
+                    str(args.max_length),
+                    "--num-examples",
+                    str(args.num_examples),
+                    "--max-streamed-examples",
+                    str(args.max_streamed_examples),
+                    "--learning-rate",
+                    "2e-5",
+                ]
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "learning_rate"):
+                train.write_or_validate_run_spec(changed, plan, manifest)
+
+    def test_run_spec_rejects_tampered_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            train.write_or_validate_run_spec(args, plan, manifest)
+            spec_path = args.out_dir / train.RUN_SPEC_FILENAME
+            spec = json.loads(spec_path.read_text())
+            spec["args"]["max_length"] = 123
+            spec_path.write_text(json.dumps(spec, indent=2))
+
+            with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                train.write_or_validate_run_spec(args, plan, manifest)
+
+    def test_resume_requires_existing_run_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+
+            with self.assertRaisesRegex(RuntimeError, "requires an immutable run spec"):
+                train.write_or_validate_run_spec(
+                    args,
+                    plan,
+                    manifest,
+                    require_existing=True,
+                )
+
     def test_mid_stage_resume_loads_dataloader_state_for_current_stage_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
@@ -720,6 +800,71 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             bucket_path = Path(manifest["bucket_files"]["256"])
             self.assertEqual(integrity["records"], 1)
             self.assertEqual(integrity, train._bucket_file_stats(bucket_path))
+
+    def test_main_writes_run_spec_for_dry_run_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            dataset_path = Path(tmp) / "dataset"
+            hf_assets_path = Path(tmp) / "hf"
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--dataset-path",
+                    str(dataset_path),
+                    "--hf-assets-path",
+                    str(hf_assets_path),
+                    "--buckets",
+                    "256",
+                    "--bucket-cp",
+                    "256:1",
+                    "--max-length",
+                    "256",
+                    "--num-examples",
+                    "1",
+                ]
+            )
+            example = {
+                "instance_id": "short",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+            self._materialize_with_fake_runtime(args, [example])
+
+            with patch.dict(os.environ, {}, clear=True):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    train.main(
+                        [
+                            "--out-dir",
+                            str(out_dir),
+                            "--dataset-path",
+                            str(dataset_path),
+                            "--hf-assets-path",
+                            str(hf_assets_path),
+                            "--buckets",
+                            "256",
+                            "--bucket-cp",
+                            "256:1",
+                            "--max-length",
+                            "256",
+                            "--num-examples",
+                            "1",
+                            "--skip-data-prep",
+                            "--dry-run",
+                        ]
+                    )
+
+            run_spec = json.loads((out_dir / train.RUN_SPEC_FILENAME).read_text())
+            launcher_plan = json.loads((out_dir / "launcher_plan.json").read_text())
+
+        self.assertEqual(run_spec["args"]["max_length"], 256)
+        self.assertEqual(run_spec["plan"]["total_steps"], 1)
+        self.assertEqual(
+            launcher_plan["run_spec"],
+            str(out_dir / train.RUN_SPEC_FILENAME),
+        )
 
     def test_load_manifest_rejects_corrupt_bucket_file(self):
         with tempfile.TemporaryDirectory() as tmp:
