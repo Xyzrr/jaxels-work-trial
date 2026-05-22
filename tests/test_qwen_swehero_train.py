@@ -507,6 +507,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 "--model-id must be",
             ),
             (["--model-revision", "main"], "--model-revision must be an exact"),
+            (["--model-revision", "0" * 40], "--model-revision must be the pinned"),
             (["--source-dataset-rows-per-shard", "0"], "--source-dataset-rows-per-shard"),
             (["--source-dataset-build-batch-size", "0"], "--source-dataset-build-batch-size"),
             (["--num-examples", "-1"], "--num-examples"),

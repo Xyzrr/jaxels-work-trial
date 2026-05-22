@@ -723,6 +723,12 @@ def validate_launch_inputs(
             "--model-revision must be an exact 40-character lowercase "
             f"Hugging Face commit SHA; got {args.model_revision!r}"
         )
+    elif args.model_revision != MODEL_REVISION:
+        errors.append(
+            "--model-revision must be the pinned "
+            f"{MODEL_ID}@{MODEL_REVISION} revision for this production "
+            f"direct-to-hero 7B launcher; got {args.model_revision!r}"
+        )
 
     int_minima = (
         ("--source-dataset-rows-per-shard", args.source_dataset_rows_per_shard, 1),
@@ -1526,8 +1532,8 @@ def parse_args(
             or MODEL_REVISION
         ),
         help=(
-            "Exact Hugging Face model commit SHA. The default pins "
-            "Qwen/Qwen2.5-Coder-7B-Instruct so asset downloads cannot float."
+            "Pinned Hugging Face model commit SHA. This production 7B launcher "
+            f"requires {MODEL_ID}@{MODEL_REVISION} so asset downloads cannot float."
         ),
     )
     parser.add_argument(
