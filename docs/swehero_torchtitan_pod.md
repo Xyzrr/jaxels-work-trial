@@ -74,6 +74,33 @@ versions, `uv` binary path/version, and critical imports used for the run.
 launching training, so dependency mismatches fail before data prep or
 distributed startup.
 
+## HF Logits Parity
+
+Before a real run, verify that the TorchTitan model definition and
+`Qwen25StateDictAdapter` load the same initial model as the Hugging Face
+reference:
+
+```bash
+cd /workspace/jaxels-work-trial
+$TORCHTITAN_POD_VENV/bin/python scripts/qwen_swehero_logits_parity.py \
+  --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
+  --reference-model-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
+  --reference-context paper-yarn-128k \
+  --json-out /workspace/qwen25-coder7b-swehero-parity.json
+```
+
+`paper-yarn-128k` is the default because the SWE-HERO paper fine-tunes
+Qwen2.5-Coder-Instruct with YaRN extending the native 32k context to 128k.
+The script also supports `--reference-context standard-hf` for checking against
+the unmodified HF config, but that is not the training recipe used here.
+
+To make the training launcher run this preflight check before data prep and
+TorchTitan startup, add:
+
+```bash
+--verify-hf-logits-parity
+```
+
 ## Smoke Run Command
 
 For the public dataset subset smoke test on the pod:

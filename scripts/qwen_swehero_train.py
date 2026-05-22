@@ -530,6 +530,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env_flag("RESUME", False),
         help="Reuse an existing checkpoint folder in --out-dir/torchtitan.",
     )
+    parser.add_argument(
+        "--verify-hf-logits-parity",
+        action="store_true",
+        default=_env_flag("VERIFY_HF_LOGITS_PARITY", False),
+        help=(
+            "Before training, run the paper-aligned HF-vs-TorchTitan logits "
+            "parity check for the Qwen2.5-Coder-7B-Instruct initial load."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1001,6 +1010,35 @@ def validate_torchtitan_runtime() -> dict[str, Any]:
     }
 
 
+
+def build_hf_logits_parity_command(args: argparse.Namespace) -> list[str]:
+    repo_root = Path(__file__).resolve().parents[1]
+    return [
+        sys.executable,
+        str(repo_root / "scripts" / "qwen_swehero_logits_parity.py"),
+        "--hf-model-id",
+        args.model_id,
+        "--hf-assets-path",
+        str(args.hf_assets_path),
+        "--reference-model-path",
+        str(args.hf_assets_path),
+        "--reference-context",
+        "paper-yarn-128k",
+        "--json-out",
+        str(args.out_dir / "hf_logits_parity.json"),
+    ]
+
+
+def verify_hf_logits_parity_if_requested(args: argparse.Namespace) -> None:
+    if not args.verify_hf_logits_parity:
+        return
+
+    command = build_hf_logits_parity_command(args)
+    print("Running HF logits parity check:")
+    print(" ".join(command))
+    subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[1])
+
+
 def build_stage_env(
     args: argparse.Namespace,
     *,
@@ -1175,6 +1213,8 @@ def main(argv: list[str] | None = None) -> None:
     if not (args.dry_run or args.prepare_data_only):
         runtime = validate_torchtitan_runtime()
         print(json.dumps({"torchtitan_runtime": runtime}, indent=2))
+
+    verify_hf_logits_parity_if_requested(args)
 
     if args.skip_data_prep:
         manifest = _load_manifest(args.out_dir)

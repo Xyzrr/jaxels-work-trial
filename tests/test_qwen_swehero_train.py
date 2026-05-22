@@ -179,6 +179,32 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("--config", command)
         self.assertIn("qwen25_coder7b_direct_to_hero", command)
 
+    def test_hf_logits_parity_command_uses_paper_yarn_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            hf_assets = Path(tmp) / "Qwen2.5-Coder-7B-Instruct"
+            args = train.parse_args(
+                ["--out-dir", str(out_dir), "--hf-assets-path", str(hf_assets)]
+            )
+            command = train.build_hf_logits_parity_command(args)
+
+        self.assertIn("qwen_swehero_logits_parity.py", " ".join(command))
+        self.assertIn("--reference-context", command)
+        self.assertEqual(
+            command[command.index("--reference-context") + 1],
+            "paper-yarn-128k",
+        )
+        self.assertIn("--reference-model-path", command)
+        self.assertEqual(
+            command[command.index("--reference-model-path") + 1],
+            str(hf_assets),
+        )
+        self.assertIn("--json-out", command)
+        self.assertEqual(
+            command[command.index("--json-out") + 1],
+            str(out_dir / "hf_logits_parity.json"),
+        )
+
     def test_dataparallel_mesh_dims_must_come_from_torch(self):
         repo_root = Path(__file__).resolve().parents[1]
         for relative_path in (
