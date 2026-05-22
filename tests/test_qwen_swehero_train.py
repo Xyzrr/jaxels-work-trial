@@ -316,8 +316,42 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         )
         return step_dir
 
+    def _validate_launch_args(self, extra_args: list[str]):
+        args = train.parse_args(
+            [
+                "--buckets",
+                "256",
+                "--bucket-cp",
+                "256:1",
+                "--max-length",
+                "256",
+                *extra_args,
+            ]
+        )
+        args.buckets = ",".join(str(b) for b in train.parse_bucket_list(args.buckets))
+        buckets = train.parse_bucket_list(args.buckets)
+        bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+        args.bucket_cp = train._format_bucket_cp_map(bucket_cp)
+        train.validate_launch_inputs(args, buckets=buckets, bucket_cp=bucket_cp)
+        train.validate_bucket_config(
+            buckets=buckets,
+            bucket_cp=bucket_cp,
+            nproc_per_node=args.nproc_per_node,
+            attention_backend=args.attention_backend,
+        )
+        return args
+
     def test_defaults_track_paper_hyperparameters_and_target_pod(self):
         args = train.parse_args([])
+        buckets = train.parse_bucket_list(args.buckets)
+        bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+        train.validate_launch_inputs(args, buckets=buckets, bucket_cp=bucket_cp)
+        train.validate_bucket_config(
+            buckets=buckets,
+            bucket_cp=bucket_cp,
+            nproc_per_node=args.nproc_per_node,
+            attention_backend=args.attention_backend,
+        )
 
         self.assertEqual(args.model_id, train.MODEL_ID)
         self.assertEqual(args.dataset_id, train.DATASET_ID)
@@ -397,6 +431,87 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 args = train.parse_args(argv, env_file_default=loaded_env_file)
 
         self.assertEqual(args.num_examples, 13)
+
+    def test_env_numeric_and_boolean_values_are_strict(self):
+        cases = [
+            ({"ENABLE_FP8": "maybe"}, "ENABLE_FP8 must be a boolean"),
+            ({"NUM_EXAMPLES": "abc"}, "NUM_EXAMPLES must be an integer"),
+            ({"LEARNING_RATE": "nan"}, "LEARNING_RATE must be finite"),
+        ]
+        for env, message in cases:
+            with self.subTest(env=env):
+                with patch.dict(os.environ, env, clear=True):
+                    with self.assertRaisesRegex(ValueError, message):
+                        train.parse_args([])
+
+    def test_launch_input_validation_rejects_bad_numeric_values(self):
+        cases = [
+            (["--source-dataset-rows-per-shard", "0"], "--source-dataset-rows-per-shard"),
+            (["--source-dataset-build-batch-size", "0"], "--source-dataset-build-batch-size"),
+            (["--num-examples", "-1"], "--num-examples"),
+            (["--max-streamed-examples", "-1"], "--max-streamed-examples"),
+            (["--shuffle-buffer", "-1"], "--shuffle-buffer"),
+            (["--seed", "-1"], "--seed"),
+            (["--max-length", "0"], "--max-length"),
+            (["--min-trainable-tokens", "0"], "--min-trainable-tokens"),
+            (["--num-train-epochs", "0"], "--num-train-epochs"),
+            (["--max-steps", "-1"], "--max-steps"),
+            (["--global-batch-size", "0"], "--global-batch-size"),
+            (["--local-batch-size", "0"], "--local-batch-size"),
+            (["--learning-rate", "0"], "--learning-rate"),
+            (["--min-learning-rate", "-1"], "--min-learning-rate"),
+            (["--warmup-ratio", "-0.1"], "--warmup-ratio"),
+            (["--warmup-ratio", "1.1"], "--warmup-ratio"),
+            (["--weight-decay", "-0.1"], "--weight-decay"),
+            (["--max-grad-norm", "0"], "--max-grad-norm"),
+            (["--chunked-ce-chunks", "0"], "--chunked-ce-chunks"),
+            (["--checkpoint-interval", "0"], "--checkpoint-interval"),
+            (["--metrics-log-freq", "0"], "--metrics-log-freq"),
+            (["--nproc-per-node", "0"], "--nproc-per-node"),
+            (["--learning-rate", "nan"], "--learning-rate must be finite"),
+            (["--min-learning-rate", "inf"], "--min-learning-rate must be finite"),
+            (
+                ["--learning-rate", "1e-5", "--min-learning-rate", "1e-4"],
+                "--min-learning-rate cannot exceed --learning-rate",
+            ),
+            (["--global-batch-size", "10"], "--global-batch-size must be divisible"),
+            (["--log-rank", "rank0"], "--log-rank contains a non-integer rank"),
+            (
+                ["--torchrun-log-rank-filter", "-1"],
+                "--torchrun-log-rank-filter ranks must be non-negative",
+            ),
+        ]
+        for cli_args, message in cases:
+            with self.subTest(cli_args=cli_args):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._validate_launch_args(cli_args)
+
+    def test_launch_input_validation_rejects_context_and_bucket_mismatches(self):
+        with self.assertRaisesRegex(ValueError, "paper context"):
+            self._validate_launch_args(
+                [
+                    "--buckets",
+                    str(train.PAPER_CONTEXT_LENGTH * 2),
+                    "--bucket-cp",
+                    f"{train.PAPER_CONTEXT_LENGTH * 2}:1",
+                    "--max-length",
+                    str(train.PAPER_CONTEXT_LENGTH + 1),
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "largest bucket"):
+            self._validate_launch_args(["--max-length", "512"])
+        with self.assertRaisesRegex(ValueError, "not present in --buckets"):
+            self._validate_launch_args(["--bucket-cp", "256:1,512:1"])
+
+    def test_bucket_parsers_reject_malformed_or_ambiguous_values(self):
+        with self.assertRaisesRegex(ValueError, "invalid bucket size"):
+            train.parse_bucket_list("256,abc")
+        with self.assertRaisesRegex(ValueError, "duplicate bucket"):
+            train.parse_bucket_list("256,256")
+        with self.assertRaisesRegex(ValueError, "invalid bucket CP map entry"):
+            train.parse_bucket_cp_map("256:not-a-cp")
+        with self.assertRaisesRegex(ValueError, "duplicate bucket"):
+            train.parse_bucket_cp_map("256:1,256:2")
 
     def test_wandb_identity_generates_run_id_and_env_controls(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -315,17 +315,38 @@ def _env_flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
         return default
-    return raw.lower() in {"1", "true", "yes", "on"}
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean env value "
+        "(one of 1/0, true/false, yes/no, on/off)"
+    )
 
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
-    return default if raw is None else int(raw)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer; got {raw!r}") from exc
 
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
-    return default if raw is None else float(raw)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite float; got {raw!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite; got {raw!r}")
+    return value
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -377,14 +398,36 @@ def load_launch_env_file(argv: list[str] | None = None) -> str:
 
 def parse_bucket_list(raw: str | Iterable[int]) -> tuple[int, ...]:
     if isinstance(raw, str):
-        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+        values = []
+        seen = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                value = int(part)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid bucket size in --buckets: {part!r}"
+                ) from exc
+            if value in seen:
+                raise ValueError(f"duplicate bucket size in --buckets: {value}")
+            seen.add(value)
+            values.append(value)
     else:
-        values = [int(part) for part in raw]
+        values = []
+        seen = set()
+        for part in raw:
+            value = int(part)
+            if value in seen:
+                raise ValueError(f"duplicate bucket size in --buckets: {value}")
+            seen.add(value)
+            values.append(value)
     if not values:
         raise ValueError("at least one sequence bucket is required")
     if any(value <= 0 for value in values):
         raise ValueError(f"bucket sizes must be positive: {values}")
-    values = sorted(set(values))
+    values = sorted(values)
     return tuple(values)
 
 
@@ -402,7 +445,18 @@ def parse_bucket_cp_map(raw: str | Mapping[int, int]) -> dict[int, int]:
                     "bucket CP map entries must look like '<bucket>:<cp>'"
                 )
             bucket, cp = part.split(":", 1)
-            parsed[int(bucket.strip())] = int(cp.strip())
+            try:
+                parsed_bucket = int(bucket.strip())
+                parsed_cp = int(cp.strip())
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid bucket CP map entry in --bucket-cp: {part!r}"
+                ) from exc
+            if parsed_bucket in parsed:
+                raise ValueError(
+                    f"duplicate bucket in --bucket-cp: {parsed_bucket}"
+                )
+            parsed[parsed_bucket] = parsed_cp
     if not parsed:
         raise ValueError("at least one bucket:cp entry is required")
     bad = {bucket: cp for bucket, cp in parsed.items() if bucket <= 0 or cp <= 0}
@@ -435,6 +489,213 @@ def choose_bucket(length: int, buckets: Iterable[int]) -> int:
         if length <= bucket:
             return bucket
     raise ValueError(f"length {length} exceeds largest bucket {max(buckets)}")
+
+
+def _add_min_error(
+    errors: list[str],
+    *,
+    name: str,
+    value: int | float,
+    minimum: int | float,
+    inclusive: bool = True,
+) -> None:
+    invalid = value < minimum if inclusive else value <= minimum
+    if invalid:
+        comparator = ">=" if inclusive else ">"
+        errors.append(f"{name} must be {comparator} {minimum}; got {value!r}")
+
+
+def _add_max_error(
+    errors: list[str],
+    *,
+    name: str,
+    value: int | float,
+    maximum: int | float,
+    inclusive: bool = True,
+) -> None:
+    invalid = value > maximum if inclusive else value >= maximum
+    if invalid:
+        comparator = "<=" if inclusive else "<"
+        errors.append(f"{name} must be {comparator} {maximum}; got {value!r}")
+
+
+def _add_finite_float_error(
+    errors: list[str],
+    *,
+    name: str,
+    value: float,
+) -> None:
+    if not math.isfinite(value):
+        errors.append(f"{name} must be finite; got {value!r}")
+
+
+def _validate_rank_filter(
+    errors: list[str],
+    *,
+    name: str,
+    value: str | None,
+) -> None:
+    if value is None or value == "":
+        return
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            errors.append(f"{name} must be a comma-separated list of ranks")
+            return
+        try:
+            rank = int(part)
+        except ValueError:
+            errors.append(f"{name} contains a non-integer rank: {part!r}")
+            return
+        if rank < 0:
+            errors.append(f"{name} ranks must be non-negative; got {rank}")
+            return
+
+
+def validate_launch_inputs(
+    args: argparse.Namespace,
+    *,
+    buckets: tuple[int, ...],
+    bucket_cp: Mapping[int, int],
+) -> None:
+    errors: list[str] = []
+
+    int_minima = (
+        ("--source-dataset-rows-per-shard", args.source_dataset_rows_per_shard, 1),
+        ("--source-dataset-build-batch-size", args.source_dataset_build_batch_size, 1),
+        ("--num-examples", args.num_examples, 0),
+        ("--max-streamed-examples", args.max_streamed_examples, 0),
+        ("--shuffle-buffer", args.shuffle_buffer, 0),
+        ("--seed", args.seed, 0),
+        ("--max-length", args.max_length, 1),
+        ("--min-trainable-tokens", args.min_trainable_tokens, 1),
+        ("--max-steps", args.max_steps, 0),
+        ("--global-batch-size", args.global_batch_size, 1),
+        ("--local-batch-size", args.local_batch_size, 1),
+        ("--chunked-ce-chunks", args.chunked_ce_chunks, 1),
+        ("--checkpoint-interval", args.checkpoint_interval, 1),
+        ("--metrics-log-freq", args.metrics_log_freq, 1),
+        ("--nproc-per-node", args.nproc_per_node, 1),
+    )
+    for name, value, minimum in int_minima:
+        _add_min_error(errors, name=name, value=value, minimum=minimum)
+
+    _add_max_error(
+        errors,
+        name="--seed",
+        value=args.seed,
+        maximum=2**63 - 1,
+    )
+
+    finite_float_fields = (
+        ("--num-train-epochs", args.num_train_epochs),
+        ("--learning-rate", args.learning_rate),
+        ("--min-learning-rate", args.min_learning_rate),
+        ("--warmup-ratio", args.warmup_ratio),
+        ("--weight-decay", args.weight_decay),
+        ("--max-grad-norm", args.max_grad_norm),
+    )
+    for name, value in finite_float_fields:
+        _add_finite_float_error(errors, name=name, value=value)
+
+    _add_min_error(
+        errors,
+        name="--num-train-epochs",
+        value=args.num_train_epochs,
+        minimum=0.0,
+        inclusive=False,
+    )
+    _add_min_error(
+        errors,
+        name="--learning-rate",
+        value=args.learning_rate,
+        minimum=0.0,
+        inclusive=False,
+    )
+    _add_min_error(
+        errors,
+        name="--min-learning-rate",
+        value=args.min_learning_rate,
+        minimum=0.0,
+    )
+    _add_min_error(
+        errors,
+        name="--warmup-ratio",
+        value=args.warmup_ratio,
+        minimum=0.0,
+    )
+    _add_max_error(
+        errors,
+        name="--warmup-ratio",
+        value=args.warmup_ratio,
+        maximum=1.0,
+    )
+    _add_min_error(
+        errors,
+        name="--weight-decay",
+        value=args.weight_decay,
+        minimum=0.0,
+    )
+    _add_min_error(
+        errors,
+        name="--max-grad-norm",
+        value=args.max_grad_norm,
+        minimum=0.0,
+        inclusive=False,
+    )
+
+    if (
+        math.isfinite(args.min_learning_rate)
+        and math.isfinite(args.learning_rate)
+        and args.min_learning_rate > args.learning_rate
+    ):
+        errors.append(
+            "--min-learning-rate cannot exceed --learning-rate; got "
+            f"{args.min_learning_rate!r} > {args.learning_rate!r}"
+        )
+
+    if args.max_length > PAPER_CONTEXT_LENGTH:
+        errors.append(
+            f"--max-length={args.max_length} exceeds paper context "
+            f"{PAPER_CONTEXT_LENGTH}"
+        )
+    if buckets and args.max_length > max(buckets):
+        errors.append("--max-length cannot exceed the largest bucket")
+
+    extra_cp_buckets = sorted(set(bucket_cp) - set(buckets))
+    if extra_cp_buckets:
+        errors.append(
+            "--bucket-cp contains buckets not present in --buckets: "
+            f"{extra_cp_buckets}"
+        )
+
+    if args.nproc_per_node > 0 and args.local_batch_size > 0:
+        for bucket in buckets:
+            cp = bucket_cp.get(bucket)
+            if cp is None or cp <= 0 or args.nproc_per_node % cp != 0:
+                continue
+            data_parallel_degree = args.nproc_per_node // cp
+            microbatch = args.local_batch_size * data_parallel_degree
+            if microbatch > 0 and args.global_batch_size % microbatch != 0:
+                errors.append(
+                    "--global-batch-size must be divisible by "
+                    "--local-batch-size * data_parallel_degree for every bucket; "
+                    f"bucket {bucket} uses CP={cp}, data_parallel_degree="
+                    f"{data_parallel_degree}, so {args.global_batch_size} % "
+                    f"{microbatch} != 0"
+                )
+
+    _validate_rank_filter(errors, name="--log-rank", value=args.log_rank)
+    _validate_rank_filter(
+        errors,
+        name="--torchrun-log-rank-filter",
+        value=args.torchrun_log_rank_filter,
+    )
+
+    if errors:
+        raise ValueError(
+            "Invalid launch inputs:\n" + "\n".join(f"- {error}" for error in errors)
+        )
 
 
 def validate_bucket_config(
@@ -4424,19 +4685,13 @@ def main(argv: list[str] | None = None) -> None:
     buckets = parse_bucket_list(args.buckets)
     bucket_cp = parse_bucket_cp_map(args.bucket_cp)
     args.bucket_cp = _format_bucket_cp_map(bucket_cp)
+    validate_launch_inputs(args, buckets=buckets, bucket_cp=bucket_cp)
     validate_bucket_config(
         buckets=buckets,
         bucket_cp=bucket_cp,
         nproc_per_node=args.nproc_per_node,
         attention_backend=args.attention_backend,
     )
-
-    if args.max_length > PAPER_CONTEXT_LENGTH:
-        raise ValueError(
-            f"--max-length={args.max_length} exceeds paper context {PAPER_CONTEXT_LENGTH}"
-        )
-    if args.max_length > max(buckets):
-        raise ValueError("--max-length cannot exceed the largest bucket")
 
     resume_state = validate_resume_request(args)
     if resume_state is not None:
