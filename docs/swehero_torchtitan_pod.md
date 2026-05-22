@@ -100,9 +100,9 @@ manifest records the dataset path, source revision, metadata hashes, selection
 manifest hash, and Parquet shard sizes/hashes. Use `--rebuild-source-dataset`
 when intentionally replacing the cached pod artifact.
 
-For quick GPU smoke tests, pass `--num-examples 64` or another cap. The default
-`--num-examples 0` means materialize all usable examples from the cached
-one-rollout dataset.
+For quick real-data GPU smoke tests, pass `--num-examples 64` or another cap.
+The default `--num-examples 0` means materialize all usable examples from the
+cached one-rollout dataset.
 
 ## HF Logits Parity
 
@@ -133,26 +133,37 @@ TorchTitan startup, add:
 
 ## Smoke Run Command
 
-For a small capped smoke test on the pod:
+For a launch-path smoke test that deterministically exercises every configured
+bucket and CP degree, use `--smoke-synthetic-buckets`. This mode materializes
+tiny synthetic tokenized records only; it is not a training dataset and should
+not be used for the paper-aligned run.
 
 ```bash
 cd /workspace/jaxels-work-trial
 scripts/run_qwen_swehero_torchtitan_pod.sh \
-  --out-dir /workspace/qwen25-coder7b-swehero-soak32k \
+  --out-dir /workspace/qwen25-coder7b-swehero-all-bucket-cp-smoke \
+  --overwrite-output \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
-  --max-length 32768 \
-  --buckets 32768 \
-  --bucket-cp 32768:2 \
-  --num-examples 64 \
+  --smoke-synthetic-buckets \
+  --smoke-synthetic-examples-per-bucket 1 \
+  --max-length 8192 \
+  --buckets 1024,2048,4096,8192 \
+  --bucket-cp 1024:1,2048:2,4096:4,8192:8 \
   --nproc-per-node 8 \
-  --num-train-epochs 100 \
-  --enable-fp8 \
-  --fp8-recipe rowwise \
+  --global-batch-size 8 \
+  --num-train-epochs 8 \
   --checkpoint-interval 1000 \
   --checkpoint-async-mode disabled \
   --metrics-log-freq 1 \
-  --log-rank 0
+  --log-rank 0 \
+  --no-compile \
+  --no-enable-fp8
 ```
+
+For a small capped smoke test against the real cached SWE traces, replace the
+synthetic flags with `--num-examples 64` and use the target bucket plan. That
+path is closer to the production data path, but it does not guarantee that
+every configured bucket is non-empty.
 
 The production run should use the same wrapper without `--num-examples`, so the
 trainer tokenizes the full cached one-rollout dataset and uses the full bucket

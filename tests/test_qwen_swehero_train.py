@@ -150,7 +150,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         )
         return args, manifest, plan
 
-    def _materialize_with_fake_runtime(self, args, examples):
+    def _materialize_with_fake_runtime(self, args, examples=(), *, synthetic=False):
         fake_tokenizer_module = types.ModuleType("torchtitan.components.tokenizer")
 
         class FakeHuggingFaceTokenizer(FakeTokenizer):
@@ -237,6 +237,8 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             patch.object(train, "_package_versions", return_value={}),
             patch.object(train, "_run_git", return_value=None),
         ):
+            if synthetic:
+                return train.materialize_synthetic_smoke_buckets(args)
             return train.materialize_training_buckets(args)
 
     def _write_preflight_hf_assets(self, hf_assets: Path) -> None:
@@ -468,6 +470,22 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             (["--checkpoint-interval", "0"], "--checkpoint-interval"),
             (["--metrics-log-freq", "0"], "--metrics-log-freq"),
             (["--nproc-per-node", "0"], "--nproc-per-node"),
+            (
+                ["--smoke-synthetic-examples-per-bucket", "0"],
+                "--smoke-synthetic-examples-per-bucket",
+            ),
+            (
+                ["--smoke-synthetic-examples-per-bucket", "2"],
+                "--smoke-synthetic-examples-per-bucket only applies",
+            ),
+            (
+                ["--smoke-synthetic-buckets", "--num-examples", "1"],
+                "--smoke-synthetic-buckets cannot be combined with --num-examples",
+            ),
+            (
+                ["--smoke-synthetic-buckets", "--max-streamed-examples", "1"],
+                "--smoke-synthetic-buckets cannot be combined with --max-streamed-examples",
+            ),
             (["--learning-rate", "nan"], "--learning-rate must be finite"),
             (["--min-learning-rate", "inf"], "--min-learning-rate must be finite"),
             (
@@ -1758,6 +1776,73 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             bucket_path = Path(manifest["bucket_files"]["256"])
             self.assertEqual(integrity["records"], 1)
             self.assertEqual(integrity, train._bucket_file_stats(bucket_path))
+
+    def test_synthetic_smoke_materialization_covers_configured_bucket_cp_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "128,256,512",
+                    "--bucket-cp",
+                    "128:1,256:2,512:4",
+                    "--max-length",
+                    "512",
+                    "--nproc-per-node",
+                    "4",
+                    "--global-batch-size",
+                    "4",
+                    "--num-train-epochs",
+                    "4",
+                    "--smoke-synthetic-buckets",
+                    "--smoke-synthetic-examples-per-bucket",
+                    "2",
+                ]
+            )
+
+            manifest = self._materialize_with_fake_runtime(args, synthetic=True)
+            bucket_counts = train._bucket_counts_from_manifest(manifest)
+            bucket_files = train._bucket_files_from_manifest(manifest)
+            plan = train.build_bucket_plan(
+                bucket_counts=bucket_counts,
+                bucket_files=bucket_files,
+                bucket_cp=train.parse_bucket_cp_map(args.bucket_cp),
+                epochs=args.num_train_epochs,
+                global_batch_size=args.global_batch_size,
+                warmup_ratio=args.warmup_ratio,
+            )
+
+            self.assertTrue(manifest["smoke_synthetic_buckets"])
+            self.assertEqual(manifest["smoke_synthetic_examples_per_bucket"], 2)
+            self.assertTrue(manifest["dataset_artifact"]["synthetic_smoke"])
+            self.assertEqual(
+                manifest["bucket_counts"], {"128": 2, "256": 2, "512": 2}
+            )
+            self.assertEqual(manifest["num_usable_examples"], 6)
+            self.assertEqual(manifest["streamed_examples_scanned"], 6)
+            self.assertTrue(
+                manifest["data_provenance"]["materialization"][
+                    "smoke_synthetic_buckets"
+                ]
+            )
+            self.assertEqual(
+                [stage.bucket for stage in plan.stages], [128, 256, 512]
+            )
+            self.assertEqual([stage.cp_degree for stage in plan.stages], [1, 2, 4])
+            for bucket, path in bucket_files.items():
+                rows = [
+                    json.loads(line)
+                    for line in path.read_text().splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(row["bucket"] == bucket for row in rows))
+                self.assertTrue(all(row["trainable_tokens"] == 1 for row in rows))
 
     def test_load_manifest_rejects_missing_model_asset_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
