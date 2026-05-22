@@ -1,5 +1,6 @@
 import ast
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -9,6 +10,8 @@ import sys
 import tempfile
 import types
 import unittest
+from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,7 +30,223 @@ class FakeTokenizer:
         return "".join(chr(i) for i in ids)
 
 
+class _BatchBackend:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def encode_batch(self, texts):
+        self.owner.batch_calls += 1
+        return [
+            types.SimpleNamespace(ids=self.owner._encode_ids(text))
+            for text in texts
+        ]
+
+
+class BatchFakeTokenizer(FakeTokenizer):
+    def __init__(self):
+        self.batch_calls = 0
+        self.encode_calls = 0
+        self.tokenizer = _BatchBackend(self)
+
+    def _encode_ids(self, text):
+        return [ord(ch) for ch in text]
+
+    def encode(self, text, **kwargs):
+        self.encode_calls += 1
+        return self._encode_ids(text)
+
+
 class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
+    @staticmethod
+    def _legacy_encode_swehero_example(
+        tokenizer,
+        example: dict[str, object],
+        *,
+        max_length: int,
+        min_trainable_tokens: int,
+        include_model_patch: bool = False,
+    ) -> dict[str, object] | None:
+        token_ids: list[int] = []
+        labels: list[int] = []
+
+        bos_id = getattr(tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None))
+        if bos_id is not None:
+            token_ids.append(int(bos_id))
+            labels.append(train.IGNORE_INDEX)
+
+        for text, is_trainable in train.qwen_openhands_segments(
+            example, include_model_patch=include_model_patch
+        ):
+            ids = train._tokenize_text(tokenizer, text)
+            token_ids.extend(ids)
+            labels.extend(ids if is_trainable else [train.IGNORE_INDEX] * len(ids))
+
+        eos_id = getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None))
+        if eos_id is not None:
+            token_ids.append(int(eos_id))
+            labels.append(
+                int(eos_id)
+                if labels and labels[-1] != train.IGNORE_INDEX
+                else train.IGNORE_INDEX
+            )
+
+        if len(token_ids) > max_length + 1:
+            raise train.LongExampleError(
+                token_count=len(token_ids),
+                max_length=max_length,
+            )
+        if len(token_ids) < 2:
+            return None
+
+        shifted_input_ids = token_ids[:-1]
+        shifted_labels = labels[1:]
+        trainable_tokens = sum(
+            label != train.IGNORE_INDEX for label in shifted_labels
+        )
+        if trainable_tokens < min_trainable_tokens:
+            return None
+
+        return {
+            "input_ids": shifted_input_ids,
+            "labels": shifted_labels,
+            "length": len(shifted_input_ids),
+            "trainable_tokens": trainable_tokens,
+        }
+
+    def _expected_materialization_from_legacy_encoder(
+        self,
+        *,
+        args,
+        tokenizer,
+        examples,
+    ) -> dict[str, object]:
+        buckets = train.parse_bucket_list(args.buckets)
+        bucket_lines: dict[str, list[str]] = {str(bucket): [] for bucket in buckets}
+        bucket_counts: Counter[int] = Counter()
+        bucket_source_ids: dict[int, list[str]] = {bucket: [] for bucket in buckets}
+        bucket_lengths: dict[int, list[int]] = {bucket: [] for bucket in buckets}
+        bucket_trainable_tokens: dict[int, list[int]] = {
+            bucket: [] for bucket in buckets
+        }
+        bucket_length_histograms: dict[int, Counter[int]] = {
+            bucket: Counter() for bucket in buckets
+        }
+        length_histogram: Counter[int] = Counter()
+        skipped: Counter[str] = Counter()
+        skipped_source_ids_by_reason: dict[str, list[str]] = {}
+        streamed_source_ids: list[str] = []
+        included_source_ids: list[str] = []
+        long_examples_sample: list[dict[str, object]] = []
+        streamed_examples = 0
+        usable_examples = 0
+
+        for example in examples:
+            streamed_examples += 1
+            source_id = train._example_id(example, streamed_examples)
+            streamed_source_ids.append(source_id)
+            try:
+                encoded = self._legacy_encode_swehero_example(
+                    tokenizer,
+                    example,
+                    max_length=args.max_length,
+                    min_trainable_tokens=args.min_trainable_tokens,
+                    include_model_patch=args.include_model_patch,
+                )
+            except train.LongExampleError as exc:
+                reason = "too_long_for_max_length"
+                skipped[reason] += 1
+                skipped_source_ids_by_reason.setdefault(reason, []).append(source_id)
+                if len(long_examples_sample) < 20:
+                    long_examples_sample.append(
+                        {
+                            "source_id": source_id,
+                            "token_count": exc.token_count,
+                            "shifted_input_length": exc.shifted_input_length,
+                            "max_length": exc.max_length,
+                        }
+                    )
+                if args.long_example_policy == "error":
+                    raise
+                encoded = None
+
+            if encoded is None:
+                if (
+                    skipped_source_ids_by_reason.get("too_long_for_max_length", [])[
+                        -1:
+                    ]
+                    != [source_id]
+                ):
+                    reason = "not_enough_trainable_tokens"
+                    skipped[reason] += 1
+                    skipped_source_ids_by_reason.setdefault(reason, []).append(
+                        source_id
+                    )
+            else:
+                try:
+                    bucket = train.choose_bucket(int(encoded["length"]), buckets)
+                except ValueError:
+                    reason = "too_long_for_largest_bucket"
+                    skipped[reason] += 1
+                    skipped_source_ids_by_reason.setdefault(reason, []).append(
+                        source_id
+                    )
+                else:
+                    record = {**encoded, "bucket": bucket, "source_id": source_id}
+                    line = json.dumps(record) + "\n"
+                    bucket_lines[str(bucket)].append(line)
+                    bucket_counts[bucket] += 1
+                    included_source_ids.append(source_id)
+                    bucket_source_ids[bucket].append(source_id)
+                    bucket_lengths[bucket].append(int(encoded["length"]))
+                    bucket_trainable_tokens[bucket].append(
+                        int(encoded["trainable_tokens"])
+                    )
+                    rounded_length = (
+                        (int(encoded["length"]) + 1023) // 1024
+                    ) * 1024
+                    length_histogram[rounded_length] += 1
+                    bucket_length_histograms[bucket][rounded_length] += 1
+                    usable_examples += 1
+
+            if args.num_examples > 0 and usable_examples >= args.num_examples:
+                break
+            if (
+                args.max_streamed_examples > 0
+                and streamed_examples >= args.max_streamed_examples
+            ):
+                break
+
+        bucket_file_integrity = {}
+        for bucket in buckets:
+            payload = "".join(bucket_lines[str(bucket)]).encode()
+            bucket_file_integrity[str(bucket)] = {
+                "bytes": len(payload),
+                "records": len(bucket_lines[str(bucket)]),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+
+        return {
+            "bucket_lines": bucket_lines,
+            "bucket_counts": {
+                str(bucket): bucket_counts[bucket] for bucket in buckets
+            },
+            "bucket_file_integrity": bucket_file_integrity,
+            "length_histogram_rounded_to_1024": {
+                str(length): count for length, count in sorted(length_histogram.items())
+            },
+            "num_usable_examples": usable_examples,
+            "streamed_examples_scanned": streamed_examples,
+            "skipped": dict(skipped),
+            "streamed_source_ids": streamed_source_ids,
+            "included_source_ids": included_source_ids,
+            "skipped_source_ids_by_reason": skipped_source_ids_by_reason,
+            "bucket_source_ids": bucket_source_ids,
+            "bucket_lengths": bucket_lengths,
+            "bucket_trainable_tokens": bucket_trainable_tokens,
+            "bucket_length_histograms": bucket_length_histograms,
+            "long_examples_sample": long_examples_sample,
+        }
+
     def _git_state(
         self,
         *,
@@ -263,6 +482,113 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             if synthetic:
                 return train.materialize_synthetic_smoke_buckets(args)
             return train.materialize_training_buckets(args)
+
+    def _real_swehero_dataset_path(self) -> Path:
+        dataset_path = Path(
+            os.environ.get(
+                "SWEHERO_TEST_DATASET_PATH",
+                Path(__file__).resolve().parents[1]
+                / "datasets"
+                / "swe-hero-openhands-trajectories-5b2ed21-one-rollout",
+            )
+        )
+        if not (dataset_path / "data").is_dir():
+            self.skipTest(f"SWE-HERO test dataset is not available: {dataset_path}")
+        return dataset_path
+
+    def _real_qwen_hf_assets_path(self) -> Path:
+        repo_root = Path(__file__).resolve().parents[1]
+        candidates = [
+            Path(value)
+            for value in [
+                os.environ.get("SWEHERO_TEST_HF_ASSETS_PATH"),
+                str(
+                    repo_root
+                    / "tmp"
+                    / "hf"
+                    / "Qwen2.5-Coder-7B-Instruct-tokenizer-only"
+                ),
+                "/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct",
+            ]
+            if value
+        ]
+        for candidate in candidates:
+            if (
+                (candidate / "tokenizer.json").is_file()
+                and (candidate / "tokenizer_config.json").is_file()
+            ):
+                return candidate
+        self.skipTest(
+            "Qwen tokenizer assets are not available; set "
+            "SWEHERO_TEST_HF_ASSETS_PATH"
+        )
+
+    def _mini_qwen_tokenizer_class(self):
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as exc:
+            self.skipTest(f"tokenizers is not available: {exc}")
+
+        class MiniHuggingFaceTokenizer:
+            def __init__(self, tokenizer_path: str):
+                self.tokenizer_path = tokenizer_path
+                root = Path(tokenizer_path)
+                self.tokenizer = Tokenizer.from_file(str(root / "tokenizer.json"))
+                config = json.loads((root / "tokenizer_config.json").read_text())
+
+                def token_content(key: str) -> str | None:
+                    value = config.get(key)
+                    if isinstance(value, Mapping):
+                        value = value.get("content")
+                    return value if isinstance(value, str) else None
+
+                bos_token = token_content("bos_token")
+                eos_token = token_content("eos_token")
+                pad_token = token_content("pad_token")
+                self.bos_id = (
+                    self.tokenizer.token_to_id(bos_token) if bos_token else None
+                )
+                self.eos_id = (
+                    self.tokenizer.token_to_id(eos_token) if eos_token else None
+                )
+                self.pad_id = (
+                    self.tokenizer.token_to_id(pad_token) if pad_token else None
+                )
+
+            def encode(self, text, add_bos=False, add_eos=False):
+                ids = list(self.tokenizer.encode(text).ids)
+                if add_bos and self.bos_id is not None:
+                    ids.insert(0, self.bos_id)
+                if add_eos and self.eos_id is not None:
+                    ids.append(self.eos_id)
+                return ids
+
+            def decode(self, ids):
+                return self.tokenizer.decode(list(ids))
+
+            def token_to_id(self, token):
+                return self.tokenizer.token_to_id(token)
+
+        return MiniHuggingFaceTokenizer
+
+    def _patch_torchtitan_tokenizer_module(self, tokenizer_class):
+        fake_tokenizer_module = types.ModuleType("torchtitan.components.tokenizer")
+        fake_tokenizer_module.HuggingFaceTokenizer = tokenizer_class
+        return patch.dict(
+            sys.modules,
+            {
+                "torchtitan": types.ModuleType("torchtitan"),
+                "torchtitan.components": types.ModuleType("torchtitan.components"),
+                "torchtitan.components.tokenizer": fake_tokenizer_module,
+            },
+        )
+
+    def _require_real_materialization_dependencies(self):
+        try:
+            import datasets  # noqa: F401
+            import pyarrow  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"real SWE-HERO materialization deps unavailable: {exc}")
 
     def _write_preflight_hf_assets(self, hf_assets: Path) -> None:
         hf_assets.mkdir(parents=True, exist_ok=True)
@@ -3318,6 +3644,45 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertNotIn("<|assistant|>", trainable_text)
         self.assertNotIn("<|im_start|>assistant", trainable_text)
 
+    def test_batched_segment_tokenization_matches_legacy_per_segment_encoding(self):
+        example = {
+            "trajectory": [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "please fix it"},
+                {
+                    "role": "assistant",
+                    "content": "RUN_TESTS",
+                    "tool_calls": [
+                        {"name": "execute_bash", "arguments": {"cmd": "pytest"}}
+                    ],
+                },
+                {"role": "tool", "content": "secret failing output"},
+                {"role": "assistant", "content": "DONE"},
+            ],
+            "model_patch": "diff --git a/file.py b/file.py\n+fixed\n",
+        }
+
+        expected = self._legacy_encode_swehero_example(
+            FakeTokenizer(),
+            example,
+            max_length=4096,
+            min_trainable_tokens=1,
+            include_model_patch=True,
+        )
+        batch_tokenizer = BatchFakeTokenizer()
+
+        actual = train.encode_swehero_example(
+            batch_tokenizer,
+            example,
+            max_length=4096,
+            min_trainable_tokens=1,
+            include_model_patch=True,
+        )
+
+        self.assertEqual(actual, expected)
+        self.assertGreater(batch_tokenizer.batch_calls, 0)
+        self.assertEqual(batch_tokenizer.encode_calls, 0)
+
     def test_encode_rejects_long_examples_instead_of_truncating(self):
         example = {
             "trajectory": [
@@ -3502,6 +3867,310 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             bucket_path = Path(manifest["bucket_files"]["256"])
             self.assertEqual(integrity["records"], 1)
             self.assertEqual(integrity, train._bucket_file_stats(bucket_path))
+
+    def test_real_swehero_materialization_matches_preoptimization_goldens(self):
+        self._require_real_materialization_dependencies()
+        dataset_path = self._real_swehero_dataset_path()
+        hf_assets_path = self._real_qwen_hf_assets_path()
+        tokenizer_class = self._mini_qwen_tokenizer_class()
+        golden_rows = [
+            {
+                "source_id": "numpy__numpy-9df514382c0b7c8fdaa979f66054285d69afee4d",
+                "segment_sha256": "8660b514a8bffff089ba77761fea116fb422f5679bc9259c3a38ee2d9f125a54",
+                "length": 28776,
+                "bucket": 32768,
+                "trainable_tokens": 10674,
+                "input_ids_sha256": "78bd4ef5d172dda88f4761a9ee7032a46ada696cc49460507ec9686e9ff9a7f8",
+                "labels_sha256": "5c2e5bbb7c7ec48e898052ce4c6ba50fb3bf2ddd4ce9c05d15b7e0036bc7a9d2",
+            },
+            {
+                "source_id": "tornadoweb__tornado-eb61029aa268456890c68ed1565dcaac1fdafb4a",
+                "segment_sha256": "b3396e337372a0a989382a88c6da3b7ca7d7a48138425dddccdf9de570f1b7ad",
+                "length": 44256,
+                "bucket": 65536,
+                "trainable_tokens": 14581,
+                "input_ids_sha256": "a46a70987ffc81765a8e2ce0ca36f6182676bd487cfd81100b75b117577fcbff",
+                "labels_sha256": "bbfe5623f71b2734f3f355d69bb3e91d0a8a87474a507b6b8a59d37a899cdba9",
+            },
+            {
+                "source_id": "tornadoweb__tornado-a48f65a42c3b3f0f2b21bcbce4da12c2d4419915",
+                "segment_sha256": "ef9e3225ccabb4596ae28837b9569e73844def8e7cc848668715b839a8045505",
+                "length": 42904,
+                "bucket": 65536,
+                "trainable_tokens": 15378,
+                "input_ids_sha256": "8fec300205d2e572d460e8521bd885dab934037759a1056334a80177015aece5",
+                "labels_sha256": "1f711e7f6705c03aac1ff17ce10dd77a4b1496e31d57e576a04a8508730c9888",
+            },
+            {
+                "source_id": "pandas-dev__pandas-586f63bc1a2bdc14dd6e3b76dd2713541b10d4f6",
+                "segment_sha256": "f40df8dba9a1503f1e8a20d4775a0de1050a46e150a860091a18137365f3ca63",
+                "length": 29799,
+                "bucket": 32768,
+                "trainable_tokens": 9154,
+                "input_ids_sha256": "c95cd26df696bda068fa6f06830e792f8df21902ae1044bb8a8b06bf4d2bb97b",
+                "labels_sha256": "78a5987dabc41951beb8badf37864c44974372930d32a83a4f2fb23f348d0a6c",
+            },
+            {
+                "source_id": "datalad__datalad-b7077e8b2024e1ac150268cc4dbd73a521ca46d2",
+                "segment_sha256": "19408d315561f2f839ef94a99f3fa58fb93501e779a152706066b819cb584445",
+                "length": 53219,
+                "bucket": 65536,
+                "trainable_tokens": 11835,
+                "input_ids_sha256": "9a481733315526fdb1ce21a5c695980694de17514bf5134d31d54dc2e5e398fc",
+                "labels_sha256": "472503c8de4936e38bbdec11c58dca1ccb8a86066cd315051dd91f903df5d1f5",
+            },
+            {
+                "source_id": "pandas-dev__pandas-04e07d0b9825d6bd9a0640568d929a89fe0e9fa8",
+                "segment_sha256": "e8f68c297b85f2ca3fc321f06dff1fb33b5837dd106ca790a6a8ea9b3f69c079",
+                "length": 54782,
+                "bucket": 65536,
+                "trainable_tokens": 17402,
+                "input_ids_sha256": "dc66c9e75716c18689ff0660e1af5a0620e8a570f7ff7302180a9379008bf84d",
+                "labels_sha256": "a868b1615629b026aa4fe7b1605a7c00a670e51f145b04dd4a0b4ea362fb11d2",
+            },
+            {
+                "source_id": "pandas-dev__pandas-3e4f000ea5fd05c85b2b0f45bc16b1943a0df555",
+                "segment_sha256": "69dcc4e6bb7b86035d942f72915d9cffe1ce81caa3cf419a3a64b602fa6c8493",
+                "length": 31473,
+                "bucket": 32768,
+                "trainable_tokens": 11891,
+                "input_ids_sha256": "d2a107cc2fe5f681b7b44d0358c57c74e40bb252c59a07ea07ec4d13ce95147b",
+                "labels_sha256": "de6be004fd2b4e670bfdd80f2b8901c0f24cb10c659c1e65eed42d306542a8fa",
+            },
+            {
+                "source_id": "nedbat__coveragepy-f3a70c951e838e3cfab706b9a2d0459d783e5a4f",
+                "segment_sha256": "ba704faa9ea4a47943f9cca9e1032a47730ba9492c757dbc03ee1ac20019a6b4",
+                "length": 128798,
+                "bucket": 131072,
+                "trainable_tokens": 8437,
+                "input_ids_sha256": "83ca86315ee2801aa44a3338ec1548f6e65c516dae5cfe0fa286f06eb66b5249",
+                "labels_sha256": "412e9feff072925889821ca7a5219f38a361486b6600014d9f81fe388d7e5afa",
+            },
+        ]
+        golden_manifest = {
+            "bucket_counts": {
+                "8192": 0,
+                "16384": 0,
+                "32768": 3,
+                "65536": 4,
+                "131072": 1,
+            },
+            "bucket_file_integrity": {
+                "8192": {
+                    "bytes": 0,
+                    "records": 0,
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                },
+                "16384": {
+                    "bytes": 0,
+                    "records": 0,
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                },
+                "32768": {
+                    "bytes": 1014056,
+                    "records": 3,
+                    "sha256": "8db8cb1d7b9640bebd786c162ba2957de4609686d7c2d25247b91c4372951b18",
+                },
+                "65536": {
+                    "bytes": 2211965,
+                    "records": 4,
+                    "sha256": "345bcb1c943f4f6d3cf3cabf92aae7aec298ef0a08cd7473b8af7769ed144399",
+                },
+                "131072": {
+                    "bytes": 1408019,
+                    "records": 1,
+                    "sha256": "1e83697c14421db9d3c2db7b6c3735961291def5d9de116f5a77dde5eb9ef09c",
+                },
+            },
+            "length_histogram_rounded_to_1024": {
+                "29696": 1,
+                "30720": 1,
+                "31744": 1,
+                "43008": 1,
+                "45056": 1,
+                "53248": 1,
+                "55296": 1,
+                "129024": 1,
+            },
+            "num_usable_examples": 8,
+            "streamed_examples_scanned": 8,
+            "skipped": {},
+            "included_ids_sha256": "9db47e477c9fb78517bda62612b65cbc4535528083f11ba45ab3daca73362051",
+            "streamed_ids_sha256": "9db47e477c9fb78517bda62612b65cbc4535528083f11ba45ab3daca73362051",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(dataset_path),
+                    "--hf-assets-path",
+                    str(hf_assets_path),
+                    "--num-examples",
+                    "8",
+                    "--max-streamed-examples",
+                    "64",
+                    "--buckets",
+                    "8192,16384,32768,65536,131072",
+                    "--bucket-cp",
+                    "8192:1,16384:1,32768:2,65536:4,131072:8",
+                    "--max-length",
+                    "131072",
+                    "--long-example-policy",
+                    "error",
+                ]
+            )
+            with self._patch_torchtitan_tokenizer_module(tokenizer_class):
+                manifest = train.materialize_training_buckets(args)
+
+            tokenizer = tokenizer_class(str(hf_assets_path))
+            examples = []
+            for index, example in enumerate(train.load_training_dataset(args), start=1):
+                source_id = train._example_id(example, index)
+                segments = train.qwen_openhands_segments(example)
+                encoded = train.encode_swehero_example(
+                    tokenizer,
+                    example,
+                    max_length=args.max_length,
+                    min_trainable_tokens=args.min_trainable_tokens,
+                    include_model_patch=args.include_model_patch,
+                )
+                self.assertIsNotNone(encoded)
+                examples.append((source_id, segments, encoded))
+                if len(examples) == len(golden_rows):
+                    break
+
+        for golden, (source_id, segments, encoded) in zip(golden_rows, examples):
+            self.assertEqual(source_id, golden["source_id"])
+            self.assertEqual(
+                hashlib.sha256(
+                    json.dumps(segments, ensure_ascii=False).encode()
+                ).hexdigest(),
+                golden["segment_sha256"],
+            )
+            self.assertEqual(encoded["length"], golden["length"])
+            self.assertEqual(
+                train.choose_bucket(
+                    encoded["length"],
+                    train.parse_bucket_list(args.buckets),
+                ),
+                golden["bucket"],
+            )
+            self.assertEqual(encoded["trainable_tokens"], golden["trainable_tokens"])
+            self.assertEqual(
+                hashlib.sha256(json.dumps(encoded["input_ids"]).encode()).hexdigest(),
+                golden["input_ids_sha256"],
+            )
+            self.assertEqual(
+                hashlib.sha256(json.dumps(encoded["labels"]).encode()).hexdigest(),
+                golden["labels_sha256"],
+            )
+
+        self.assertEqual(manifest["bucket_counts"], golden_manifest["bucket_counts"])
+        self.assertEqual(
+            manifest["bucket_file_integrity"],
+            golden_manifest["bucket_file_integrity"],
+        )
+        self.assertEqual(
+            manifest["length_histogram_rounded_to_1024"],
+            golden_manifest["length_histogram_rounded_to_1024"],
+        )
+        self.assertEqual(
+            manifest["num_usable_examples"],
+            golden_manifest["num_usable_examples"],
+        )
+        self.assertEqual(
+            manifest["streamed_examples_scanned"],
+            golden_manifest["streamed_examples_scanned"],
+        )
+        self.assertEqual(manifest["skipped"], golden_manifest["skipped"])
+        self.assertEqual(
+            manifest["data_provenance"]["included"]["sha256"],
+            golden_manifest["included_ids_sha256"],
+        )
+        self.assertEqual(
+            manifest["data_provenance"]["streamed"]["sha256"],
+            golden_manifest["streamed_ids_sha256"],
+        )
+
+    def test_real_swehero_skip_materialization_matches_legacy_encoder(self):
+        self._require_real_materialization_dependencies()
+        dataset_path = self._real_swehero_dataset_path()
+        hf_assets_path = self._real_qwen_hf_assets_path()
+        tokenizer_class = self._mini_qwen_tokenizer_class()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(dataset_path),
+                    "--hf-assets-path",
+                    str(hf_assets_path),
+                    "--num-examples",
+                    "2",
+                    "--max-streamed-examples",
+                    "8",
+                    "--buckets",
+                    "30000",
+                    "--bucket-cp",
+                    "30000:1",
+                    "--max-length",
+                    "30000",
+                    "--long-example-policy",
+                    "skip",
+                ]
+            )
+            tokenizer = tokenizer_class(str(hf_assets_path))
+            expected = self._expected_materialization_from_legacy_encoder(
+                args=args,
+                tokenizer=tokenizer,
+                examples=train.load_training_dataset(args),
+            )
+            with self._patch_torchtitan_tokenizer_module(tokenizer_class):
+                manifest = train.materialize_training_buckets(args)
+            actual_bucket_text = Path(manifest["bucket_files"]["30000"]).read_text()
+
+        self.assertEqual(manifest["bucket_counts"], expected["bucket_counts"])
+        self.assertEqual(
+            manifest["bucket_file_integrity"],
+            expected["bucket_file_integrity"],
+        )
+        self.assertEqual(
+            manifest["length_histogram_rounded_to_1024"],
+            expected["length_histogram_rounded_to_1024"],
+        )
+        self.assertEqual(
+            manifest["num_usable_examples"],
+            expected["num_usable_examples"],
+        )
+        self.assertEqual(
+            manifest["streamed_examples_scanned"],
+            expected["streamed_examples_scanned"],
+        )
+        self.assertEqual(manifest["skipped"], {"too_long_for_max_length": 2})
+        self.assertEqual(manifest["skipped"], expected["skipped"])
+        self.assertEqual(
+            manifest["data_provenance"]["streamed"]["source_ids"],
+            expected["streamed_source_ids"],
+        )
+        self.assertEqual(
+            manifest["data_provenance"]["included"]["source_ids"],
+            expected["included_source_ids"],
+        )
+        self.assertEqual(
+            manifest["data_provenance"]["skipped"]["by_reason"][
+                "too_long_for_max_length"
+            ]["source_ids"],
+            expected["skipped_source_ids_by_reason"]["too_long_for_max_length"],
+        )
+        self.assertEqual(
+            actual_bucket_text,
+            "".join(expected["bucket_lines"]["30000"]),
+        )
 
     def test_synthetic_smoke_materialization_covers_configured_bucket_cp_paths(self):
         with tempfile.TemporaryDirectory() as tmp:

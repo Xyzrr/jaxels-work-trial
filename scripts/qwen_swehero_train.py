@@ -37,6 +37,7 @@ import subprocess
 import sys
 import time
 import uuid
+from bisect import bisect_left
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
@@ -3567,6 +3568,47 @@ def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
         return list(tokenizer.encode(text, add_special_tokens=False))
 
 
+def _tokenize_texts(tokenizer: Any, texts: Iterable[str]) -> list[list[int]]:
+    values = list(texts)
+    if not values:
+        return []
+
+    # TorchTitan's HuggingFaceTokenizer wraps tokenizers.Tokenizer at
+    # ``.tokenizer``. Calling the wrapped Rust batch API preserves the same
+    # per-segment boundaries while avoiding one Python call per rendered segment.
+    backend = getattr(tokenizer, "tokenizer", None)
+    encode_batch = getattr(backend, "encode_batch", None)
+    if callable(encode_batch):
+        try:
+            return [list(encoding.ids) for encoding in encode_batch(values)]
+        except TypeError:
+            pass
+
+    encode_batch = getattr(tokenizer, "encode_batch", None)
+    if callable(encode_batch):
+        try:
+            return [
+                list(encoding.ids)
+                for encoding in encode_batch(values, add_special_tokens=False)
+            ]
+        except TypeError:
+            try:
+                return [list(encoding.ids) for encoding in encode_batch(values)]
+            except TypeError:
+                pass
+
+    batch_encode_plus = getattr(tokenizer, "batch_encode_plus", None)
+    if callable(batch_encode_plus):
+        try:
+            encoded = batch_encode_plus(values, add_special_tokens=False)
+        except TypeError:
+            encoded = None
+        if isinstance(encoded, Mapping) and "input_ids" in encoded:
+            return [list(ids) for ids in encoded["input_ids"]]
+
+    return [_tokenize_text(tokenizer, text) for text in values]
+
+
 def encode_swehero_example(
     tokenizer: Any,
     example: dict[str, object],
@@ -3583,10 +3625,16 @@ def encode_swehero_example(
         token_ids.append(int(bos_id))
         labels.append(IGNORE_INDEX)
 
-    for text, is_trainable in qwen_openhands_segments(
+    segments = qwen_openhands_segments(
         example, include_model_patch=include_model_patch
-    ):
-        ids = _tokenize_text(tokenizer, text)
+    )
+    tokenized_segments = _tokenize_texts(tokenizer, (text for text, _ in segments))
+    if len(tokenized_segments) != len(segments):
+        raise RuntimeError(
+            "Tokenizer returned a different number of segment encodings than "
+            f"requested: {len(tokenized_segments)} != {len(segments)}"
+        )
+    for ids, (_text, is_trainable) in zip(tokenized_segments, segments):
         token_ids.extend(ids)
         labels.extend(ids if is_trainable else [IGNORE_INDEX] * len(ids))
 
@@ -3645,6 +3693,15 @@ def _example_id(example: Mapping[str, object], fallback_index: int) -> str:
         if value:
             return str(value)
     return f"stream_row_{fallback_index}"
+
+
+def _choose_bucket_from_sorted(length: int, buckets: tuple[int, ...]) -> int:
+    if length <= 0:
+        raise ValueError("length must be positive")
+    index = bisect_left(buckets, length)
+    if index == len(buckets):
+        raise ValueError(f"length {length} exceeds largest bucket {buckets[-1]}")
+    return buckets[index]
 
 
 def _resolve_bucket_file_for_validation(
@@ -4401,7 +4458,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                 ).append(source_id)
             else:
                 try:
-                    bucket = choose_bucket(encoded["length"], buckets)
+                    bucket = _choose_bucket_from_sorted(encoded["length"], buckets)
                 except ValueError:
                     skipped["too_long_for_largest_bucket"] += 1
                     skipped_source_ids_by_reason.setdefault(
@@ -4418,11 +4475,9 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                     included_source_ids.append(source_id)
                     bucket_source_ids[bucket].append(source_id)
                     bucket_lengths[bucket].append(int(encoded["length"]))
-                    trainable_tokens = sum(
-                        label != IGNORE_INDEX for label in encoded["labels"]
-                    )
+                    trainable_tokens = int(encoded["trainable_tokens"])
                     bucket_trainable_tokens[bucket].append(trainable_tokens)
-                    rounded_length = int(math.ceil(encoded["length"] / 1024) * 1024)
+                    rounded_length = ((int(encoded["length"]) + 1023) // 1024) * 1024
                     length_histogram[rounded_length] += 1
                     bucket_length_histograms[bucket][rounded_length] += 1
                     usable_examples += 1
