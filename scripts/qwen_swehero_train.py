@@ -75,6 +75,17 @@ DEFAULT_BUCKET_CP = {
     PAPER_CONTEXT_LENGTH: 8,
 }
 DEFAULT_BUCKET_CURRICULUM = "short-to-long"
+DEFAULT_LONG_EXAMPLE_POLICY = "error"
+DEFAULT_MIN_TRAINABLE_TOKENS = 1
+DEFAULT_INCLUDE_MODEL_PATCH = False
+DEFAULT_NUM_TRAIN_EPOCHS = 3.0
+DEFAULT_MAX_STEPS = 0
+DEFAULT_GLOBAL_BATCH_SIZE = 32
+DEFAULT_LOCAL_BATCH_SIZE = 1
+DEFAULT_LEARNING_RATE = 1e-5
+DEFAULT_MIN_LEARNING_RATE = 1e-8
+DEFAULT_WARMUP_RATIO = 0.1
+DEFAULT_WEIGHT_DECAY = 0.0
 BUCKET_CURRICULUM_CHOICES = (
     "short-to-long",
     "long-to-short",
@@ -148,6 +159,7 @@ RESUME_ARG_FIELDS = (
     "source_dataset_id",
     "source_dataset_revision",
     "hf_assets_path",
+    "production_mode",
     "num_examples",
     "max_streamed_examples",
     "shuffle_buffer",
@@ -212,6 +224,7 @@ RUN_SPEC_ARG_FIELDS = (
     "source_dataset_rows_per_shard",
     "source_dataset_build_batch_size",
     "hf_assets_path",
+    "production_mode",
     "num_examples",
     "max_streamed_examples",
     "shuffle_buffer",
@@ -792,6 +805,118 @@ def _artifact_path_safety_errors(args: argparse.Namespace) -> list[str]:
     return errors
 
 
+def _values_match(actual: object, expected: object) -> bool:
+    if isinstance(expected, float):
+        return isinstance(actual, (int, float)) and math.isclose(
+            float(actual),
+            expected,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
+    return actual == expected
+
+
+def _production_mode_errors(
+    args: argparse.Namespace,
+    *,
+    buckets: tuple[int, ...],
+    bucket_cp: Mapping[int, int],
+) -> list[str]:
+    if not args.production_mode:
+        return []
+
+    errors: list[str] = []
+    forbidden_flags = (
+        ("--dry-run", args.dry_run, "it does not launch training"),
+        ("--prepare-data-only", args.prepare_data_only, "it exits before training"),
+        (
+            "--smoke-synthetic-buckets",
+            args.smoke_synthetic_buckets,
+            "it trains on synthetic launcher records",
+        ),
+    )
+    for name, enabled, reason in forbidden_flags:
+        if enabled:
+            errors.append(f"--production-mode rejects {name} because {reason}")
+
+    if args.skip_data_prep and not args.resume:
+        errors.append(
+            "--production-mode rejects --skip-data-prep for fresh launches; "
+            "materialize and validate data in the launch or use --resume for "
+            "checkpoint continuation"
+        )
+
+    required_values = (
+        ("--dataset-id", args.dataset_id, DATASET_ID),
+        ("--source-dataset-id", args.source_dataset_id, SOURCE_DATASET_ID),
+        (
+            "--source-dataset-revision",
+            args.source_dataset_revision,
+            SOURCE_DATASET_REVISION,
+        ),
+        ("--num-examples", args.num_examples, DEFAULT_NUM_EXAMPLES),
+        (
+            "--max-streamed-examples",
+            args.max_streamed_examples,
+            DEFAULT_MAX_STREAMED_EXAMPLES,
+        ),
+        ("--max-length", args.max_length, PAPER_CONTEXT_LENGTH),
+        (
+            "--long-example-policy",
+            args.long_example_policy,
+            DEFAULT_LONG_EXAMPLE_POLICY,
+        ),
+        (
+            "--min-trainable-tokens",
+            args.min_trainable_tokens,
+            DEFAULT_MIN_TRAINABLE_TOKENS,
+        ),
+        (
+            "--include-model-patch",
+            args.include_model_patch,
+            DEFAULT_INCLUDE_MODEL_PATCH,
+        ),
+        ("--num-train-epochs", args.num_train_epochs, DEFAULT_NUM_TRAIN_EPOCHS),
+        ("--max-steps", args.max_steps, DEFAULT_MAX_STEPS),
+        ("--global-batch-size", args.global_batch_size, DEFAULT_GLOBAL_BATCH_SIZE),
+        ("--local-batch-size", args.local_batch_size, DEFAULT_LOCAL_BATCH_SIZE),
+        ("--learning-rate", args.learning_rate, DEFAULT_LEARNING_RATE),
+        ("--min-learning-rate", args.min_learning_rate, DEFAULT_MIN_LEARNING_RATE),
+        ("--warmup-ratio", args.warmup_ratio, DEFAULT_WARMUP_RATIO),
+        ("--weight-decay", args.weight_decay, DEFAULT_WEIGHT_DECAY),
+    )
+    for name, actual, expected in required_values:
+        if not _values_match(actual, expected):
+            errors.append(
+                f"--production-mode requires {name}={expected!r}; got "
+                f"{actual!r}. This prevents a smoke/prototype launch from "
+                "being recorded as the production direct-to-hero run."
+            )
+
+    if buckets != DEFAULT_BUCKETS:
+        errors.append(
+            "--production-mode requires "
+            f"--buckets={','.join(str(bucket) for bucket in DEFAULT_BUCKETS)}; "
+            f"got {','.join(str(bucket) for bucket in buckets)}. This preserves "
+            "the reviewed full-context bucket plan."
+        )
+    if dict(bucket_cp) != DEFAULT_BUCKET_CP:
+        errors.append(
+            "--production-mode requires "
+            f"--bucket-cp={_format_bucket_cp_map(DEFAULT_BUCKET_CP)}; got "
+            f"{_format_bucket_cp_map(bucket_cp)}. This preserves the reviewed "
+            "per-bucket context-parallel plan."
+        )
+    if args.bucket_curriculum != DEFAULT_BUCKET_CURRICULUM:
+        errors.append(
+            "--production-mode requires "
+            f"--bucket-curriculum={DEFAULT_BUCKET_CURRICULUM!r}; got "
+            f"{args.bucket_curriculum!r}. Alternate curricula must be launched "
+            "as explicit non-production ablations."
+        )
+    return errors
+
+
 def validate_launch_inputs(
     args: argparse.Namespace,
     *,
@@ -1019,6 +1144,7 @@ def validate_launch_inputs(
             "--smoke-synthetic-examples-per-bucket only applies when "
             "--smoke-synthetic-buckets is set"
         )
+    errors.extend(_production_mode_errors(args, buckets=buckets, bucket_cp=bucket_cp))
 
     if args.profiler_freq < args.profiler_active + args.profiler_warmup:
         errors.append(
@@ -1762,7 +1888,7 @@ def parse_args(
     parser.add_argument(
         "--long-example-policy",
         choices=("error", "skip"),
-        default=os.environ.get("LONG_EXAMPLE_POLICY", "error"),
+        default=os.environ.get("LONG_EXAMPLE_POLICY", DEFAULT_LONG_EXAMPLE_POLICY),
         help=(
             "How to handle examples whose shifted input length exceeds "
             "--max-length. The production default is error so over-context "
@@ -1816,61 +1942,61 @@ def parse_args(
     parser.add_argument(
         "--min-trainable-tokens",
         type=int,
-        default=_env_int("MIN_TRAINABLE_TOKENS", 1),
+        default=_env_int("MIN_TRAINABLE_TOKENS", DEFAULT_MIN_TRAINABLE_TOKENS),
         help="Drop examples with fewer trainable shifted labels than this.",
     )
     parser.add_argument(
         "--include-model-patch",
         action="store_true",
-        default=_env_flag("INCLUDE_MODEL_PATCH", False),
+        default=_env_flag("INCLUDE_MODEL_PATCH", DEFAULT_INCLUDE_MODEL_PATCH),
         help="Also train on the model_patch field when present.",
     )
     parser.add_argument(
         "--num-train-epochs",
         type=float,
-        default=_env_float("NUM_TRAIN_EPOCHS", 3.0),
+        default=_env_float("NUM_TRAIN_EPOCHS", DEFAULT_NUM_TRAIN_EPOCHS),
         help="SFT epochs over the materialized subset. Paper uses up to 3.",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=_env_int("MAX_STEPS", 0),
+        default=_env_int("MAX_STEPS", DEFAULT_MAX_STEPS),
         help="Optional total optimizer-step cap across all bucket stages.",
     )
     parser.add_argument(
         "--global-batch-size",
         type=int,
-        default=_env_int("GLOBAL_BATCH_SIZE", 32),
+        default=_env_int("GLOBAL_BATCH_SIZE", DEFAULT_GLOBAL_BATCH_SIZE),
         help="Paper global batch size is 32.",
     )
     parser.add_argument(
         "--local-batch-size",
         type=int,
-        default=_env_int("LOCAL_BATCH_SIZE", 1),
+        default=_env_int("LOCAL_BATCH_SIZE", DEFAULT_LOCAL_BATCH_SIZE),
         help="TorchTitan local microbatch size per data-parallel rank.",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=_env_float("LEARNING_RATE", 1e-5),
+        default=_env_float("LEARNING_RATE", DEFAULT_LEARNING_RATE),
         help="Peak AdamW learning rate. Paper uses 1e-5.",
     )
     parser.add_argument(
         "--min-learning-rate",
         type=float,
-        default=_env_float("MIN_LEARNING_RATE", 1e-8),
+        default=_env_float("MIN_LEARNING_RATE", DEFAULT_MIN_LEARNING_RATE),
         help="Cosine floor learning rate. Paper uses 1e-8.",
     )
     parser.add_argument(
         "--warmup-ratio",
         type=float,
-        default=_env_float("WARMUP_RATIO", 0.1),
+        default=_env_float("WARMUP_RATIO", DEFAULT_WARMUP_RATIO),
         help="Warmup ratio. Paper uses 0.1.",
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=_env_float("WEIGHT_DECAY", 0.0),
+        default=_env_float("WEIGHT_DECAY", DEFAULT_WEIGHT_DECAY),
         help="AdamW weight decay. The paper does not report this.",
     )
     parser.add_argument(
@@ -2188,6 +2314,16 @@ def parse_args(
         help=(
             "Value exported to TORCH_NCCL_ASYNC_ERROR_HANDLING for torchrun "
             "workers. The previous implicit default was 1."
+        ),
+    )
+    parser.add_argument(
+        "--production-mode",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("PRODUCTION_MODE", False),
+        help=(
+            "Fail closed unless the launch uses the full reviewed "
+            "direct-to-hero recipe. This rejects dry-run, synthetic smoke, "
+            "subset, step-capped, and shortened-context settings."
         ),
     )
     parser.add_argument(
@@ -2817,6 +2953,15 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
             "The paper reports direct-to-hero as a 32B ablation; this 7B run is a scale-study extension.",
             "The one-rollout public training artifact is generated from the closest public historical SWE-Hero revision and records the public-column filter limitation in metadata.json.",
         ],
+        "run_safety": {
+            "production_mode": args.production_mode,
+            "production_gate": (
+                "enabled: smoke, subset, step-capped, and shortened-context "
+                "settings are rejected before launch"
+                if args.production_mode
+                else "disabled: smoke/prototype settings are allowed but recorded"
+            ),
+        },
         "intentional_engineering_deltas": [
             "TorchTitan distributed full-model SFT replaces the earlier local Transformers smoke script.",
             "FSDP uses BF16 mixed-precision parameters/reductions; FP8 is applied only to TorchTitan linear layers selected by its converter.",

@@ -106,8 +106,9 @@ manifest hash, and Parquet shard sizes/hashes. Use `--rebuild-source-dataset`
 when intentionally replacing the cached pod artifact.
 
 For quick real-data GPU smoke tests, pass `--num-examples 64` or another cap.
-The default `--num-examples 0` means materialize all usable examples from the
-cached one-rollout dataset.
+Do not combine those smoke caps with `--production-mode`. The default
+`--num-examples 0` means materialize all usable examples from the cached
+one-rollout dataset.
 
 ## HF Logits Parity
 
@@ -170,9 +171,11 @@ synthetic flags with `--num-examples 64` and use the target bucket plan. That
 path is closer to the production data path, but it does not guarantee that
 every configured bucket is non-empty.
 
-The production run should use the same wrapper without `--num-examples`, so the
-trainer tokenizes the full cached one-rollout dataset and uses the full bucket
-plan.
+The production run should use the same wrapper with `--production-mode` and
+without `--num-examples`, so the trainer tokenizes the full cached one-rollout
+dataset and uses the full bucket plan. The production gate rejects dry runs,
+synthetic buckets, subset caps, step caps, shortened context, and alternate
+bucket curricula before launch.
 
 ## Launch Argument Files
 
@@ -186,6 +189,10 @@ scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
 Each non-empty line in the argument file is parsed like shell input, and lines
 starting with `#` are ignored. Flags written after `@configs/swehero-7b.args`
 on the command line override earlier values from the file.
+
+Reviewed argument files for the actual direct-to-hero run should include
+`--production-mode`. Leave that flag out for smoke, profiler, and bounded soak
+commands because those intentionally use prototype settings.
 
 ## Recorded Training Environment Inputs
 

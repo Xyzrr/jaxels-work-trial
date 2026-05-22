@@ -349,6 +349,38 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         )
         return args
 
+    def _validate_default_production_launch_args(
+        self,
+        extra_args: list[str] | None = None,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
+                    "--production-mode",
+                    *(extra_args or []),
+                ]
+            )
+            args.buckets = ",".join(
+                str(b) for b in train.parse_bucket_list(args.buckets)
+            )
+            buckets = train.parse_bucket_list(args.buckets)
+            bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+            args.bucket_cp = train._format_bucket_cp_map(bucket_cp)
+            train.validate_launch_inputs(args, buckets=buckets, bucket_cp=bucket_cp)
+            train.validate_bucket_config(
+                buckets=buckets,
+                bucket_cp=bucket_cp,
+                nproc_per_node=args.nproc_per_node,
+                attention_backend=args.attention_backend,
+            )
+            return args
+
     def test_defaults_track_paper_hyperparameters_and_target_pod(self):
         args = train.parse_args([])
         buckets = train.parse_bucket_list(args.buckets)
@@ -389,6 +421,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.mixed_precision_param_dtype, "bfloat16")
         self.assertEqual(args.mixed_precision_reduce_dtype, "bfloat16")
         self.assertEqual(args.fsdp_reshard_after_forward, "never")
+        self.assertFalse(args.production_mode)
         self.assertFalse(args.detect_anomaly)
         self.assertEqual(args.cuda_device_max_connections, "1")
         self.assertEqual(args.torch_nccl_async_error_handling, "1")
@@ -399,6 +432,59 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.profiler_warmup, 3)
         self.assertFalse(args.enable_memory_snapshot)
         self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
+
+    def test_production_mode_accepts_full_default_training_recipe(self):
+        args = self._validate_default_production_launch_args()
+
+        self.assertTrue(args.production_mode)
+        self.assertEqual(args.num_examples, 0)
+        self.assertEqual(args.max_streamed_examples, 0)
+        self.assertEqual(args.max_steps, 0)
+        self.assertEqual(args.max_length, train.PAPER_CONTEXT_LENGTH)
+
+    def test_production_mode_rejects_smoke_and_subset_controls(self):
+        cases = [
+            (["--dry-run"], "--dry-run"),
+            (["--prepare-data-only"], "--prepare-data-only"),
+            (["--skip-data-prep"], "--skip-data-prep"),
+            (["--smoke-synthetic-buckets"], "--smoke-synthetic-buckets"),
+            (["--num-examples", "1"], "--num-examples=0"),
+            (["--max-streamed-examples", "10"], "--max-streamed-examples=0"),
+            (["--max-steps", "1"], "--max-steps=0"),
+        ]
+        for extra_args, message in cases:
+            with self.subTest(extra_args=extra_args):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._validate_default_production_launch_args(extra_args)
+
+    def test_production_mode_rejects_non_production_training_recipe(self):
+        cases = [
+            (["--max-length", "32768"], "--max-length=131072"),
+            (["--buckets", "131072", "--bucket-cp", "131072:8"], "--buckets"),
+            (
+                [
+                    "--bucket-cp",
+                    "8192:1,16384:1,32768:1,65536:4,131072:8",
+                ],
+                "--bucket-cp",
+            ),
+            (["--bucket-curriculum", "long-to-short"], "--bucket-curriculum"),
+            (["--num-train-epochs", "1"], "--num-train-epochs=3.0"),
+            (["--global-batch-size", "8"], "--global-batch-size=32"),
+            (["--local-batch-size", "2"], "--local-batch-size=1"),
+            (["--learning-rate", "2e-5"], "--learning-rate=1e-05"),
+            (["--min-learning-rate", "0"], "--min-learning-rate=1e-08"),
+            (["--warmup-ratio", "0"], "--warmup-ratio=0.1"),
+            (["--weight-decay", "0.1"], "--weight-decay=0.0"),
+            (["--long-example-policy", "skip"], "--long-example-policy='error'"),
+            (["--include-model-patch"], "--include-model-patch=False"),
+            (["--min-trainable-tokens", "2"], "--min-trainable-tokens=1"),
+            (["--source-dataset-revision", "main"], "--source-dataset-revision"),
+        ]
+        for extra_args, message in cases:
+            with self.subTest(extra_args=extra_args):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._validate_default_production_launch_args(extra_args)
 
     def test_launch_env_file_sets_defaults_before_full_parse(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -490,6 +576,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_env_numeric_and_boolean_values_are_strict(self):
         cases = [
             ({"ENABLE_FP8": "maybe"}, "ENABLE_FP8 must be a boolean"),
+            ({"PRODUCTION_MODE": "maybe"}, "PRODUCTION_MODE must be a boolean"),
             ({"NUM_EXAMPLES": "abc"}, "NUM_EXAMPLES must be an integer"),
             ({"PROFILER_REPEAT": "abc"}, "PROFILER_REPEAT must be an integer"),
             ({"LEARNING_RATE": "nan"}, "LEARNING_RATE must be finite"),
@@ -1913,6 +2000,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertFalse(written_again)
         self.assertEqual(spec_sha, train._sha256_text(spec_text))
         self.assertEqual(spec["schema_version"], train.RUN_SPEC_SCHEMA_VERSION)
+        self.assertFalse(spec["args"]["production_mode"])
         self.assertEqual(spec["args"]["max_length"], 32768)
         self.assertEqual(spec["manifest"], train._resume_manifest_contract(manifest))
         self.assertEqual(
@@ -1935,6 +2023,17 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(first_env["SWEHERO_PROFILER_FREQ"], "10")
         self.assertEqual(first_env["SWEHERO_ENABLE_MEMORY_SNAPSHOT"], "0")
         self.assertNotIn("SWEHERO_SECRET", first_env)
+
+    def test_production_mode_is_recorded_in_run_spec_and_resume_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            args.production_mode = True
+            spec = train.build_run_spec(args, plan, manifest)
+            contract = train.build_resume_contract(args, plan, manifest)
+
+        self.assertTrue(spec["args"]["production_mode"])
+        self.assertTrue(contract["args"]["production_mode"])
+        self.assertTrue(spec["paper_alignment"]["run_safety"]["production_mode"])
 
     def test_hidden_torchtitan_env_inputs_are_recorded_as_launch_args(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -2802,6 +2901,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             launcher_plan = json.loads((out_dir / "launcher_plan.json").read_text())
 
         self.assertEqual(run_spec["args"]["max_length"], 256)
+        self.assertFalse(run_spec["args"]["production_mode"])
         self.assertEqual(run_spec["args"]["model_revision"], train.MODEL_REVISION)
         self.assertEqual(
             run_spec["paper_alignment"]["kept"]["base_model_revision"],
