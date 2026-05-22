@@ -20,6 +20,12 @@ spec:
         - bash
         - -lc
         - |
+          if ! command -v tmux >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends tmux
+            rm -rf /var/lib/apt/lists/*
+          fi
           export UV_CACHE_DIR=/workspace/.cache/uv
           export UV_PYTHON_INSTALL_DIR=/workspace/python
           /workspace/uv/uv-0.11.16/uv python install 3.10.12 \

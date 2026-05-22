@@ -14,6 +14,35 @@ scripts/run_qwen_swehero_torchtitan_pod.sh \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
 ```
 
+When this wrapper is run from an interactive pod terminal, it creates or
+attaches to a `tmux` session named from `--out-dir`. The training process stays
+inside that pod-local session if the `kubectl exec` connection drops, and
+rerunning the same wrapper command reconnects to the existing session instead
+of starting a duplicate job. The wrapper also records the outer launcher
+transcript under `/workspace/runlogs/<session>.tmux.log`.
+
+Useful controls:
+
+```bash
+# List supervised launches.
+tmux ls
+
+# Reattach directly when you know the session name.
+tmux attach-session -t swehero-qwen25-coder7b-swehero-torchtitan
+
+# Override the derived session name for a launch.
+SWEHERO_POD_TMUX_SESSION=swehero-7b-prod \
+  scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
+
+# Force a supervised detached launch from a non-interactive exec.
+SWEHERO_POD_SUPERVISOR=1 SWEHERO_POD_TMUX_ATTACH=0 \
+  scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
+
+# Bypass tmux intentionally for non-interactive automation.
+SWEHERO_POD_SUPERVISOR=0 \
+  scripts/run_qwen_swehero_torchtitan_pod.sh --dry-run
+```
+
 The host and container workspace root are both `/workspace`. The pod manifest
 uses `hostPath.path: /workspace` with `type: Directory`, so the GPU node must
 prepare `/workspace` as a real directory or mountpoint before the pod is
@@ -21,9 +50,11 @@ created. Do not rely on a host symlink for this path.
 
 The CUDA base image does not include Python. The pod entrypoint uses the pinned
 `/workspace/uv/uv-0.11.16/uv` binary to install CPython 3.10.12 under
-`/workspace/python` before idling, so the persisted uv-managed venv under
-`/workspace/venvs/torchtitan-swehero-cu128` has a valid interpreter after every
-pod recreation without relying on apt-managed Python.
+`/workspace/python` before idling. It also installs `tmux` when the base image
+does not provide it, so reconnectable launches are available before training.
+The persisted uv-managed venv under `/workspace/venvs/torchtitan-swehero-cu128`
+has a valid interpreter after every pod recreation without relying on
+apt-managed Python.
 
 The launcher pins the base checkpoint to
 `Qwen/Qwen2.5-Coder-7B-Instruct@c03e6d358207e414f1eca0bb1891e29f1db0e242`.
