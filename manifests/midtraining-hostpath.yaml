@@ -11,7 +11,7 @@ metadata:
 spec:
   restartPolicy: Never
   nodeSelector:
-    kubernetes.io/hostname: gpu-dp-nwfln-6w5tz
+    kubernetes.io/hostname: gpu-dp-8sd75-hxggv
   containers:
     - name: trainer
       image: nvidia/cuda:12.8.0-base-ubuntu22.04
@@ -19,7 +19,7 @@ spec:
       command: ["bash", "-lc", "sleep infinity"]
       resources:
         limits:
-          nvidia.com/gpu: 1
+          nvidia.com/gpu: 8
       env:
         - name: HF_HOME
           value: /workspace/.cache/huggingface
