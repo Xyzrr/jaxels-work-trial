@@ -922,6 +922,151 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(summary["device_count"], 1)
         self.assertEqual(summary["devices"][0]["capability"], [9, 0])
 
+    def test_nvidia_smi_metadata_parses_driver_and_cuda_version(self):
+        def fake_command(command, *, timeout_seconds=5.0):
+            if "--query-gpu=index,name,uuid,driver_version,memory.total" in command:
+                return {
+                    "command": command,
+                    "available": True,
+                    "returncode": 0,
+                    "stdout": (
+                        "0, NVIDIA H100 80GB HBM3, GPU-test, "
+                        "570.195.03, 81559\n"
+                    ),
+                    "stderr": "",
+                }
+            return {
+                "command": command,
+                "available": True,
+                "returncode": 0,
+                "stdout": (
+                    "| NVIDIA-SMI 570.195.03    Driver Version: 570.195.03"
+                    "    CUDA Version: 12.8 |\n"
+                ),
+                "stderr": "",
+            }
+
+        with patch.object(train, "_run_metadata_command", side_effect=fake_command):
+            metadata = train._nvidia_smi_metadata()
+
+        self.assertEqual(metadata["cuda_version_from_banner"], "12.8")
+        self.assertEqual(metadata["gpus"][0]["index"], "0")
+        self.assertEqual(metadata["gpus"][0]["name"], "NVIDIA H100 80GB HBM3")
+        self.assertEqual(metadata["gpus"][0]["uuid"], "GPU-test")
+        self.assertEqual(metadata["gpus"][0]["driver_version"], "570.195.03")
+        self.assertEqual(metadata["gpus"][0]["memory_total_mib"], "81559")
+
+    def test_write_runtime_metadata_records_environment_and_lockfiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(["--out-dir", str(Path(tmp) / "run")])
+            args.out_dir.mkdir(parents=True)
+            lockfile = Path(tmp) / "lock.txt"
+            lockfile.write_text("locked\n")
+            runtime = {
+                "python": sys.executable,
+                "torch": "2.x",
+                "cuda": {"device_count": 8},
+            }
+
+            with (
+                patch.object(train.time, "time", return_value=123.0),
+                patch.object(
+                    train,
+                    "_runtime_lockfile_metadata",
+                    return_value=[
+                        {
+                            "kind": "test_lock",
+                            **train._file_metadata(lockfile),
+                        }
+                    ],
+                ),
+                patch.object(
+                    train,
+                    "_nvidia_smi_metadata",
+                    return_value={
+                        "gpus": [
+                            {
+                                "index": "0",
+                                "driver_version": "570.195.03",
+                            }
+                        ],
+                        "cuda_version_from_banner": "12.8",
+                    },
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "NCCL_DEBUG": "INFO",
+                        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+                        "UNRELATED": "ignored",
+                    },
+                    clear=True,
+                ),
+            ):
+                metadata = train.write_runtime_metadata(args, runtime)
+
+            persisted = json.loads(
+                (args.out_dir / train.RUNTIME_METADATA_FILENAME).read_text()
+            )
+
+        self.assertEqual(metadata, persisted)
+        self.assertEqual(
+            metadata["schema_version"],
+            train.RUNTIME_METADATA_SCHEMA_VERSION,
+        )
+        self.assertEqual(metadata["created_at_unix"], 123.0)
+        self.assertEqual(metadata["runtime"], runtime)
+        self.assertEqual(
+            metadata["lockfiles"][0]["sha256"],
+            train._sha256_text("locked\n"),
+        )
+        self.assertEqual(
+            metadata["hardware"]["nvidia_smi"]["cuda_version_from_banner"],
+            "12.8",
+        )
+        self.assertEqual(
+            metadata["environment"],
+            {
+                "NCCL_DEBUG": "INFO",
+                "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+            },
+        )
+
+    def test_runtime_lockfile_metadata_uses_invoked_venv_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            venv_root = Path(tmp) / "venv"
+            (repo_root / "requirements").mkdir(parents=True)
+            (repo_root / "torchtitan" / ".ci" / "docker").mkdir(parents=True)
+            (venv_root / "bin").mkdir(parents=True)
+            (repo_root / "requirements" / "torchtitan-pod-cu128.lock").write_text(
+                "lock\n"
+            )
+            (repo_root / "requirements" / "torchtitan-pod-cu128.txt").write_text(
+                "requirements\n"
+            )
+            (
+                repo_root / "torchtitan" / ".ci" / "docker" / "requirements.txt"
+            ).write_text("torchtitan\n")
+            runtime_json = venv_root / "torchtitan-swehero-runtime.json"
+            runtime_json.write_text('{"runtime": true}\n')
+
+            metadata = train._runtime_lockfile_metadata(
+                repo_root=repo_root,
+                python_executable=str(venv_root / "bin" / "python"),
+            )
+
+        by_kind = {record["kind"]: record for record in metadata}
+        self.assertEqual(
+            by_kind["venv_runtime_metadata"]["path"],
+            str(runtime_json),
+        )
+        self.assertTrue(by_kind["venv_runtime_metadata"]["exists"])
+        self.assertEqual(
+            by_kind["venv_runtime_metadata"]["sha256"],
+            train._sha256_text('{"runtime": true}\n'),
+        )
+
     def test_dataset_artifact_metadata_records_selection_and_shard_hashes(self):
         with tempfile.TemporaryDirectory() as tmp:
             dataset = Path(tmp) / "dataset"
@@ -2302,6 +2447,14 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(
             launcher_plan["wandb_identity"],
             str(out_dir / train.WANDB_IDENTITY_FILENAME),
+        )
+        self.assertEqual(
+            run_spec["paths"]["runtime_metadata"],
+            str(out_dir / train.RUNTIME_METADATA_FILENAME),
+        )
+        self.assertEqual(
+            launcher_plan["runtime_metadata"],
+            str(out_dir / train.RUNTIME_METADATA_FILENAME),
         )
         self.assertEqual(run_spec["args"]["post_training_eval_command"], "")
         self.assertEqual(

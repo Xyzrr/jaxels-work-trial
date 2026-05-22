@@ -28,6 +28,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import signal
@@ -97,6 +98,8 @@ FINAL_ARTIFACT_VALIDATION_SCHEMA_VERSION = 1
 FINAL_ARTIFACT_VALIDATION_FILENAME = "final_artifact_validation.json"
 POST_TRAINING_EVAL_STATUS_SCHEMA_VERSION = 1
 POST_TRAINING_EVAL_STATUS_FILENAME = "post_training_eval_status.json"
+RUNTIME_METADATA_SCHEMA_VERSION = 1
+RUNTIME_METADATA_FILENAME = "runtime_metadata.json"
 STAGE_STATUS_SCHEMA_VERSION = 1
 STAGE_STATUS_FILENAME = "stage_status.json"
 WANDB_IDENTITY_SCHEMA_VERSION = 1
@@ -970,6 +973,10 @@ def _final_artifact_validation_path(out_dir: Path) -> Path:
 
 def _post_training_eval_status_path(out_dir: Path) -> Path:
     return out_dir / POST_TRAINING_EVAL_STATUS_FILENAME
+
+
+def _runtime_metadata_path(out_dir: Path) -> Path:
+    return out_dir / RUNTIME_METADATA_FILENAME
 
 
 def _stage_status_path(out_dir: Path) -> Path:
@@ -2274,6 +2281,145 @@ def _package_versions() -> dict[str, str | None]:
         except Exception:
             versions[package_name] = None
     return versions
+
+
+def _file_metadata(path: Path) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "bytes": path.stat().st_size if path.exists() else 0,
+        "sha256": _hash_file(path),
+    }
+
+
+def _runtime_lockfile_metadata(
+    *,
+    repo_root: Path | None = None,
+    python_executable: str | None = None,
+) -> list[dict[str, Any]]:
+    repo_root = repo_root or Path(__file__).resolve().parents[1]
+    python_path = Path(python_executable or sys.executable).expanduser()
+    venv_root = (
+        python_path.parent.parent
+        if python_path.parent.name == "bin"
+        else None
+    )
+    lockfiles: list[tuple[str, Path]] = [
+        ("pod_lock", repo_root / "requirements" / "torchtitan-pod-cu128.lock"),
+        ("pod_requirements", repo_root / "requirements" / "torchtitan-pod-cu128.txt"),
+        (
+            "torchtitan_requirements",
+            repo_root / "torchtitan" / ".ci" / "docker" / "requirements.txt",
+        ),
+    ]
+    if venv_root is not None:
+        lockfiles.append(
+            (
+                "venv_runtime_metadata",
+                venv_root / "torchtitan-swehero-runtime.json",
+            )
+        )
+    return [
+        {"kind": kind, **_file_metadata(path)}
+        for kind, path in lockfiles
+    ]
+
+
+def _runtime_environment_metadata() -> dict[str, str]:
+    prefixes = ("CUDA_", "NCCL_", "TORCH_NCCL_")
+    explicit_keys = {"CUDA_VISIBLE_DEVICES"}
+    return {
+        key: os.environ[key]
+        for key in sorted(os.environ)
+        if key in explicit_keys or key.startswith(prefixes)
+    }
+
+
+def _metadata_text_tail(value: object, limit: int = 20_000) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    return text[-limit:]
+
+
+def _run_metadata_command(
+    command: list[str],
+    *,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        return {
+            "command": command,
+            "available": False,
+            "error": repr(exc),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": command,
+            "available": True,
+            "timed_out": True,
+            "timeout_seconds": timeout_seconds,
+            "stdout": _metadata_text_tail(exc.stdout),
+            "stderr": _metadata_text_tail(exc.stderr),
+        }
+    return {
+        "command": command,
+        "available": True,
+        "returncode": completed.returncode,
+        "stdout": _metadata_text_tail(completed.stdout),
+        "stderr": _metadata_text_tail(completed.stderr),
+    }
+
+
+def _nvidia_smi_metadata() -> dict[str, Any]:
+    query = _run_metadata_command(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,uuid,driver_version,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    gpus = []
+    if query.get("returncode") == 0 and isinstance(query.get("stdout"), str):
+        for line in query["stdout"].splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 5:
+                continue
+            gpus.append(
+                {
+                    "index": parts[0],
+                    "name": parts[1],
+                    "uuid": parts[2],
+                    "driver_version": parts[3],
+                    "memory_total_mib": parts[4],
+                }
+            )
+
+    banner = _run_metadata_command(["nvidia-smi"])
+    cuda_version = None
+    if banner.get("returncode") == 0 and isinstance(banner.get("stdout"), str):
+        match = re.search(r"CUDA Version:\s*([0-9.]+)", banner["stdout"])
+        if match:
+            cuda_version = match.group(1)
+
+    return {
+        "query_gpu": query,
+        "banner": banner,
+        "gpus": gpus,
+        "cuda_version_from_banner": cuda_version,
+    }
 
 
 def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
@@ -3742,6 +3888,27 @@ def _cuda_launch_summary(
     }
 
 
+def _torch_cuda_driver_version(torch_module: Any) -> Any:
+    try:
+        return torch_module._C._cuda_getDriverVersion()
+    except Exception as exc:
+        return {"error": repr(exc)}
+
+
+def _torch_cudnn_version(torch_module: Any) -> Any:
+    try:
+        return torch_module.backends.cudnn.version()
+    except Exception as exc:
+        return {"error": repr(exc)}
+
+
+def _torch_nccl_version(torch_module: Any) -> Any:
+    try:
+        return torch_module.cuda.nccl.version()
+    except Exception as exc:
+        return {"error": repr(exc)}
+
+
 def validate_torchtitan_runtime(
     args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
@@ -3816,8 +3983,21 @@ def validate_torchtitan_runtime(
 
     return {
         "python": sys.executable,
+        "platform": {
+            "platform": platform.platform(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "node": platform.node(),
+        },
+        "package_versions": _package_versions(),
         "torch": getattr(torch, "__version__", None),
         "torch_cuda": getattr(torch.version, "cuda", None),
+        "torch_cuda_driver_version": _torch_cuda_driver_version(torch),
+        "torch_cudnn_version": _torch_cudnn_version(torch),
+        "torch_nccl_version": _torch_nccl_version(torch),
+        "torch_git_version": getattr(torch.version, "git_version", None),
         "torchao": getattr(torchao, "__version__", None),
         "cuda": cuda,
         "torchrun_bin": {
@@ -3827,6 +4007,25 @@ def validate_torchtitan_runtime(
         "DataParallelMeshDims": repr(DataParallelMeshDims),
         "qwen_yarn_rope": qwen_yarn_rope,
     }
+
+
+def write_runtime_metadata(
+    args: argparse.Namespace,
+    runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = {
+        "schema_version": RUNTIME_METADATA_SCHEMA_VERSION,
+        "created_at_unix": time.time(),
+        "path": str(_runtime_metadata_path(args.out_dir)),
+        "runtime": dict(runtime),
+        "hardware": {
+            "nvidia_smi": _nvidia_smi_metadata(),
+        },
+        "environment": _runtime_environment_metadata(),
+        "lockfiles": _runtime_lockfile_metadata(),
+    }
+    _write_json_atomic(_runtime_metadata_path(args.out_dir), metadata)
+    return metadata
 
 
 def validate_launch_preflight(
@@ -4493,6 +4692,7 @@ def build_run_spec(
             "torchtitan_dump": str(_torchtitan_dump_dir(args.out_dir)),
             "resumable_checkpoints": str(_checkpoint_dir(args.out_dir)),
             "final_model_exports": str(_final_model_export_dir(args.out_dir)),
+            "runtime_metadata": str(_runtime_metadata_path(args.out_dir)),
             "post_training_eval_status": str(
                 _post_training_eval_status_path(args.out_dir)
             ),
@@ -4819,6 +5019,7 @@ def _build_stage_status_document(
             "run_spec": str(_run_spec_path(args.out_dir)),
             "launcher_plan": str(args.out_dir / "launcher_plan.json"),
             "wandb_identity": str(_wandb_identity_path(args.out_dir)),
+            "runtime_metadata": str(_runtime_metadata_path(args.out_dir)),
             "final_artifact_validation": str(
                 _final_artifact_validation_path(args.out_dir)
             ),
@@ -5488,6 +5689,7 @@ def _write_launcher_plan(
         "run_spec": str(_run_spec_path(args.out_dir)),
         "stage_status": str(_stage_status_path(args.out_dir)),
         "wandb_identity": str(_wandb_identity_path(args.out_dir)),
+        "runtime_metadata": str(_runtime_metadata_path(args.out_dir)),
         "post_training_eval_status": str(_post_training_eval_status_path(args.out_dir)),
     }
     (args.out_dir / "launcher_plan.json").write_text(
@@ -5539,7 +5741,7 @@ def main(argv: list[str] | None = None) -> None:
     if not (args.dry_run or args.prepare_data_only):
         hf_asset_preflight = validate_hf_asset_preflight(args)
         print(json.dumps({"hf_asset_preflight": hf_asset_preflight}, indent=2))
-        runtime = validate_torchtitan_runtime(args)
+        runtime = write_runtime_metadata(args, validate_torchtitan_runtime(args))
         print(json.dumps({"torchtitan_runtime": runtime}, indent=2))
 
     verify_hf_logits_parity_if_requested(args)
