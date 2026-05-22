@@ -75,6 +75,7 @@ QWEN_DEFAULT_SYSTEM_PROMPT = (
 QWEN_ROPE_THETA = 1_000_000.0
 QWEN_YARN_BETA_FAST = 32.0
 QWEN_YARN_BETA_SLOW = 1.0
+MATERIALIZED_DATA_SCHEMA_VERSION = 1
 RESUME_CONTRACT_SCHEMA_VERSION = 1
 RESUME_CONTRACT_FILENAME = "resume_contract.json"
 RESUME_ARG_FIELDS = (
@@ -469,6 +470,9 @@ def _resume_manifest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
         }
 
     return {
+        "materialized_data_schema_version": manifest.get(
+            "materialized_data_schema_version"
+        ),
         "model_id": manifest.get("model_id"),
         "dataset_id": manifest.get("dataset_id"),
         "dataset_path": manifest.get("dataset_path"),
@@ -481,6 +485,7 @@ def _resume_manifest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "long_example_policy": manifest.get("long_example_policy"),
         "buckets": manifest.get("buckets"),
         "bucket_files": manifest.get("bucket_files"),
+        "bucket_file_integrity": manifest.get("bucket_file_integrity"),
         "bucket_counts": manifest.get("bucket_counts"),
         "num_usable_examples": manifest.get("num_usable_examples"),
         "streamed_examples_scanned": manifest.get("streamed_examples_scanned"),
@@ -1164,6 +1169,23 @@ def _hash_file(path: Path) -> str | None:
     return digest.hexdigest()
 
 
+def _bucket_file_stats(path: Path) -> dict[str, int | str]:
+    digest = hashlib.sha256()
+    bytes_read = 0
+    records = 0
+    with path.open("rb") as handle:
+        for line in handle:
+            bytes_read += len(line)
+            digest.update(line)
+            if line.strip():
+                records += 1
+    return {
+        "bytes": bytes_read,
+        "records": records,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def _tokenizer_metadata(tokenizer: Any, hf_assets_path: Path) -> dict[str, Any]:
     tokenizer_config_path = hf_assets_path / "tokenizer_config.json"
     config: dict[str, Any] = {}
@@ -1466,20 +1488,150 @@ def _example_id(example: Mapping[str, object], fallback_index: int) -> str:
     return f"stream_row_{fallback_index}"
 
 
+def _resolve_bucket_file_for_validation(
+    path: Path,
+    path_overrides: Mapping[str, Path] | None,
+) -> Path:
+    if path_overrides is None:
+        return path
+    return path_overrides.get(str(path), path)
+
+
+def validate_materialized_data_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    path_overrides: Mapping[str, Path] | None = None,
+) -> None:
+    schema_version = manifest.get("materialized_data_schema_version")
+    if schema_version != MATERIALIZED_DATA_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported materialized data manifest schema version: "
+            f"{schema_version!r}; expected {MATERIALIZED_DATA_SCHEMA_VERSION}"
+        )
+
+    bucket_files = manifest.get("bucket_files")
+    bucket_counts = manifest.get("bucket_counts")
+    bucket_integrity = manifest.get("bucket_file_integrity")
+    if not isinstance(bucket_files, Mapping):
+        raise RuntimeError("Materialized data manifest is missing bucket_files")
+    if not isinstance(bucket_counts, Mapping):
+        raise RuntimeError("Materialized data manifest is missing bucket_counts")
+    if not isinstance(bucket_integrity, Mapping):
+        raise RuntimeError(
+            "Materialized data manifest is missing bucket_file_integrity"
+        )
+
+    expected_buckets = set(str(bucket) for bucket in manifest.get("buckets", []))
+    manifest_buckets = set(str(bucket) for bucket in bucket_files)
+    count_buckets = set(str(bucket) for bucket in bucket_counts)
+    integrity_buckets = set(str(bucket) for bucket in bucket_integrity)
+    if expected_buckets and manifest_buckets != expected_buckets:
+        raise RuntimeError(
+            "Materialized data manifest bucket_files do not match buckets: "
+            f"bucket_files={sorted(manifest_buckets)} buckets={sorted(expected_buckets)}"
+        )
+    if count_buckets != manifest_buckets:
+        raise RuntimeError(
+            "Materialized data manifest bucket_counts do not match bucket_files: "
+            f"bucket_counts={sorted(count_buckets)} "
+            f"bucket_files={sorted(manifest_buckets)}"
+        )
+    if integrity_buckets != manifest_buckets:
+        raise RuntimeError(
+            "Materialized data manifest bucket_file_integrity does not match "
+            f"bucket_files: integrity={sorted(integrity_buckets)} "
+            f"bucket_files={sorted(manifest_buckets)}"
+        )
+
+    total_records = 0
+    for bucket, raw_path in bucket_files.items():
+        bucket_key = str(bucket)
+        path = _resolve_bucket_file_for_validation(Path(raw_path), path_overrides)
+        if not path.exists():
+            raise RuntimeError(f"Materialized bucket file does not exist: {path}")
+
+        stats = _bucket_file_stats(path)
+        expected_integrity = bucket_integrity[bucket_key]
+        if not isinstance(expected_integrity, Mapping):
+            raise RuntimeError(
+                f"bucket_file_integrity[{bucket_key!r}] must be an object"
+            )
+        expected_records = int(bucket_counts[bucket_key])
+        total_records += expected_records
+
+        if int(expected_integrity.get("records", -1)) != expected_records:
+            raise RuntimeError(
+                f"bucket_file_integrity[{bucket_key!r}].records does not match "
+                f"bucket_counts: {expected_integrity.get('records')!r} != "
+                f"{expected_records}"
+            )
+        if int(stats["records"]) != expected_records:
+            raise RuntimeError(
+                f"Materialized bucket {bucket_key} has {stats['records']} "
+                f"record(s), expected {expected_records}"
+            )
+        if int(expected_integrity.get("bytes", -1)) != int(stats["bytes"]):
+            raise RuntimeError(
+                f"Materialized bucket {bucket_key} byte count mismatch: "
+                f"{stats['bytes']} != {expected_integrity.get('bytes')!r}"
+            )
+        if expected_integrity.get("sha256") != stats["sha256"]:
+            raise RuntimeError(
+                f"Materialized bucket {bucket_key} sha256 mismatch: "
+                f"{stats['sha256']} != {expected_integrity.get('sha256')!r}"
+            )
+
+    if int(manifest.get("num_usable_examples", -1)) != total_records:
+        raise RuntimeError(
+            "Materialized data manifest num_usable_examples does not match "
+            f"bucket_counts total: {manifest.get('num_usable_examples')!r} != "
+            f"{total_records}"
+        )
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    tmp_path.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp_path, path)
+
+
+def _promote_materialized_data_dir(staging_data_dir: Path, final_data_dir: Path) -> None:
+    backup_data_dir: Path | None = None
+    if final_data_dir.exists():
+        backup_data_dir = final_data_dir.with_name(
+            f".data.previous-{os.getpid()}-{time.time_ns()}"
+        )
+        final_data_dir.replace(backup_data_dir)
+
+    try:
+        staging_data_dir.replace(final_data_dir)
+    except Exception:
+        if backup_data_dir is not None and backup_data_dir.exists():
+            backup_data_dir.replace(final_data_dir)
+        raise
+    else:
+        if backup_data_dir is not None:
+            shutil.rmtree(backup_data_dir, ignore_errors=True)
+
+
 def _load_manifest(out_dir: Path) -> dict[str, Any]:
     manifest_path = out_dir / "data" / "manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"{manifest_path} does not exist; run without --skip-data-prep first"
         )
-    return json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+    validate_materialized_data_manifest(manifest)
+    return manifest
 
 
 def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
+    args.out_dir.mkdir(parents=True, exist_ok=True)
     data_dir = args.out_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    staging_data_dir = args.out_dir / f".data.tmp-{os.getpid()}-{time.time_ns()}"
+    staging_data_dir.mkdir(parents=True)
     buckets = parse_bucket_list(args.buckets)
 
     tokenizer = HuggingFaceTokenizer(tokenizer_path=str(args.hf_assets_path))
@@ -1488,7 +1640,12 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     bucket_paths = {
         bucket: data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets
     }
-    handles = {bucket: path.open("w") for bucket, path in bucket_paths.items()}
+    staging_bucket_paths = {
+        bucket: staging_data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets
+    }
+    handles = {
+        bucket: path.open("w") for bucket, path in staging_bucket_paths.items()
+    }
     bucket_counts: Counter[int] = Counter()
     skipped: Counter[str] = Counter()
     long_examples_sample: list[dict[str, Any]] = []
@@ -1497,6 +1654,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     usable_examples = 0
 
     raw = load_training_dataset(args)
+    promoted = False
 
     try:
         for example in raw:
@@ -1554,54 +1712,75 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                 and streamed_examples >= args.max_streamed_examples
             ):
                 break
+        for handle in handles.values():
+            handle.close()
+        handles = {}
+
+        if usable_examples == 0:
+            raise RuntimeError(
+                "No usable SWE-HERO examples were materialized. Increase "
+                "--max-streamed-examples, reduce --min-trainable-tokens, or inspect "
+                "the dataset schema."
+            )
+
+        bucket_file_integrity = {
+            str(bucket): _bucket_file_stats(staging_bucket_paths[bucket])
+            for bucket in buckets
+        }
+        manifest = {
+            "materialized_data_schema_version": MATERIALIZED_DATA_SCHEMA_VERSION,
+            "created_at_unix": time.time(),
+            "model_id": args.model_id,
+            "dataset_id": args.dataset_id,
+            "dataset_path": str(args.dataset_path),
+            "dataset_artifact": _dataset_artifact_metadata(args.dataset_path),
+            "source_dataset_id": args.source_dataset_id,
+            "source_dataset_revision": _dataset_revision_info(
+                args.source_dataset_id, args.source_dataset_revision
+            ),
+            "paper_alignment": paper_alignment(args),
+            "tokenizer": _tokenizer_metadata(tokenizer, args.hf_assets_path),
+            "pad_token_id": pad_token_id,
+            "max_length": args.max_length,
+            "long_example_policy": args.long_example_policy,
+            "buckets": list(buckets),
+            "bucket_files": {
+                str(bucket): str(path) for bucket, path in bucket_paths.items()
+            },
+            "bucket_file_integrity": bucket_file_integrity,
+            "bucket_counts": {str(bucket): bucket_counts[bucket] for bucket in buckets},
+            "length_histogram_rounded_to_1024": {
+                str(length): count for length, count in sorted(length_histogram.items())
+            },
+            "num_usable_examples": usable_examples,
+            "streamed_examples_scanned": streamed_examples,
+            "skipped": dict(skipped),
+            "long_examples_sample": long_examples_sample,
+            "include_model_patch": args.include_model_patch,
+            "git": {
+                "branch": _run_git(["branch", "--show-current"]),
+                "commit": _run_git(["rev-parse", "HEAD"]),
+                "status_short": _run_git(["status", "--short"]),
+            },
+            "software_versions": _package_versions(),
+        }
+        path_overrides = {
+            str(bucket_paths[bucket]): staging_bucket_paths[bucket]
+            for bucket in buckets
+        }
+        validate_materialized_data_manifest(
+            manifest,
+            path_overrides=path_overrides,
+        )
+        _write_json_atomic(staging_data_dir / "manifest.json", manifest)
+        _promote_materialized_data_dir(staging_data_dir, data_dir)
+        promoted = True
+        return _load_manifest(args.out_dir)
     finally:
         for handle in handles.values():
             handle.close()
-
-    if usable_examples == 0:
-        raise RuntimeError(
-            "No usable SWE-HERO examples were materialized. Increase "
-            "--max-streamed-examples, reduce --min-trainable-tokens, or inspect "
-            "the dataset schema."
-        )
-
-    manifest = {
-        "created_at_unix": time.time(),
-        "model_id": args.model_id,
-        "dataset_id": args.dataset_id,
-        "dataset_path": str(args.dataset_path),
-        "dataset_artifact": _dataset_artifact_metadata(args.dataset_path),
-        "source_dataset_id": args.source_dataset_id,
-        "source_dataset_revision": _dataset_revision_info(
-            args.source_dataset_id, args.source_dataset_revision
-        ),
-        "paper_alignment": paper_alignment(args),
-        "tokenizer": _tokenizer_metadata(tokenizer, args.hf_assets_path),
-        "pad_token_id": pad_token_id,
-        "max_length": args.max_length,
-        "long_example_policy": args.long_example_policy,
-        "buckets": list(buckets),
-        "bucket_files": {
-            str(bucket): str(path) for bucket, path in bucket_paths.items()
-        },
-        "bucket_counts": {str(bucket): bucket_counts[bucket] for bucket in buckets},
-        "length_histogram_rounded_to_1024": {
-            str(length): count for length, count in sorted(length_histogram.items())
-        },
-        "num_usable_examples": usable_examples,
-        "streamed_examples_scanned": streamed_examples,
-        "skipped": dict(skipped),
-        "long_examples_sample": long_examples_sample,
-        "include_model_patch": args.include_model_patch,
-        "git": {
-            "branch": _run_git(["branch", "--show-current"]),
-            "commit": _run_git(["rev-parse", "HEAD"]),
-            "status_short": _run_git(["status", "--short"]),
-        },
-        "software_versions": _package_versions(),
-    }
-    (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    return manifest
+        if not promoted:
+            shutil.rmtree(staging_data_dir, ignore_errors=True)
 
 
 def _bucket_files_from_manifest(manifest: Mapping[str, Any]) -> dict[int, Path]:

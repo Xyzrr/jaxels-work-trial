@@ -602,6 +602,170 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(manifest["long_examples_sample"][0]["source_id"], "too-long")
         self.assertEqual(manifest["num_usable_examples"], 1)
 
+    def test_materialization_writes_self_verifying_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "256",
+                    "--max-length",
+                    "256",
+                    "--num-examples",
+                    "1",
+                ]
+            )
+            example = {
+                "instance_id": "short",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+
+            manifest = self._materialize_with_fake_runtime(args, [example])
+            loaded_manifest = train._load_manifest(args.out_dir)
+
+            self.assertEqual(
+                manifest["materialized_data_schema_version"],
+                train.MATERIALIZED_DATA_SCHEMA_VERSION,
+            )
+            self.assertEqual(manifest, loaded_manifest)
+            self.assertEqual(manifest["bucket_counts"], {"256": 1})
+            integrity = manifest["bucket_file_integrity"]["256"]
+            bucket_path = Path(manifest["bucket_files"]["256"])
+            self.assertEqual(integrity["records"], 1)
+            self.assertEqual(integrity, train._bucket_file_stats(bucket_path))
+
+    def test_load_manifest_rejects_corrupt_bucket_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "256",
+                    "--max-length",
+                    "256",
+                    "--num-examples",
+                    "1",
+                ]
+            )
+            example = {
+                "instance_id": "short",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+
+            manifest = self._materialize_with_fake_runtime(args, [example])
+            bucket_path = Path(manifest["bucket_files"]["256"])
+            with bucket_path.open("a") as handle:
+                handle.write('{"unexpected": true}\n')
+
+            with self.assertRaisesRegex(RuntimeError, "record|sha256"):
+                train._load_manifest(args.out_dir)
+
+    def test_failed_materialization_does_not_publish_partial_data(self):
+        def broken_examples():
+            yield {
+                "instance_id": "short",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "256",
+                    "--max-length",
+                    "256",
+                    "--max-streamed-examples",
+                    "2",
+                ]
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                self._materialize_with_fake_runtime(args, broken_examples())
+
+            self.assertFalse((args.out_dir / "data").exists())
+            self.assertEqual(
+                list(args.out_dir.glob(".data.tmp-*")),
+                [],
+            )
+
+    def test_failed_rematerialization_preserves_existing_data(self):
+        def broken_examples():
+            yield {
+                "instance_id": "replacement",
+                "trajectory": [
+                    {"role": "user", "content": "different issue"},
+                    {"role": "assistant", "content": "different answer"},
+                ],
+            }
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "256",
+                    "--max-length",
+                    "256",
+                    "--max-streamed-examples",
+                    "2",
+                ]
+            )
+            original_example = {
+                "instance_id": "original",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+            original_manifest = self._materialize_with_fake_runtime(
+                args,
+                [original_example],
+            )
+            original_bucket_path = Path(original_manifest["bucket_files"]["256"])
+            original_bucket_bytes = original_bucket_path.read_bytes()
+
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                self._materialize_with_fake_runtime(args, broken_examples())
+
+            self.assertEqual(train._load_manifest(args.out_dir), original_manifest)
+            self.assertEqual(original_bucket_path.read_bytes(), original_bucket_bytes)
+            self.assertEqual(
+                list(args.out_dir.glob(".data.tmp-*")),
+                [],
+            )
+
     def test_openhands_messages_render_as_qwen_chatml(self):
         example = {
             "trajectory": [
