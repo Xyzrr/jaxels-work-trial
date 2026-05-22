@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import sys
 import tempfile
 import types
@@ -170,6 +171,84 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertTrue(args.enable_fp8)
         self.assertEqual(args.attention_backend, "sdpa")
         self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
+
+    def test_launch_env_file_sets_defaults_before_full_parse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "NUM_EXAMPLES=7",
+                        "MAX_STREAMED_EXAMPLES=11",
+                        "export SWEHERO_BUCKETS=1024",
+                        "SWEHERO_BUCKET_CP=1024:1",
+                        "ENABLE_FP8=0 # disable for test",
+                        "WANDB_RUN_NAME='dotenv-run'",
+                    ]
+                )
+            )
+            argv = ["--env-file", str(env_file)]
+
+            with patch.dict(os.environ, {}, clear=True):
+                loaded_env_file = train.load_launch_env_file(argv)
+                args = train.parse_args(argv, env_file_default=loaded_env_file)
+
+        self.assertEqual(args.env_file, str(env_file))
+        self.assertEqual(args.num_examples, 7)
+        self.assertEqual(args.max_streamed_examples, 11)
+        self.assertEqual(args.buckets, "1024")
+        self.assertEqual(args.bucket_cp, "1024:1")
+        self.assertFalse(args.enable_fp8)
+        self.assertEqual(args.wandb_run_name, "dotenv-run")
+
+    def test_cli_flags_override_launch_env_file_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("NUM_EXAMPLES=7\nENABLE_FP8=0\n")
+            argv = [
+                "--env-file",
+                str(env_file),
+                "--num-examples",
+                "3",
+                "--enable-fp8",
+            ]
+
+            with patch.dict(os.environ, {}, clear=True):
+                loaded_env_file = train.load_launch_env_file(argv)
+                args = train.parse_args(argv, env_file_default=loaded_env_file)
+
+        self.assertEqual(args.num_examples, 3)
+        self.assertTrue(args.enable_fp8)
+
+    def test_process_env_overrides_launch_env_file_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("NUM_EXAMPLES=7\n")
+            argv = ["--env-file", str(env_file)]
+
+            with patch.dict(os.environ, {"NUM_EXAMPLES": "13"}, clear=True):
+                loaded_env_file = train.load_launch_env_file(argv)
+                args = train.parse_args(argv, env_file_default=loaded_env_file)
+
+        self.assertEqual(args.num_examples, 13)
+
+    def test_explicit_launch_env_file_must_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.env"
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(FileNotFoundError, "Requested env file"):
+                    train.load_launch_env_file(["--env-file", str(missing)])
+
+    def test_default_launch_env_file_is_optional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.env"
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(train.smoke, "ENV_FILE", str(missing)),
+            ):
+                loaded_env_file = train.load_launch_env_file([])
+
+        self.assertEqual(loaded_env_file, str(missing))
 
     def test_expected_qwen_yarn_rope_config_tracks_128k_extension(self):
         rope = train.expected_qwen_yarn_rope_config()

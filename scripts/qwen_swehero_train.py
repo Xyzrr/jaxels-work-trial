@@ -206,6 +206,33 @@ def _default_torchrun_bin() -> str:
     return "torchrun"
 
 
+def _argv_for_env_file_scan(argv: list[str] | None) -> list[str]:
+    return list(sys.argv[1:] if argv is None else argv)
+
+
+def _env_file_from_argv(argv: list[str] | None) -> tuple[str, bool]:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--env-file")
+    namespace, _unknown = pre_parser.parse_known_args(_argv_for_env_file_scan(argv))
+    if namespace.env_file is not None:
+        if not namespace.env_file.strip():
+            raise ValueError("--env-file cannot be empty")
+        return namespace.env_file, True
+
+    env_file = os.environ.get("ENV_FILE")
+    if env_file is not None:
+        if not env_file.strip():
+            raise ValueError("ENV_FILE cannot be empty")
+        return env_file, True
+    return smoke.ENV_FILE, False
+
+
+def load_launch_env_file(argv: list[str] | None = None) -> str:
+    env_file, required = _env_file_from_argv(argv)
+    smoke.load_env_file(env_file, required=required)
+    return env_file
+
+
 def parse_bucket_list(raw: str | Iterable[int]) -> tuple[int, ...]:
     if isinstance(raw, str):
         values = [int(part.strip()) for part in raw.split(",") if part.strip()]
@@ -674,7 +701,16 @@ def dataloader_resume_flags_by_stage(
     return flags
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None,
+    *,
+    env_file_default: str | None = None,
+) -> argparse.Namespace:
+    env_file_default = (
+        os.environ.get("ENV_FILE", smoke.ENV_FILE)
+        if env_file_default is None
+        else env_file_default
+    )
     parser = argparse.ArgumentParser(
         description="Materialize bucketed SWE-HERO training data and launch TorchTitan."
     )
@@ -753,8 +789,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--env-file",
-        default=os.environ.get("ENV_FILE", smoke.ENV_FILE),
-        help="Optional dotenv-style file loaded before work starts.",
+        default=env_file_default,
+        help=(
+            "Optional dotenv-style file loaded before argument defaults are "
+            "resolved. CLI flags override process env, and process env overrides "
+            "values in this file."
+        ),
     )
     parser.add_argument(
         "--download-hf-assets",
@@ -2071,8 +2111,8 @@ def _write_launcher_plan(
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
-    smoke.load_env_file(args.env_file)
+    env_file = load_launch_env_file(argv)
+    args = parse_args(argv, env_file_default=env_file)
 
     args.buckets = ",".join(str(b) for b in parse_bucket_list(args.buckets))
     buckets = parse_bucket_list(args.buckets)

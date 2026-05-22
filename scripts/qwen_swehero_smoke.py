@@ -66,17 +66,43 @@ WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", "qwen25-coder7b-swehero-smoke"
 ENV_FILE = os.environ.get("ENV_FILE", "/workspace/.env")
 
 
-def load_env_file(path: str = ENV_FILE) -> None:
+def _dotenv_value(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    for index, char in enumerate(value):
+        if char == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value
+
+
+def load_env_file(path: str = ENV_FILE, *, required: bool = False) -> bool:
     env_path = Path(path)
     if not env_path.exists():
-        return
+        if required:
+            raise FileNotFoundError(f"Requested env file does not exist: {env_path}")
+        return False
 
-    for raw_line in env_path.read_text().splitlines():
+    for line_number, raw_line in enumerate(env_path.read_text().splitlines(), start=1):
         line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            if required:
+                raise ValueError(
+                    f"Invalid dotenv line in {env_path}:{line_number}: {raw_line!r}"
+                )
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        key = key.strip()
+        if not key:
+            raise ValueError(
+                f"Invalid empty dotenv key in {env_path}:{line_number}: {raw_line!r}"
+            )
+        os.environ.setdefault(key, _dotenv_value(value))
+    return True
 
 
 def _stringify(value: object) -> str:
