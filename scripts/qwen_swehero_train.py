@@ -323,6 +323,7 @@ RESUME_STAGE_ENV_KEYS = (
     "SWEHERO_AC_MODE",
     "SWEHERO_CHUNKED_CE_CHUNKS",
     "SWEHERO_DETECT_ANOMALY",
+    "SWEHERO_SAVE_FINAL_FULL_CHECKPOINT",
 )
 LAUNCH_STAGE_ENV_KEYS = (
     *RESUME_STAGE_ENV_KEYS,
@@ -1446,6 +1447,17 @@ def validate_resume_progress(
 
     if resume_state.latest_model_export_step is not None:
         if resume_state.latest_model_export_step == plan.total_steps:
+            if resume_state.latest_resumable_step == plan.total_steps:
+                return
+            raise RuntimeError(
+                "final model export exists at the plan total step, but the "
+                "matching final full DCP checkpoint is missing; refusing to "
+                "treat a non-resumable export as a complete production run"
+            )
+        if (
+            resume_state.latest_resumable_step is not None
+            and resume_state.latest_resumable_step == plan.total_steps
+        ):
             return
         latest_resumable = resume_state.latest_resumable_step or -1
         if resume_state.latest_model_export_step > latest_resumable:
@@ -4543,6 +4555,11 @@ def validate_final_artifacts(
             "Latest resumable checkpoint step exceeds the final plan step: "
             f"{max(checkpoint_steps)} > {plan.total_steps}"
         )
+    if plan.total_steps not in checkpoint_steps:
+        raise RuntimeError(
+            "Final resumable DCP checkpoint is missing for the plan total step: "
+            f"expected {_checkpoint_dir(args.out_dir) / f'step-{plan.total_steps}'}"
+        )
 
     dcp_checkpoints = [
         _validate_dcp_checkpoint_step(
@@ -4874,6 +4891,7 @@ def build_stage_env(
             "SWEHERO_AC_MODE": args.activation_checkpoint_mode,
             "SWEHERO_CHUNKED_CE_CHUNKS": str(args.chunked_ce_chunks),
             "SWEHERO_DETECT_ANOMALY": "1" if args.detect_anomaly else "0",
+            "SWEHERO_SAVE_FINAL_FULL_CHECKPOINT": "1",
             "SWEHERO_CHECKPOINT_INTERVAL": str(args.checkpoint_interval),
             "SWEHERO_CHECKPOINT_ASYNC_MODE": args.checkpoint_async_mode,
             "SWEHERO_METRICS_LOG_FREQ": str(args.metrics_log_freq),

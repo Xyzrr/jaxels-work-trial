@@ -175,6 +175,10 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
             initial_load_in_hf=True,
             initial_load_model_only=True,
             last_save_model_only=is_final_stage,
+            save_last_step_full_checkpoint=_env_bool(
+                "SWEHERO_SAVE_FINAL_FULL_CHECKPOINT",
+                True,
+            ),
             last_save_in_hf=is_final_stage,
             export_dtype="bfloat16",
             async_mode=_env("SWEHERO_CHECKPOINT_ASYNC_MODE", "async"),  # type: ignore[arg-type]

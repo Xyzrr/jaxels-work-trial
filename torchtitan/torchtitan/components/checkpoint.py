@@ -240,6 +240,13 @@ class CheckpointManager(Configurable):
         The default value is True.
         """
 
+        save_last_step_full_checkpoint: bool = False
+        """
+        When true and last_save_model_only=True, also save a full DCP checkpoint
+        at the final step before writing the model-only final export. This keeps
+        the terminal training state resumable while preserving the export.
+        """
+
         last_save_in_hf: bool = False
         """
         Enable the use of Hugging Face's safetensors format for checkpointing. This will save the
@@ -376,6 +383,7 @@ class CheckpointManager(Configurable):
         self.initial_load_path = config.initial_load_path
         self.initial_load_in_hf_quantized = config.initial_load_in_hf_quantized
         self.last_save_model_only = config.last_save_model_only
+        self.save_last_step_full_checkpoint = config.save_last_step_full_checkpoint
         self.last_save_in_hf = config.last_save_in_hf
         if self.last_save_in_hf:
             assert (
@@ -609,6 +617,18 @@ class CheckpointManager(Configurable):
         # GC right after async_save -- the CPU memory is not able to be
         # freed until _async_wait()
         if last_step:
+            if self.last_save_model_only and self.save_last_step_full_checkpoint:
+                logger.info(
+                    f"Saving a full resumable checkpoint at last step, step {curr_step}, "
+                    "before the model-only final export."
+                )
+                self.dcp_save(
+                    self._flattened_model_states_sd(),
+                    checkpoint_id=checkpoint_id,
+                    async_mode=AsyncMode.DISABLED,
+                    enable_garbage_collection=True,
+                )
+                self._purge_stale_checkpoints()
             self._save_last_step(curr_step)
             return True
 

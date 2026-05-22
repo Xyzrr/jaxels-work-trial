@@ -1304,7 +1304,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             args, _manifest, plan = self._resume_test_setup(tmp)
             checkpoint_root = train._checkpoint_dir(args.out_dir)
             final_export_root = train._final_model_export_dir(args.out_dir)
-            full = checkpoint_root / "step-4"
+            full = checkpoint_root / "step-5"
             export = final_export_root / "step-5"
             full.mkdir(parents=True)
             export.mkdir(parents=True)
@@ -1315,12 +1315,12 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             resume_state = train.validate_resume_request(args)
             train.validate_resume_progress(plan, resume_state)
 
-        self.assertEqual(resume_state.latest_resumable_step, 4)
+        self.assertEqual(resume_state.latest_resumable_step, 5)
         self.assertEqual(resume_state.latest_model_export_step, 5)
         self.assertEqual(resume_state.latest_any_step, 5)
         self.assertEqual(train.stages_to_run_for_resume(plan, resume_state), ())
 
-    def test_resume_accepts_completed_final_export_without_full_checkpoint(self):
+    def test_resume_rejects_completed_final_export_without_full_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
             export = train._final_model_export_dir(args.out_dir) / "step-5"
@@ -1329,11 +1329,9 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             args.resume = True
 
             resume_state = train.validate_resume_request(args)
-            train.validate_resume_progress(plan, resume_state)
 
-        self.assertIsNone(resume_state.latest_resumable_step)
-        self.assertEqual(resume_state.latest_model_export_step, 5)
-        self.assertEqual(train.stages_to_run_for_resume(plan, resume_state), ())
+            with self.assertRaisesRegex(RuntimeError, "final.*full DCP"):
+                train.validate_resume_progress(plan, resume_state)
 
     def test_resume_rejects_nonfinal_model_export_newer_than_full_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1378,7 +1376,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_final_artifact_validation_writes_report_for_completed_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
-            self._write_dcp_checkpoint(args.out_dir, step=4)
+            self._write_dcp_checkpoint(args.out_dir, step=5)
             self._write_final_export(args.out_dir, step=5)
 
             report = train.validate_final_artifacts(args, plan)
@@ -1395,11 +1393,21 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(report["final_export"]["layout"], "final_export")
         self.assertEqual(report["final_export"]["shard_count"], 2)
         self.assertEqual(report["final_export"]["weight_map_entries"], 2)
-        self.assertEqual(report["resumable_checkpoints"]["steps"], [4])
+        self.assertEqual(report["resumable_checkpoints"]["steps"], [5])
+        self.assertEqual(report["resumable_checkpoints"]["latest_step"], 5)
         self.assertEqual(
             report["resumable_checkpoints"]["checkpoints"][0]["payload_file_count"],
             1,
         )
+
+    def test_final_artifact_validation_requires_final_resumable_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_dcp_checkpoint(args.out_dir, step=4)
+            self._write_final_export(args.out_dir, step=5)
+
+            with self.assertRaisesRegex(RuntimeError, "Final resumable DCP"):
+                train.validate_final_artifacts(args, plan, write_report=False)
 
     def test_final_artifact_validation_rejects_missing_export_shard(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1413,7 +1421,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_final_artifact_validation_rejects_empty_dcp_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
-            checkpoint = self._write_dcp_checkpoint(args.out_dir, step=4)
+            checkpoint = self._write_dcp_checkpoint(args.out_dir, step=5)
             (checkpoint / "__0_0.distcp").write_bytes(b"")
             self._write_final_export(args.out_dir, step=5)
 
@@ -1429,26 +1437,25 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "both"):
                 train.validate_final_artifacts(args, plan, write_report=False)
 
-    def test_final_artifact_validation_can_accept_legacy_export_for_resume(self):
+    def test_final_artifact_validation_rejects_legacy_export_without_final_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
             self._write_final_export(args.out_dir, step=5, legacy=True)
 
             with self.assertRaisesRegex(RuntimeError, "Final model export is missing"):
                 train.validate_final_artifacts(args, plan, write_report=False)
-            report = train.validate_final_artifacts(
-                args,
-                plan,
-                allow_legacy_export=True,
-                write_report=False,
-            )
-
-        self.assertEqual(report["final_export"]["layout"], "legacy_checkpoint_export")
+            with self.assertRaisesRegex(RuntimeError, "Final resumable DCP"):
+                train.validate_final_artifacts(
+                    args,
+                    plan,
+                    allow_legacy_export=True,
+                    write_report=False,
+                )
 
     def test_post_training_eval_hook_records_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
-            self._write_dcp_checkpoint(args.out_dir, step=4)
+            self._write_dcp_checkpoint(args.out_dir, step=5)
             self._write_final_export(args.out_dir, step=5)
             final_validation = train.validate_final_artifacts(args, plan)
             train.initialize_stage_status(
@@ -1494,7 +1501,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_post_training_eval_hook_records_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
-            self._write_dcp_checkpoint(args.out_dir, step=4)
+            self._write_dcp_checkpoint(args.out_dir, step=5)
             self._write_final_export(args.out_dir, step=5)
             final_validation = train.validate_final_artifacts(args, plan)
             train.initialize_stage_status(
@@ -1717,6 +1724,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 stages_to_run=plan.stages,
                 dataloader_resume_flags={},
             )
+            self._write_dcp_checkpoint(args.out_dir, step=5)
             self._write_final_export(args.out_dir, step=5)
 
             train.validate_final_artifacts_with_status(args, plan)
@@ -1812,6 +1820,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             first_env["SWEHERO_FINAL_EXPORT_FOLDER"],
             train.FINAL_MODEL_EXPORT_FOLDER,
         )
+        self.assertEqual(first_env["SWEHERO_SAVE_FINAL_FULL_CHECKPOINT"], "1")
         self.assertEqual(first_env["SWEHERO_ENABLE_PROFILER"], "0")
         self.assertEqual(first_env["SWEHERO_PROFILER_FREQ"], "10")
         self.assertEqual(first_env["SWEHERO_ENABLE_MEMORY_SNAPSHOT"], "0")
@@ -2069,6 +2078,8 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertIn("final_model_export_folder=", source)
         self.assertIn("SWEHERO_FINAL_EXPORT_FOLDER", source)
+        self.assertIn("save_last_step_full_checkpoint=", source)
+        self.assertIn("SWEHERO_SAVE_FINAL_FULL_CHECKPOINT", source)
         self.assertIn('"final_export"', source)
 
     def test_torchtitan_checkpoint_manager_supports_separate_final_exports(self):
@@ -2079,6 +2090,8 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertIn("final_model_export_folder", source)
         self.assertIn("self.final_model_export_folder", source)
+        self.assertIn("save_last_step_full_checkpoint", source)
+        self.assertIn("Saving a full resumable checkpoint at last step", source)
         self.assertIn("checkpoint.final_model_export_folder must differ", source)
 
     def test_resume_contract_rejects_changed_training_config(self):
@@ -3107,6 +3120,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             env["SWEHERO_FINAL_EXPORT_FOLDER"],
             train.FINAL_MODEL_EXPORT_FOLDER,
         )
+        self.assertEqual(env["SWEHERO_SAVE_FINAL_FULL_CHECKPOINT"], "1")
         self.assertIn("-m", command)
         self.assertIn("torchtitan.train", command)
         self.assertIn("--module", command)
