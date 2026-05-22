@@ -372,6 +372,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.nproc_per_node, 8)
         self.assertTrue(args.enable_fp8)
         self.assertEqual(args.attention_backend, "sdpa")
+        self.assertEqual(args.bucket_curriculum, train.DEFAULT_BUCKET_CURRICULUM)
         self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
 
     def test_launch_env_file_sets_defaults_before_full_parse(self):
@@ -520,6 +521,17 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             self._validate_launch_args(["--max-length", "512"])
         with self.assertRaisesRegex(ValueError, "not present in --buckets"):
             self._validate_launch_args(["--bucket-cp", "256:1,512:1"])
+        with self.assertRaisesRegex(ValueError, "single-bucket"):
+            self._validate_launch_args(
+                [
+                    "--buckets",
+                    "128,256",
+                    "--bucket-cp",
+                    "128:1,256:1",
+                    "--bucket-curriculum",
+                    "single-bucket",
+                ]
+            )
 
     def test_bucket_parsers_reject_malformed_or_ambiguous_values(self):
         with self.assertRaisesRegex(ValueError, "invalid bucket size"):
@@ -958,6 +970,45 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual([stage.steps for stage in plan.stages], [4, 1])
         self.assertEqual([stage.cumulative_steps for stage in plan.stages], [4, 5])
         self.assertEqual([stage.cp_degree for stage in plan.stages], [1, 2])
+
+    def test_bucket_plan_uses_explicit_curriculum_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bucket_files = {
+                8192: Path(tmp) / "bucket_8192.jsonl",
+                32768: Path(tmp) / "bucket_32768.jsonl",
+            }
+            plan = train.build_bucket_plan(
+                bucket_counts={8192: 33, 32768: 1},
+                bucket_files=bucket_files,
+                bucket_cp={8192: 1, 32768: 2},
+                epochs=3.0,
+                global_batch_size=32,
+                warmup_ratio=0.1,
+                bucket_curriculum="long-to-short",
+            )
+
+        self.assertEqual([stage.bucket for stage in plan.stages], [32768, 8192])
+        self.assertEqual([stage.steps for stage in plan.stages], [1, 4])
+        self.assertEqual([stage.cumulative_steps for stage in plan.stages], [1, 5])
+        self.assertEqual([stage.cp_degree for stage in plan.stages], [2, 1])
+
+    def test_single_bucket_curriculum_requires_one_non_empty_bucket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bucket_files = {
+                8192: Path(tmp) / "bucket_8192.jsonl",
+                32768: Path(tmp) / "bucket_32768.jsonl",
+            }
+
+            with self.assertRaisesRegex(ValueError, "single-bucket curriculum"):
+                train.build_bucket_plan(
+                    bucket_counts={8192: 33, 32768: 1},
+                    bucket_files=bucket_files,
+                    bucket_cp={8192: 1, 32768: 2},
+                    epochs=3.0,
+                    global_batch_size=32,
+                    warmup_ratio=0.1,
+                    bucket_curriculum="single-bucket",
+                )
 
     def test_resume_requires_existing_artifact_then_full_dcp_for_incomplete_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1769,6 +1820,15 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 ["short"],
             )
             self.assertEqual(
+                manifest["bucket_curriculum"], train.DEFAULT_BUCKET_CURRICULUM
+            )
+            self.assertEqual(
+                manifest["data_provenance"]["materialization"][
+                    "bucket_curriculum"
+                ],
+                train.DEFAULT_BUCKET_CURRICULUM,
+            )
+            self.assertEqual(
                 manifest["data_provenance"]["buckets"]["256"]["integrity"],
                 manifest["bucket_file_integrity"]["256"],
             )
@@ -1819,6 +1879,9 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
             self.assertTrue(manifest["smoke_synthetic_buckets"])
             self.assertEqual(manifest["smoke_synthetic_examples_per_bucket"], 2)
+            self.assertEqual(
+                manifest["bucket_curriculum"], train.DEFAULT_BUCKET_CURRICULUM
+            )
             self.assertTrue(manifest["dataset_artifact"]["synthetic_smoke"])
             self.assertEqual(
                 manifest["bucket_counts"], {"128": 2, "256": 2, "512": 2}
@@ -1971,6 +2034,15 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             launcher_plan = json.loads((out_dir / "launcher_plan.json").read_text())
 
         self.assertEqual(run_spec["args"]["max_length"], 256)
+        self.assertEqual(
+            run_spec["args"]["bucket_curriculum"], train.DEFAULT_BUCKET_CURRICULUM
+        )
+        self.assertEqual(
+            run_spec["plan"]["bucket_curriculum"], train.DEFAULT_BUCKET_CURRICULUM
+        )
+        self.assertEqual(
+            launcher_plan["bucket_curriculum"], train.DEFAULT_BUCKET_CURRICULUM
+        )
         self.assertEqual(run_spec["plan"]["total_steps"], 1)
         self.assertEqual(
             run_spec["manifest"]["data_provenance"]["included"]["source_ids"],

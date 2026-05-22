@@ -168,3 +168,17 @@ every configured bucket is non-empty.
 The production run should use the same wrapper without `--num-examples`, so the
 trainer tokenizes the full cached one-rollout dataset and uses the full bucket
 plan.
+
+## Bucket Curriculum
+
+The launcher defaults to `--bucket-curriculum short-to-long`, which preserves
+the current throughput-oriented staging order: shorter non-empty sequence
+buckets train first, then progressively longer buckets. This is an explicit
+engineering choice for the TorchTitan bucketed/CP implementation, not a
+training detail specified by the SWE-ZERO to SWE-HERO paper.
+
+For an ablation that removes the length-bucket curriculum, launch with a single
+configured bucket and `--bucket-curriculum single-bucket`, for example
+`--buckets 131072 --bucket-cp 131072:8`. The launcher rejects
+`single-bucket` when multiple buckets are configured, so the run spec cannot
+silently claim a no-curriculum setup while using staged bucket training.

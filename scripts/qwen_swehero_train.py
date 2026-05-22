@@ -70,6 +70,12 @@ DEFAULT_BUCKET_CP = {
     65_536: 4,
     PAPER_CONTEXT_LENGTH: 8,
 }
+DEFAULT_BUCKET_CURRICULUM = "short-to-long"
+BUCKET_CURRICULUM_CHOICES = (
+    "short-to-long",
+    "long-to-short",
+    "single-bucket",
+)
 QWEN_DEFAULT_SYSTEM_PROMPT = (
     "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 )
@@ -179,6 +185,7 @@ RUN_SPEC_ARG_FIELDS = (
     "long_example_policy",
     "smoke_synthetic_buckets",
     "smoke_synthetic_examples_per_bucket",
+    "bucket_curriculum",
     "buckets",
     "bucket_cp",
     "min_trainable_tokens",
@@ -675,6 +682,17 @@ def validate_launch_inputs(
             "--bucket-cp contains buckets not present in --buckets: "
             f"{extra_cp_buckets}"
         )
+    if args.bucket_curriculum not in BUCKET_CURRICULUM_CHOICES:
+        errors.append(
+            "--bucket-curriculum must be one of "
+            f"{', '.join(BUCKET_CURRICULUM_CHOICES)}; got "
+            f"{args.bucket_curriculum!r}"
+        )
+    if args.bucket_curriculum == "single-bucket" and len(buckets) != 1:
+        errors.append(
+            "--bucket-curriculum=single-bucket requires exactly one configured "
+            "--buckets entry"
+        )
 
     if args.smoke_synthetic_buckets and args.num_examples != 0:
         errors.append(
@@ -760,6 +778,32 @@ def _ceil_steps(example_count: int, epochs: float, global_batch_size: int) -> in
     return max(1, math.ceil(example_count * epochs / global_batch_size))
 
 
+def ordered_buckets_for_curriculum(
+    bucket_counts: Mapping[int, int],
+    bucket_curriculum: str = DEFAULT_BUCKET_CURRICULUM,
+) -> tuple[int, ...]:
+    non_empty_buckets = [
+        bucket
+        for bucket, count in bucket_counts.items()
+        if int(count) > 0
+    ]
+    if bucket_curriculum == "short-to-long":
+        return tuple(sorted(non_empty_buckets))
+    if bucket_curriculum == "long-to-short":
+        return tuple(sorted(non_empty_buckets, reverse=True))
+    if bucket_curriculum == "single-bucket":
+        if len(non_empty_buckets) != 1:
+            raise ValueError(
+                "single-bucket curriculum requires exactly one non-empty bucket; "
+                f"found {len(non_empty_buckets)}"
+            )
+        return tuple(sorted(non_empty_buckets))
+    raise ValueError(
+        "unknown bucket curriculum "
+        f"{bucket_curriculum!r}; expected one of {BUCKET_CURRICULUM_CHOICES}"
+    )
+
+
 def build_bucket_plan(
     *,
     bucket_counts: Mapping[int, int],
@@ -769,6 +813,7 @@ def build_bucket_plan(
     global_batch_size: int,
     warmup_ratio: float,
     max_steps: int = 0,
+    bucket_curriculum: str = DEFAULT_BUCKET_CURRICULUM,
 ) -> BucketPlan:
     if epochs <= 0 and max_steps <= 0:
         raise ValueError("epochs must be positive unless max_steps is set")
@@ -776,7 +821,7 @@ def build_bucket_plan(
         raise ValueError("global_batch_size must be positive")
 
     natural: list[tuple[int, int]] = []
-    for bucket in sorted(bucket_counts):
+    for bucket in ordered_buckets_for_curriculum(bucket_counts, bucket_curriculum):
         steps = _ceil_steps(bucket_counts[bucket], epochs, global_batch_size)
         if steps > 0:
             natural.append((bucket, steps))
@@ -1389,6 +1434,18 @@ def parse_args(
             "SWEHERO_BUCKETS", ",".join(str(b) for b in DEFAULT_BUCKETS)
         ),
         help="Comma-separated sequence buckets.",
+    )
+    parser.add_argument(
+        "--bucket-curriculum",
+        default=os.environ.get(
+            "SWEHERO_BUCKET_CURRICULUM", DEFAULT_BUCKET_CURRICULUM
+        ),
+        choices=BUCKET_CURRICULUM_CHOICES,
+        help=(
+            "Order non-empty bucket stages. short-to-long preserves the "
+            "current throughput-oriented default; single-bucket documents a "
+            "no-length-curriculum run and requires exactly one bucket."
+        ),
     )
     parser.add_argument(
         "--bucket-cp",
@@ -2093,6 +2150,10 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
             "TorchTitan distributed full-model SFT replaces the earlier local Transformers smoke script.",
             "FSDP uses BF16 mixed-precision parameters/reductions; FP8 is applied only to TorchTitan linear layers selected by its converter.",
             "Length buckets with per-bucket CP replace static 128k padding.",
+            (
+                f"Bucket curriculum is explicit: {args.bucket_curriculum}. The "
+                "paper does not specify an intra-SWE-HERO length-bucket curriculum."
+            ),
             "TorchTitan VarlenAttention currently does not support CP, so CP buckets use the supported SDPA/Flex attention path.",
             f"The tokenized bucket manifest covers {dataset_scope}.",
         ],
@@ -2392,6 +2453,7 @@ def _build_data_provenance(
             "smoke_synthetic_examples_per_bucket": (
                 args.smoke_synthetic_examples_per_bucket
             ),
+            "bucket_curriculum": args.bucket_curriculum,
             "shuffle_buffer": args.shuffle_buffer,
             "seed": args.seed,
             "max_length": args.max_length,
@@ -2952,6 +3014,7 @@ def materialize_synthetic_smoke_buckets(args: argparse.Namespace) -> dict[str, A
             "smoke_synthetic_examples_per_bucket": (
                 args.smoke_synthetic_examples_per_bucket
             ),
+            "bucket_curriculum": args.bucket_curriculum,
             "buckets": list(buckets),
             "bucket_files": {
                 str(bucket): str(path) for bucket, path in bucket_paths.items()
@@ -3162,6 +3225,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
             "long_example_policy": args.long_example_policy,
             "smoke_synthetic_buckets": False,
             "smoke_synthetic_examples_per_bucket": None,
+            "bucket_curriculum": args.bucket_curriculum,
             "buckets": list(buckets),
             "bucket_files": {
                 str(bucket): str(path) for bucket, path in bucket_paths.items()
@@ -4250,6 +4314,7 @@ def build_run_spec(
         },
         "manifest": _resume_manifest_contract(manifest),
         "plan": {
+            "bucket_curriculum": args.bucket_curriculum,
             "total_steps": plan.total_steps,
             "warmup_steps": plan.warmup_steps,
             "stages": [
@@ -4517,6 +4582,7 @@ def _build_stage_status_document(
             ],
         },
         "plan": {
+            "bucket_curriculum": args.bucket_curriculum,
             "total_steps": plan.total_steps,
             "warmup_steps": plan.warmup_steps,
         },
@@ -4917,6 +4983,7 @@ def _write_launcher_plan(
             )
             for stage in plan.stages
         ],
+        "bucket_curriculum": args.bucket_curriculum,
         "total_steps": plan.total_steps,
         "warmup_steps": plan.warmup_steps,
         "manifest": str(args.out_dir / "data" / "manifest.json"),
@@ -4996,6 +5063,7 @@ def main(argv: list[str] | None = None) -> None:
         global_batch_size=args.global_batch_size,
         warmup_ratio=args.warmup_ratio,
         max_steps=args.max_steps,
+        bucket_curriculum=args.bucket_curriculum,
     )
     write_or_validate_run_spec(
         args,
