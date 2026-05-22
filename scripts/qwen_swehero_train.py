@@ -119,6 +119,8 @@ RUNTIME_METADATA_SCHEMA_VERSION = 1
 RUNTIME_METADATA_FILENAME = "runtime_metadata.json"
 STAGE_STATUS_SCHEMA_VERSION = 1
 STAGE_STATUS_FILENAME = "stage_status.json"
+LAUNCH_LOCK_SCHEMA_VERSION = 1
+LAUNCH_LOCK_SUFFIX = ".launch.lock"
 WANDB_IDENTITY_SCHEMA_VERSION = 1
 WANDB_IDENTITY_FILENAME = "wandb_identity.json"
 WANDB_RESUME_CHOICES = ("allow", "never", "must", "auto")
@@ -1447,6 +1449,10 @@ def _runtime_metadata_path(out_dir: Path) -> Path:
     return out_dir / RUNTIME_METADATA_FILENAME
 
 
+def _launch_lock_path(out_dir: Path) -> Path:
+    return out_dir.with_name(out_dir.name + LAUNCH_LOCK_SUFFIX)
+
+
 def _stage_status_path(out_dir: Path) -> Path:
     return out_dir / STAGE_STATUS_FILENAME
 
@@ -1470,6 +1476,85 @@ def _final_model_export_dir(out_dir: Path) -> Path:
 def _checkpoint_step(path: Path) -> int | None:
     match = re.fullmatch(r"step-(\d+)", path.name)
     return int(match.group(1)) if match else None
+
+
+def _launch_lock_payload(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "schema_version": LAUNCH_LOCK_SCHEMA_VERSION,
+        "created_at_unix": time.time(),
+        "pid": os.getpid(),
+        "hostname": platform.node(),
+        "out_dir": str(args.out_dir),
+        "lock_path": str(_launch_lock_path(args.out_dir)),
+        "workspace_root": str(_configured_workspace_root(args)),
+        "production_mode": bool(args.production_mode),
+        "resume": bool(args.resume),
+        "overwrite_output": bool(args.overwrite_output),
+        "argv": sys.argv,
+    }
+
+
+def _read_launch_lock(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+class OutDirLaunchLock:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.path = _launch_lock_path(args.out_dir)
+        self._acquired = False
+
+    def __enter__(self) -> "OutDirLaunchLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _launch_lock_payload(self.args)
+        payload_text = _canonical_json_text(payload)
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError as exc:
+            existing = _read_launch_lock(self.path)
+            if existing is None:
+                detail = "existing lock could not be parsed"
+            else:
+                detail = (
+                    f"pid={existing.get('pid')!r}, "
+                    f"hostname={existing.get('hostname')!r}, "
+                    f"created_at_unix={existing.get('created_at_unix')!r}"
+                )
+            raise RuntimeError(
+                "Launch lock already exists for this output directory: "
+                f"{self.path} ({detail}). Another launcher may be using "
+                "the same --out-dir; remove the lock only after confirming "
+                "no launch is still running."
+            ) from exc
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload_text)
+        except BaseException:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        self._acquired = True
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if not self._acquired:
+            return
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        self._acquired = False
+
+
+def launch_lock(args: argparse.Namespace) -> OutDirLaunchLock:
+    return OutDirLaunchLock(args)
 
 
 def _has_dcp_checkpoint_metadata(path: Path) -> bool:
@@ -5548,6 +5633,7 @@ def build_run_spec(
         "paths": {
             "workspace_root": str(_configured_workspace_root(args)),
             "out_dir": str(args.out_dir),
+            "launch_lock": str(_launch_lock_path(args.out_dir)),
             "data_manifest": str(args.out_dir / "data" / "manifest.json"),
             "launcher_plan": str(args.out_dir / "launcher_plan.json"),
             "resume_contract": str(_resume_contract_path(args.out_dir)),
@@ -6708,6 +6794,7 @@ def _write_launcher_plan(
         "warmup_steps": plan.warmup_steps,
         "manifest": str(args.out_dir / "data" / "manifest.json"),
         "run_spec": str(_run_spec_path(args.out_dir)),
+        "launch_lock": str(_launch_lock_path(args.out_dir)),
         "stage_status": str(_stage_status_path(args.out_dir)),
         "wandb_identity": str(_wandb_identity_path(args.out_dir)),
         "runtime_metadata": str(_runtime_metadata_path(args.out_dir)),
@@ -6718,22 +6805,12 @@ def _write_launcher_plan(
     )
 
 
-def main(argv: list[str] | None = None) -> None:
-    env_file = load_launch_env_file(argv)
-    args = parse_args(argv, env_file_default=env_file)
-
-    args.buckets = ",".join(str(b) for b in parse_bucket_list(args.buckets))
-    buckets = parse_bucket_list(args.buckets)
-    bucket_cp = parse_bucket_cp_map(args.bucket_cp)
-    args.bucket_cp = _format_bucket_cp_map(bucket_cp)
-    validate_launch_inputs(args, buckets=buckets, bucket_cp=bucket_cp)
-    validate_bucket_config(
-        buckets=buckets,
-        bucket_cp=bucket_cp,
-        nproc_per_node=args.nproc_per_node,
-        attention_backend=args.attention_backend,
-    )
-
+def _run_launch(
+    args: argparse.Namespace,
+    *,
+    buckets: tuple[int, ...],
+    bucket_cp: Mapping[int, int],
+) -> None:
     resume_state = validate_resume_request(args)
     if resume_state is not None:
         args.skip_data_prep = True
@@ -6866,6 +6943,26 @@ def main(argv: list[str] | None = None) -> None:
     eval_status = run_post_training_eval(args, plan, final_validation)
     if eval_status is not None:
         print(json.dumps({"post_training_eval": eval_status}, indent=2))
+
+
+def main(argv: list[str] | None = None) -> None:
+    env_file = load_launch_env_file(argv)
+    args = parse_args(argv, env_file_default=env_file)
+
+    args.buckets = ",".join(str(b) for b in parse_bucket_list(args.buckets))
+    buckets = parse_bucket_list(args.buckets)
+    bucket_cp = parse_bucket_cp_map(args.bucket_cp)
+    args.bucket_cp = _format_bucket_cp_map(bucket_cp)
+    validate_launch_inputs(args, buckets=buckets, bucket_cp=bucket_cp)
+    validate_bucket_config(
+        buckets=buckets,
+        bucket_cp=bucket_cp,
+        nproc_per_node=args.nproc_per_node,
+        attention_backend=args.attention_backend,
+    )
+
+    with launch_lock(args):
+        _run_launch(args, buckets=buckets, bucket_cp=bucket_cp)
 
 
 if __name__ == "__main__":
