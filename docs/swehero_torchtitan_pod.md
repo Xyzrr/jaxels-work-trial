@@ -191,11 +191,57 @@ synthetic flags with `--num-examples 64` and use the target bucket plan. That
 path is closer to the production data path, but it does not guarantee that
 every configured bucket is non-empty.
 
+To exercise the checkpoint/resume/export/validation lifecycle on the GPU pod,
+run the lifecycle smoke wrapper. It launches the same TorchTitan trainer with a
+single tiny synthetic bucket, requires the step-1 DCP validation report, checks
+the final DCP checkpoint plus Hugging Face export, then invokes the same
+immutable run spec with `--resume` and verifies the completed run again:
+
+```bash
+cd /workspace/jaxels-work-trial
+$TORCHTITAN_POD_VENV/bin/python scripts/qwen_swehero_gpu_lifecycle_smoke.py \
+  --out-dir /workspace/qwen25-coder7b-swehero-lifecycle-smoke \
+  --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
+  --nproc-per-node 8
+```
+
+This lifecycle smoke intentionally uses `--smoke-synthetic-buckets`,
+`--no-compile`, `--no-enable-fp8`, and lowered resource thresholds so it can
+run quickly and repeatedly. It does not change the production recipe or the
+paper-aligned launch gate.
+
 The production run should use the same wrapper with `--production-mode` and
 without `--num-examples`, so the trainer tokenizes the full cached one-rollout
 dataset and uses the full bucket plan. The production gate rejects dry runs,
 synthetic buckets, subset caps, step caps, shortened context, and alternate
 bucket curricula before launch.
+
+Production mode also rejects any bucket stage whose example count is smaller
+than its data-parallel degree. Tiny smoke runs may reuse tiny buckets on empty
+ranks to exercise distributed code paths, but the paper-aligned data run must
+not silently duplicate records because a length bucket is too small for the
+configured rank topology.
+
+Production mode also requires `git` to be available in the launch environment
+and the repository worktree to be clean. Commit or stash local edits before the
+paper-aligned run; non-production smoke runs record whatever Git state is
+available but do not enforce cleanliness.
+
+Production mode requires W&B metrics with a durable mode. Include
+`--enable-wandb` and do not set `--wandb-mode offline` or
+`--wandb-mode disabled` for the paper-aligned run.
+
+Before torchrun starts, the launcher also checks output-disk free space, free
+GPU memory, available CPU memory, and write throughput to the run filesystem.
+The defaults are conservative launch gates and are recorded in `run_spec.json`:
+
+```bash
+--min-free-disk-gb 100 \
+--min-free-gpu-memory-gb 60 \
+--min-free-cpu-memory-gb 32 \
+--min-write-throughput-mb-s 50 \
+--write-throughput-probe-mb 64
+```
 
 ## Launch Argument Files
 
@@ -211,8 +257,9 @@ starting with `#` are ignored. Flags written after `@configs/swehero-7b.args`
 on the command line override earlier values from the file.
 
 Reviewed argument files for the actual direct-to-hero run should include
-`--production-mode`. Leave that flag out for smoke, profiler, and bounded soak
-commands because those intentionally use prototype settings.
+`--production-mode` and `--enable-wandb`. Leave production mode out for smoke,
+profiler, and bounded soak commands because those intentionally use prototype
+settings.
 
 ## Output Launch Lock
 
@@ -229,6 +276,18 @@ fails before data prep or TorchTitan startup and reports the lock metadata
 (`pid`, `hostname`, and creation time). The lock is removed on normal exit and
 on handled exceptions; if the process is killed with `SIGKILL` or the pod dies,
 remove the sidecar only after confirming no matching launcher is still running.
+
+## Torchrun Logs
+
+Each bucket-stage attempt writes torchrun stdout and stderr under:
+
+```text
+$OUT_DIR/torchrun_logs/
+```
+
+The exact per-attempt paths are also recorded in `stage_status.json` under the
+stage attempt's `logs` field, so failed stages can be debugged after the
+terminal session or pod output scrollback is gone.
 
 ## Recorded Training Environment Inputs
 

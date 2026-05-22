@@ -28,6 +28,24 @@ class FakeTokenizer:
 
 
 class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
+    def _git_state(
+        self,
+        *,
+        dirty: bool = False,
+        available: bool = True,
+        status_short: str = "",
+    ) -> dict:
+        return {
+            "schema_version": train.GIT_STATE_SCHEMA_VERSION,
+            "repo_root": str(train.CANONICAL_WORKSPACE_ROOT),
+            "available": available,
+            "top_level": str(train.CANONICAL_WORKSPACE_ROOT) if available else None,
+            "branch": "main" if available else None,
+            "commit": "a" * 40 if available else None,
+            "status_short": status_short if available else None,
+            "dirty": dirty if available else None,
+        }
+
     def _resume_test_setup(self, tmp: str):
         out_dir = Path(tmp) / "run"
         data_dir = out_dir / "data"
@@ -368,10 +386,18 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self,
         extra_args: list[str] | None = None,
     ):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(
-            train,
-            "_detected_workspace_root",
-            return_value=train.CANONICAL_WORKSPACE_ROOT,
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                train,
+                "_detected_workspace_root",
+                return_value=train.CANONICAL_WORKSPACE_ROOT,
+            ),
+            patch.object(
+                train,
+                "git_state_for_workspace",
+                return_value=self._git_state(),
+            ),
         ):
             args = train.parse_args(
                 [
@@ -382,6 +408,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                     "--hf-assets-path",
                     str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
                     "--production-mode",
+                    "--enable-wandb",
                     *(extra_args or []),
                 ]
             )
@@ -442,6 +469,23 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.fsdp_reshard_after_forward, "never")
         self.assertFalse(args.production_mode)
         self.assertFalse(args.detect_anomaly)
+        self.assertEqual(args.min_free_disk_gb, train.DEFAULT_MIN_FREE_DISK_GB)
+        self.assertEqual(
+            args.min_free_gpu_memory_gb,
+            train.DEFAULT_MIN_FREE_GPU_MEMORY_GB,
+        )
+        self.assertEqual(
+            args.min_free_cpu_memory_gb,
+            train.DEFAULT_MIN_FREE_CPU_MEMORY_GB,
+        )
+        self.assertEqual(
+            args.min_write_throughput_mb_s,
+            train.DEFAULT_MIN_WRITE_THROUGHPUT_MB_S,
+        )
+        self.assertEqual(
+            args.write_throughput_probe_mb,
+            train.DEFAULT_WRITE_THROUGHPUT_PROBE_MB,
+        )
         self.assertEqual(args.cuda_device_max_connections, "1")
         self.assertEqual(args.torch_nccl_async_error_handling, "1")
         self.assertEqual(args.bucket_curriculum, train.DEFAULT_BUCKET_CURRICULUM)
@@ -464,6 +508,122 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.max_length, train.PAPER_CONTEXT_LENGTH)
         self.assertTrue(args.validate_first_step_checkpoint)
         self.assertEqual(args.workspace_root, train.CANONICAL_WORKSPACE_ROOT)
+        self.assertTrue(args.enable_wandb)
+
+    def test_production_mode_requires_clean_git_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
+                    "--production-mode",
+                ]
+            )
+            buckets = train.parse_bucket_list(args.buckets)
+            bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+
+            with (
+                patch.object(
+                    train,
+                    "_detected_workspace_root",
+                    return_value=train.CANONICAL_WORKSPACE_ROOT,
+                ),
+                patch.object(
+                    train,
+                    "git_state_for_workspace",
+                    return_value=self._git_state(
+                        dirty=True,
+                        status_short=" M scripts/qwen_swehero_train.py",
+                    ),
+                ),
+                self.assertRaisesRegex(ValueError, "clean Git worktree"),
+            ):
+                train.validate_launch_inputs(
+                    args,
+                    buckets=buckets,
+                    bucket_cp=bucket_cp,
+                )
+
+    def test_production_mode_requires_durable_metrics_backend(self):
+        cases = [
+            ([], "--enable-wandb"),
+            (["--enable-wandb", "--wandb-mode", "offline"], "not durable"),
+            (["--enable-wandb", "--wandb-mode", "disabled"], "not durable"),
+        ]
+        for extra_args, message in cases:
+            with self.subTest(extra_args=extra_args), tempfile.TemporaryDirectory() as tmp:
+                args = train.parse_args(
+                    [
+                        "--out-dir",
+                        str(Path(tmp) / "run"),
+                        "--dataset-path",
+                        str(Path(tmp) / "dataset"),
+                        "--hf-assets-path",
+                        str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
+                        "--production-mode",
+                        *extra_args,
+                    ]
+                )
+                buckets = train.parse_bucket_list(args.buckets)
+                bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+
+                with (
+                    patch.object(
+                        train,
+                        "_detected_workspace_root",
+                        return_value=train.CANONICAL_WORKSPACE_ROOT,
+                    ),
+                    patch.object(
+                        train,
+                        "git_state_for_workspace",
+                        return_value=self._git_state(),
+                    ),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    train.validate_launch_inputs(
+                        args,
+                        buckets=buckets,
+                        bucket_cp=bucket_cp,
+                    )
+
+    def test_production_mode_requires_available_git_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
+                    "--production-mode",
+                ]
+            )
+            buckets = train.parse_bucket_list(args.buckets)
+            bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+
+            with (
+                patch.object(
+                    train,
+                    "_detected_workspace_root",
+                    return_value=train.CANONICAL_WORKSPACE_ROOT,
+                ),
+                patch.object(
+                    train,
+                    "git_state_for_workspace",
+                    return_value=self._git_state(available=False),
+                ),
+                self.assertRaisesRegex(ValueError, "requires Git metadata"),
+            ):
+                train.validate_launch_inputs(
+                    args,
+                    buckets=buckets,
+                    bucket_cp=bucket_cp,
+                )
 
     def test_production_mode_requires_canonical_workspace_root(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -524,6 +684,62 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                         pass
 
             self.assertFalse(lock_path.exists())
+
+    def test_launch_lock_rejects_duplicate_overwrite_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            args = train.parse_args(["--out-dir", str(out_dir)])
+            overwrite_args = train.parse_args(
+                ["--out-dir", str(out_dir), "--overwrite-output"]
+            )
+            lock_path = train._launch_lock_path(args.out_dir)
+
+            with train.launch_lock(args):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Launch lock already exists",
+                ):
+                    with train.launch_lock(overwrite_args):
+                        pass
+                self.assertTrue(lock_path.is_file())
+
+            self.assertFalse(lock_path.exists())
+
+    def test_launch_lock_rejects_malformed_existing_lock_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(["--out-dir", str(Path(tmp) / "run")])
+            lock_path = train._launch_lock_path(args.out_dir)
+            lock_path.write_text("not json")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "existing lock could not be parsed",
+            ):
+                with train.launch_lock(args):
+                    pass
+
+            self.assertEqual(lock_path.read_text(), "not json")
+
+    def test_launch_lock_error_reports_existing_lock_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(["--out-dir", str(Path(tmp) / "run")])
+            lock_path = train._launch_lock_path(args.out_dir)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": 12345,
+                        "hostname": "worker-a",
+                        "created_at_unix": 100.5,
+                    }
+                )
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "pid=12345.*hostname='worker-a'.*created_at_unix=100.5",
+            ):
+                with train.launch_lock(args):
+                    pass
 
     def test_launch_lock_is_sidecar_to_survive_overwrite_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -724,6 +940,14 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             (["--chunked-ce-chunks", "0"], "--chunked-ce-chunks"),
             (["--checkpoint-interval", "0"], "--checkpoint-interval"),
             (["--metrics-log-freq", "0"], "--metrics-log-freq"),
+            (["--min-free-disk-gb", "-1"], "--min-free-disk-gb"),
+            (["--min-free-gpu-memory-gb", "-1"], "--min-free-gpu-memory-gb"),
+            (["--min-free-cpu-memory-gb", "-1"], "--min-free-cpu-memory-gb"),
+            (
+                ["--min-write-throughput-mb-s", "-1"],
+                "--min-write-throughput-mb-s",
+            ),
+            (["--write-throughput-probe-mb", "0"], "--write-throughput-probe-mb"),
             (["--profiler-freq", "0"], "--profiler-freq"),
             (["--profiler-active", "0"], "--profiler-active"),
             (["--profiler-warmup", "-1"], "--profiler-warmup"),
@@ -1203,14 +1427,17 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
     def test_nvidia_smi_metadata_parses_driver_and_cuda_version(self):
         def fake_command(command, *, timeout_seconds=5.0):
-            if "--query-gpu=index,name,uuid,driver_version,memory.total" in command:
+            if (
+                "--query-gpu=index,name,uuid,driver_version,memory.total,memory.free"
+                in command
+            ):
                 return {
                     "command": command,
                     "available": True,
                     "returncode": 0,
                     "stdout": (
                         "0, NVIDIA H100 80GB HBM3, GPU-test, "
-                        "570.195.03, 81559\n"
+                        "570.195.03, 81559, 80000\n"
                     ),
                     "stderr": "",
                 }
@@ -1234,6 +1461,62 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(metadata["gpus"][0]["uuid"], "GPU-test")
         self.assertEqual(metadata["gpus"][0]["driver_version"], "570.195.03")
         self.assertEqual(metadata["gpus"][0]["memory_total_mib"], "81559")
+        self.assertEqual(metadata["gpus"][0]["memory_free_mib"], "80000")
+
+    def test_resource_preflights_reject_low_disk_cpu_gpu_and_write_throughput(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+
+            with (
+                patch.object(
+                    train.shutil,
+                    "disk_usage",
+                    return_value=types.SimpleNamespace(
+                        total=100,
+                        used=90,
+                        free=10,
+                    ),
+                ),
+                self.assertRaisesRegex(RuntimeError, "Disk preflight failed"),
+            ):
+                train._disk_space_preflight(out_dir, min_free_gb=1)
+
+            with (
+                patch.object(train, "_available_cpu_memory_bytes", return_value=10),
+                self.assertRaisesRegex(RuntimeError, "CPU memory preflight failed"),
+            ):
+                train._cpu_memory_preflight(min_free_gb=1)
+
+            with (
+                patch.object(
+                    train,
+                    "_nvidia_smi_metadata",
+                    return_value={
+                        "gpus": [
+                            {
+                                "index": "0",
+                                "name": "H100",
+                                "memory_free_mib": "1024",
+                            }
+                        ]
+                    },
+                ),
+                self.assertRaisesRegex(RuntimeError, "GPU memory preflight failed"),
+            ):
+                train._gpu_memory_preflight(
+                    min_free_gb=2,
+                    required_gpus=1,
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Write-throughput preflight failed",
+            ):
+                train._write_throughput_preflight(
+                    out_dir,
+                    min_mb_s=1e12,
+                    probe_mb=1,
+                )
 
     def test_write_runtime_metadata_records_environment_and_lockfiles(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1271,6 +1554,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                         ],
                         "cuda_version_from_banner": "12.8",
                     },
+                ),
+                patch.object(
+                    train,
+                    "git_state_for_workspace",
+                    return_value=self._git_state(),
                 ),
                 patch.dict(
                     os.environ,
@@ -1319,6 +1607,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             str(train.CANONICAL_WORKSPACE_ROOT),
         )
         self.assertIn("cwd", metadata["workspace"])
+        self.assertEqual(metadata["git"], self._git_state())
 
     def test_runtime_lockfile_metadata_uses_invoked_venv_root(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1902,12 +2191,48 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             )
 
         run_mock.assert_called_once()
+        self.assertIn("log_paths", run_mock.call_args.kwargs)
         stage = status["stages"][0]
         self.assertEqual(stage["status"], "succeeded")
         self.assertEqual(stage["attempts"][0]["status"], "succeeded")
         self.assertIn("torchrun_command", stage["attempts"][0])
+        self.assertEqual(
+            stage["attempts"][0]["logs"],
+            train._stage_attempt_log_paths(
+                args.out_dir,
+                stage_id=stage["id"],
+                attempt_number=1,
+            ),
+        )
         self.assertEqual(status["failures"], [])
         self.assertEqual(status["summary"]["stage_status_counts"]["succeeded"], 1)
+
+    def test_stage_command_persists_stdout_and_stderr_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_paths = {
+                "stdout": str(root / "logs" / "stage.stdout.log"),
+                "stderr": str(root / "logs" / "stage.stderr.log"),
+            }
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "print('stdout line'); "
+                    "print('stderr line', file=sys.stderr)"
+                ),
+            ]
+
+            train._run_command_with_signal_forwarding(
+                command,
+                env=os.environ.copy(),
+                cwd=root,
+                log_paths=log_paths,
+            )
+
+            self.assertEqual(Path(log_paths["stdout"]).read_text(), "stdout line\n")
+            self.assertEqual(Path(log_paths["stderr"]).read_text(), "stderr line\n")
 
     def test_stage_status_records_failed_stage_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2062,6 +2387,125 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             status["stages"][1]["id"],
         ])
 
+    def test_stage_status_recovers_stale_running_attempt_before_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            args.validate_first_step_checkpoint = False
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+            status_path = args.out_dir / train.STAGE_STATUS_FILENAME
+            stale = json.loads(status_path.read_text())
+            stale_stage = stale["stages"][0]
+            stale_stage["status"] = "running"
+            stale_stage["started_at_unix"] = 100.0
+            stale_stage["finished_at_unix"] = None
+            stale_stage["duration_seconds"] = None
+            stale_stage["attempts"] = [
+                {
+                    "attempt": 1,
+                    "status": "running",
+                    "started_at_unix": 100.0,
+                    "finished_at_unix": None,
+                    "duration_seconds": None,
+                    "failure": None,
+                }
+            ]
+            train._write_json_atomic(status_path, stale)
+
+            recovered = train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+            recovered_stage = recovered["stages"][0]
+
+            with (
+                patch.object(train, "_run_command_with_signal_forwarding"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                train.run_stage_with_status(args, plan.stages[0], plan, manifest)
+
+            final_status = json.loads(status_path.read_text())
+
+        self.assertEqual(recovered_stage["status"], "pending")
+        self.assertEqual(
+            recovered_stage["attempts"][0]["status"],
+            "stale_recovered",
+        )
+        self.assertEqual(
+            recovered_stage["attempts"][0]["failure"]["phase"],
+            "stage_recovery",
+        )
+        self.assertEqual(recovered["failures"][0]["phase"], "stage_recovery")
+        self.assertEqual(final_status["stages"][0]["status"], "succeeded")
+        self.assertEqual(
+            [attempt["status"] for attempt in final_status["stages"][0]["attempts"]],
+            ["stale_recovered", "succeeded"],
+        )
+        self.assertEqual(final_status["summary"]["running_stage_ids"], [])
+
+    def test_stage_status_recovers_stale_running_validation_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            args.post_training_eval_command = "true"
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+            status_path = args.out_dir / train.STAGE_STATUS_FILENAME
+            stale = json.loads(status_path.read_text())
+            for key in (
+                "first_step_checkpoint_validation",
+                "final_artifact_validation",
+                "post_training_eval",
+            ):
+                stale[key]["status"] = "running"
+                stale[key]["started_at_unix"] = 100.0
+                stale[key]["finished_at_unix"] = None
+                stale[key]["duration_seconds"] = None
+            train._write_json_atomic(status_path, stale)
+
+            recovered = train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+
+        self.assertEqual(
+            recovered["first_step_checkpoint_validation"]["status"],
+            "pending",
+        )
+        self.assertEqual(recovered["final_artifact_validation"]["status"], "pending")
+        self.assertEqual(recovered["post_training_eval"]["status"], "pending")
+        for key in (
+            "first_step_checkpoint_validation",
+            "final_artifact_validation",
+            "post_training_eval",
+        ):
+            self.assertIsNone(recovered[key]["finished_at_unix"])
+            self.assertIsNone(recovered[key]["duration_seconds"])
+        self.assertEqual(
+            recovered["summary"]["first_step_checkpoint_validation_status"],
+            "pending",
+        )
+        self.assertEqual(
+            recovered["summary"]["final_artifact_validation_status"],
+            "pending",
+        )
+        self.assertEqual(recovered["summary"]["post_training_eval_status"], "pending")
+
     def test_final_validation_status_records_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
@@ -2189,6 +2633,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             str(train._configured_workspace_root(args)),
         )
         self.assertEqual(first_env["SWEHERO_BUCKET_SEQ_LEN"], "8192")
+        self.assertEqual(first_env["SWEHERO_ALLOW_EMPTY_RANK_REUSE"], "1")
         self.assertEqual(
             first_env["SWEHERO_FINAL_EXPORT_FOLDER"],
             train.FINAL_MODEL_EXPORT_FOLDER,
@@ -2216,6 +2661,16 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertTrue(spec["paper_alignment"]["run_safety"]["production_mode"])
         self.assertEqual(spec["workspace"]["configured_root"], str(args.workspace_root))
         self.assertEqual(contract["workspace"]["configured_root"], str(args.workspace_root))
+        self.assertEqual(
+            spec["plan"]["stages"][0]["env_overrides"][
+                "SWEHERO_ALLOW_EMPTY_RANK_REUSE"
+            ],
+            "0",
+        )
+        self.assertEqual(
+            contract["stage_env"][0]["env"]["SWEHERO_ALLOW_EMPTY_RANK_REUSE"],
+            "0",
+        )
 
     def test_hidden_torchtitan_env_inputs_are_recorded_as_launch_args(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -2485,6 +2940,40 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(first_env["SWEHERO_LOAD_DATALOADER_STATE"], "1")
         self.assertEqual(second_env["SWEHERO_LOAD_DATALOADER_STATE"], "0")
 
+    def test_stage_env_disables_empty_rank_reuse_in_production_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            stage = train.BucketStage(
+                bucket=256,
+                cp_degree=1,
+                example_count=1,
+                steps=1,
+                cumulative_steps=1,
+                bucket_file=out_dir / "data" / "bucket_256.jsonl",
+            )
+            smoke_args = train.parse_args(["--out-dir", str(out_dir)])
+            production_args = train.parse_args(
+                ["--out-dir", str(out_dir), "--production-mode"]
+            )
+
+            smoke_env = train.build_stage_env(
+                smoke_args,
+                stage=stage,
+                total_steps=1,
+                warmup_steps=0,
+                pad_token_id=151643,
+            )
+            production_env = train.build_stage_env(
+                production_args,
+                stage=stage,
+                total_steps=1,
+                warmup_steps=0,
+                pad_token_id=151643,
+            )
+
+        self.assertEqual(smoke_env["SWEHERO_ALLOW_EMPTY_RANK_REUSE"], "1")
+        self.assertEqual(production_env["SWEHERO_ALLOW_EMPTY_RANK_REUSE"], "0")
+
     def test_stage_boundary_resume_does_not_load_previous_bucket_dataloader(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
@@ -2511,6 +3000,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         ).read_text()
 
         self.assertIn("SWEHERO_LOAD_DATALOADER_STATE", source)
+        self.assertIn("SWEHERO_ALLOW_EMPTY_RANK_REUSE", source)
         self.assertIn("_checkpoint_exclude_from_loading()", source)
         self.assertNotIn("exclude_from_loading=[\"dataloader\"]", source)
 
@@ -3724,13 +4214,69 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             )
             plan = train.BucketPlan((stage,), total_steps=1, warmup_steps=0)
 
-            summary = train.validate_launch_preflight(args, plan, manifest)
+            with patch.object(
+                train,
+                "validate_resource_preflights",
+                return_value={"resource": "ok"},
+            ):
+                summary = train.validate_launch_preflight(args, plan, manifest)
             bucket_file.unlink()
-            with self.assertRaisesRegex(RuntimeError, "bucket file"):
+            with (
+                patch.object(
+                    train,
+                    "validate_resource_preflights",
+                    return_value={"resource": "ok"},
+                ),
+                self.assertRaisesRegex(RuntimeError, "bucket file"),
+            ):
                 train.validate_launch_preflight(args, plan, manifest)
 
         self.assertEqual(summary["torchrun_bin"]["resolved"], sys.executable)
+        self.assertEqual(summary["resources"], {"resource": "ok"})
         self.assertEqual(summary["bucket_files"][0]["bucket"], 256)
+
+    def test_production_launch_preflight_rejects_empty_rank_data_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            hf_assets = Path(tmp) / "hf"
+            self._write_preflight_hf_assets(hf_assets)
+            bucket_file = out_dir / "data" / "bucket_256.jsonl"
+            bucket_file.parent.mkdir(parents=True)
+            bucket_file.write_text('{"input_ids":[1],"labels":[1]}\n')
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--hf-assets-path",
+                    str(hf_assets),
+                    "--torchrun-bin",
+                    sys.executable,
+                    "--production-mode",
+                ]
+            )
+            manifest = self._model_assets_manifest(args)
+            stage = train.BucketStage(
+                bucket=256,
+                cp_degree=1,
+                example_count=1,
+                steps=1,
+                cumulative_steps=1,
+                bucket_file=bucket_file,
+            )
+            plan = train.BucketPlan((stage,), total_steps=1, warmup_steps=0)
+
+            with (
+                patch.object(
+                    train,
+                    "validate_resource_preflights",
+                    return_value={"resource": "ok"},
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "would leave data-parallel ranks empty",
+                ),
+            ):
+                train.validate_launch_preflight(args, plan, manifest)
 
     def test_hf_logits_parity_command_uses_paper_yarn_reference(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -87,6 +87,11 @@ DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_MIN_LEARNING_RATE = 1e-8
 DEFAULT_WARMUP_RATIO = 0.1
 DEFAULT_WEIGHT_DECAY = 0.0
+DEFAULT_MIN_FREE_DISK_GB = 100.0
+DEFAULT_MIN_FREE_GPU_MEMORY_GB = 60.0
+DEFAULT_MIN_FREE_CPU_MEMORY_GB = 32.0
+DEFAULT_MIN_WRITE_THROUGHPUT_MB_S = 50.0
+DEFAULT_WRITE_THROUGHPUT_PROBE_MB = 64
 BUCKET_CURRICULUM_CHOICES = (
     "short-to-long",
     "long-to-short",
@@ -101,6 +106,7 @@ QWEN_YARN_BETA_SLOW = 1.0
 MATERIALIZED_DATA_SCHEMA_VERSION = 1
 MODEL_ASSET_PROVENANCE_SCHEMA_VERSION = 1
 DATA_PROVENANCE_SCHEMA_VERSION = 1
+GIT_STATE_SCHEMA_VERSION = 1
 RUN_SPEC_SCHEMA_VERSION = 1
 RUN_SPEC_FILENAME = "run_spec.json"
 RUN_SPEC_SHA256_FILENAME = "run_spec.sha256"
@@ -199,6 +205,11 @@ RESUME_ARG_FIELDS = (
     "chunked_ce_chunks",
     "detect_anomaly",
     "validate_first_step_checkpoint",
+    "min_free_disk_gb",
+    "min_free_gpu_memory_gb",
+    "min_free_cpu_memory_gb",
+    "min_write_throughput_mb_s",
+    "write_throughput_probe_mb",
     "enable_wandb",
     "wandb_project",
     "wandb_entity",
@@ -272,6 +283,11 @@ RUN_SPEC_ARG_FIELDS = (
     "checkpoint_async_mode",
     "validate_first_step_checkpoint",
     "metrics_log_freq",
+    "min_free_disk_gb",
+    "min_free_gpu_memory_gb",
+    "min_free_cpu_memory_gb",
+    "min_write_throughput_mb_s",
+    "write_throughput_probe_mb",
     "enable_profiler",
     "profiler_trace_folder",
     "profiler_freq",
@@ -321,6 +337,7 @@ RESUME_STAGE_ENV_KEYS = (
     "SWEHERO_BUCKET_FILE",
     "SWEHERO_BUCKET_SEQ_LEN",
     "SWEHERO_BUCKET_CP",
+    "SWEHERO_ALLOW_EMPTY_RANK_REUSE",
     "SWEHERO_TOTAL_STEPS",
     "SWEHERO_CUMULATIVE_STEPS",
     "SWEHERO_WARMUP_STEPS",
@@ -1021,6 +1038,17 @@ def _production_mode_errors(
             f"{args.bucket_curriculum!r}. Alternate curricula must be launched "
             "as explicit non-production ablations."
         )
+
+    if not args.enable_wandb:
+        errors.append(
+            "--production-mode requires --enable-wandb so training metrics are "
+            "written to a durable backend, not only local stdout/log files."
+        )
+    elif args.wandb_mode in {"offline", "disabled"}:
+        errors.append(
+            "--production-mode requires a durable W&B mode; "
+            f"--wandb-mode={args.wandb_mode!r} is not durable during training."
+        )
     return errors
 
 
@@ -1075,6 +1103,7 @@ def validate_launch_inputs(
         ("--profiler-freq", args.profiler_freq, 1),
         ("--profiler-active", args.profiler_active, 1),
         ("--profiler-warmup", args.profiler_warmup, 0),
+        ("--write-throughput-probe-mb", args.write_throughput_probe_mb, 1),
         ("--nproc-per-node", args.nproc_per_node, 1),
         ("--nnodes", args.nnodes, 1),
         ("--node-rank", args.node_rank, 0),
@@ -1105,6 +1134,10 @@ def validate_launch_inputs(
         ("--warmup-ratio", args.warmup_ratio),
         ("--weight-decay", args.weight_decay),
         ("--max-grad-norm", args.max_grad_norm),
+        ("--min-free-disk-gb", args.min_free_disk_gb),
+        ("--min-free-gpu-memory-gb", args.min_free_gpu_memory_gb),
+        ("--min-free-cpu-memory-gb", args.min_free_cpu_memory_gb),
+        ("--min-write-throughput-mb-s", args.min_write_throughput_mb_s),
     )
     for name, value in finite_float_fields:
         _add_finite_float_error(errors, name=name, value=value)
@@ -1153,6 +1186,30 @@ def validate_launch_inputs(
         value=args.max_grad_norm,
         minimum=0.0,
         inclusive=False,
+    )
+    _add_min_error(
+        errors,
+        name="--min-free-disk-gb",
+        value=args.min_free_disk_gb,
+        minimum=0.0,
+    )
+    _add_min_error(
+        errors,
+        name="--min-free-gpu-memory-gb",
+        value=args.min_free_gpu_memory_gb,
+        minimum=0.0,
+    )
+    _add_min_error(
+        errors,
+        name="--min-free-cpu-memory-gb",
+        value=args.min_free_cpu_memory_gb,
+        minimum=0.0,
+    )
+    _add_min_error(
+        errors,
+        name="--min-write-throughput-mb-s",
+        value=args.min_write_throughput_mb_s,
+        minimum=0.0,
     )
 
     if (
@@ -1252,6 +1309,7 @@ def validate_launch_inputs(
             "--smoke-synthetic-buckets is set"
         )
     errors.extend(_production_mode_errors(args, buckets=buckets, bucket_cp=bucket_cp))
+    errors.extend(_production_git_state_errors(args))
 
     if args.profiler_freq < args.profiler_active + args.profiler_warmup:
         errors.append(
@@ -1447,6 +1505,23 @@ def _post_training_eval_status_path(out_dir: Path) -> Path:
 
 def _runtime_metadata_path(out_dir: Path) -> Path:
     return out_dir / RUNTIME_METADATA_FILENAME
+
+
+def _torchrun_logs_dir(out_dir: Path) -> Path:
+    return out_dir / "torchrun_logs"
+
+
+def _stage_attempt_log_paths(
+    out_dir: Path,
+    *,
+    stage_id: str,
+    attempt_number: int,
+) -> dict[str, str]:
+    base = _torchrun_logs_dir(out_dir) / f"{stage_id}-attempt-{attempt_number:02d}"
+    return {
+        "stdout": str(base.with_suffix(".stdout.log")),
+        "stderr": str(base.with_suffix(".stderr.log")),
+    }
 
 
 def _launch_lock_path(out_dir: Path) -> Path:
@@ -1764,6 +1839,7 @@ def build_resume_contract(
             for field in RESUME_ARG_FIELDS
         },
         "workspace": workspace_root_metadata(args),
+        "git": git_state_for_workspace(_configured_workspace_root(args)),
         "manifest": _resume_manifest_contract(manifest),
         "plan": {
             "total_steps": plan.total_steps,
@@ -2310,6 +2386,54 @@ def parse_args(
         default=_env_int("METRICS_LOG_FREQ", 1),
     )
     parser.add_argument(
+        "--min-free-disk-gb",
+        type=float,
+        default=float(os.environ.get("MIN_FREE_DISK_GB", DEFAULT_MIN_FREE_DISK_GB)),
+        help="Minimum free GiB required on --out-dir filesystem before launch.",
+    )
+    parser.add_argument(
+        "--min-free-gpu-memory-gb",
+        type=float,
+        default=float(
+            os.environ.get(
+                "MIN_FREE_GPU_MEMORY_GB",
+                DEFAULT_MIN_FREE_GPU_MEMORY_GB,
+            )
+        ),
+        help="Minimum free GiB required on each visible training GPU.",
+    )
+    parser.add_argument(
+        "--min-free-cpu-memory-gb",
+        type=float,
+        default=float(
+            os.environ.get(
+                "MIN_FREE_CPU_MEMORY_GB",
+                DEFAULT_MIN_FREE_CPU_MEMORY_GB,
+            )
+        ),
+        help="Minimum available system memory GiB required before launch.",
+    )
+    parser.add_argument(
+        "--min-write-throughput-mb-s",
+        type=float,
+        default=float(
+            os.environ.get(
+                "MIN_WRITE_THROUGHPUT_MB_S",
+                DEFAULT_MIN_WRITE_THROUGHPUT_MB_S,
+            )
+        ),
+        help="Minimum write throughput MiB/s required on --out-dir filesystem.",
+    )
+    parser.add_argument(
+        "--write-throughput-probe-mb",
+        type=int,
+        default=_env_int(
+            "WRITE_THROUGHPUT_PROBE_MB",
+            DEFAULT_WRITE_THROUGHPUT_PROBE_MB,
+        ),
+        help="MiB to write for the output filesystem throughput probe.",
+    )
+    parser.add_argument(
         "--enable-profiler",
         action=argparse.BooleanOptionalAction,
         default=_env_flag("ENABLE_PROFILER", False),
@@ -2589,16 +2713,61 @@ def parse_args(
     return args
 
 
-def _run_git(args: list[str]) -> str | None:
+def _run_git(args: list[str], *, cwd: Path | None = None) -> str | None:
     try:
         return subprocess.check_output(
             ["git", *args],
-            cwd=Path(__file__).resolve().parents[1],
+            cwd=cwd or Path(__file__).resolve().parents[1],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
     except Exception:
         return None
+
+
+def git_state_for_workspace(workspace_root: Path) -> dict[str, Any]:
+    repo_root = _absolute_without_symlink_resolution(workspace_root)
+    branch = _run_git(["branch", "--show-current"], cwd=repo_root)
+    commit = _run_git(["rev-parse", "HEAD"], cwd=repo_root)
+    status_short = _run_git(["status", "--short"], cwd=repo_root)
+    top_level = _run_git(["rev-parse", "--show-toplevel"], cwd=repo_root)
+    available = commit is not None and status_short is not None
+    return {
+        "schema_version": GIT_STATE_SCHEMA_VERSION,
+        "repo_root": str(repo_root),
+        "available": available,
+        "top_level": top_level,
+        "branch": branch,
+        "commit": commit,
+        "status_short": status_short,
+        "dirty": bool(status_short) if status_short is not None else None,
+    }
+
+
+def _production_git_state_errors(args: argparse.Namespace) -> list[str]:
+    if not args.production_mode:
+        return []
+
+    git_state = git_state_for_workspace(_configured_workspace_root(args))
+    if not git_state["available"]:
+        return [
+            "--production-mode requires Git metadata to prove the launch code "
+            f"is clean; could not read Git state under {git_state['repo_root']}. "
+            "Install git in the launch environment and run from the repository."
+        ]
+    if git_state["dirty"]:
+        status = str(git_state.get("status_short") or "").strip()
+        preview = "\n".join(status.splitlines()[:20])
+        extra = (
+            ""
+            if len(status.splitlines()) <= 20
+            else f"\n... and {len(status.splitlines()) - 20} more dirty paths"
+        )
+        return [
+            "--production-mode requires a clean Git worktree. Commit or stash "
+            f"dirty changes before launching production:\n{preview}{extra}"
+        ]
+    return []
 
 
 def _dataset_revision_info(dataset_id: str, revision: str | None) -> dict[str, Any]:
@@ -3101,7 +3270,7 @@ def _nvidia_smi_metadata() -> dict[str, Any]:
     query = _run_metadata_command(
         [
             "nvidia-smi",
-            "--query-gpu=index,name,uuid,driver_version,memory.total",
+            "--query-gpu=index,name,uuid,driver_version,memory.total,memory.free",
             "--format=csv,noheader,nounits",
         ]
     )
@@ -3111,15 +3280,16 @@ def _nvidia_smi_metadata() -> dict[str, Any]:
             parts = [part.strip() for part in line.split(",")]
             if len(parts) < 5:
                 continue
-            gpus.append(
-                {
-                    "index": parts[0],
-                    "name": parts[1],
-                    "uuid": parts[2],
-                    "driver_version": parts[3],
-                    "memory_total_mib": parts[4],
-                }
-            )
+            gpu = {
+                "index": parts[0],
+                "name": parts[1],
+                "uuid": parts[2],
+                "driver_version": parts[3],
+                "memory_total_mib": parts[4],
+            }
+            if len(parts) >= 6:
+                gpu["memory_free_mib"] = parts[5]
+            gpus.append(gpu)
 
     banner = _run_metadata_command(["nvidia-smi"])
     cuda_version = None
@@ -4079,11 +4249,7 @@ def materialize_synthetic_smoke_buckets(args: argparse.Namespace) -> dict[str, A
             "skipped": {},
             "long_examples_sample": [],
             "include_model_patch": args.include_model_patch,
-            "git": {
-                "branch": _run_git(["branch", "--show-current"]),
-                "commit": _run_git(["rev-parse", "HEAD"]),
-                "status_short": _run_git(["status", "--short"]),
-            },
+            "git": git_state_for_workspace(_configured_workspace_root(args)),
             "software_versions": _package_versions(),
         }
         path_overrides = {
@@ -4292,11 +4458,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
             "skipped": dict(skipped),
             "long_examples_sample": long_examples_sample,
             "include_model_patch": args.include_model_patch,
-            "git": {
-                "branch": _run_git(["branch", "--show-current"]),
-                "commit": _run_git(["rev-parse", "HEAD"]),
-                "status_short": _run_git(["status", "--short"]),
-            },
+            "git": git_state_for_workspace(_configured_workspace_root(args)),
             "software_versions": _package_versions(),
         }
         path_overrides = {
@@ -4609,6 +4771,169 @@ def validate_hf_asset_preflight(
     }
 
 
+def _gib(value: float) -> int:
+    return int(value * 1024 * 1024 * 1024)
+
+
+def _mib(value: float) -> int:
+    return int(value * 1024 * 1024)
+
+
+def _disk_space_preflight(path: Path, *, min_free_gb: float) -> dict[str, Any]:
+    usage = shutil.disk_usage(path)
+    min_free_bytes = _gib(min_free_gb)
+    if usage.free < min_free_bytes:
+        raise RuntimeError(
+            f"Disk preflight failed for {path}: free={usage.free} bytes, "
+            f"required>={min_free_bytes} bytes"
+        )
+    return {
+        "path": str(path),
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+        "min_free_bytes": min_free_bytes,
+    }
+
+
+def _available_cpu_memory_bytes() -> int | None:
+    meminfo = Path("/proc/meminfo")
+    if meminfo.is_file():
+        for line in meminfo.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return int(pages) * int(page_size)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _cpu_memory_preflight(*, min_free_gb: float) -> dict[str, Any]:
+    available_bytes = _available_cpu_memory_bytes()
+    min_free_bytes = _gib(min_free_gb)
+    if available_bytes is None:
+        raise RuntimeError("CPU memory preflight could not determine available memory")
+    if available_bytes < min_free_bytes:
+        raise RuntimeError(
+            f"CPU memory preflight failed: available={available_bytes} bytes, "
+            f"required>={min_free_bytes} bytes"
+        )
+    return {
+        "available_bytes": available_bytes,
+        "min_free_bytes": min_free_bytes,
+    }
+
+
+def _gpu_memory_preflight(
+    *,
+    min_free_gb: float,
+    required_gpus: int,
+) -> dict[str, Any]:
+    nvidia = _nvidia_smi_metadata()
+    gpus = nvidia.get("gpus")
+    if not isinstance(gpus, list) or len(gpus) < required_gpus:
+        raise RuntimeError(
+            "GPU memory preflight could not inspect enough GPUs: "
+            f"found={0 if not isinstance(gpus, list) else len(gpus)}, "
+            f"required={required_gpus}"
+        )
+    min_free_mib = min_free_gb * 1024
+    checked = []
+    for gpu in gpus[:required_gpus]:
+        if not isinstance(gpu, Mapping):
+            raise RuntimeError(f"GPU memory preflight got invalid GPU row: {gpu!r}")
+        try:
+            free_mib = float(gpu["memory_free_mib"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "GPU memory preflight requires nvidia-smi memory.free data"
+            ) from exc
+        if free_mib < min_free_mib:
+            raise RuntimeError(
+                "GPU memory preflight failed for GPU "
+                f"{gpu.get('index')}: free={free_mib} MiB, "
+                f"required>={min_free_mib} MiB"
+            )
+        checked.append(
+            {
+                "index": gpu.get("index"),
+                "name": gpu.get("name"),
+                "memory_free_mib": free_mib,
+                "min_free_mib": min_free_mib,
+            }
+        )
+    return {
+        "required_gpus": required_gpus,
+        "checked_gpus": checked,
+        "nvidia_smi": nvidia,
+    }
+
+
+def _write_throughput_preflight(
+    out_dir: Path,
+    *,
+    min_mb_s: float,
+    probe_mb: int,
+) -> dict[str, Any]:
+    probe_bytes = _mib(float(probe_mb))
+    chunk = b"\0" * _mib(1.0)
+    probe = out_dir / f".write-throughput-preflight-{os.getpid()}-{time.time_ns()}"
+    start = time.monotonic()
+    try:
+        with probe.open("wb") as handle:
+            remaining = probe_bytes
+            while remaining > 0:
+                payload = chunk if remaining >= len(chunk) else chunk[:remaining]
+                handle.write(payload)
+                remaining -= len(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        elapsed = max(time.monotonic() - start, 1e-9)
+    finally:
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass
+    throughput_mb_s = (probe_bytes / (1024 * 1024)) / elapsed
+    if throughput_mb_s < min_mb_s:
+        raise RuntimeError(
+            "Write-throughput preflight failed: "
+            f"{throughput_mb_s:.2f} MiB/s < required {min_mb_s:.2f} MiB/s"
+        )
+    return {
+        "path": str(out_dir),
+        "probe_bytes": probe_bytes,
+        "duration_seconds": elapsed,
+        "throughput_mb_s": throughput_mb_s,
+        "min_mb_s": min_mb_s,
+    }
+
+
+def validate_resource_preflights(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "disk": _disk_space_preflight(
+            args.out_dir,
+            min_free_gb=args.min_free_disk_gb,
+        ),
+        "cpu_memory": _cpu_memory_preflight(
+            min_free_gb=args.min_free_cpu_memory_gb,
+        ),
+        "gpu_memory": _gpu_memory_preflight(
+            min_free_gb=args.min_free_gpu_memory_gb,
+            required_gpus=args.nproc_per_node,
+        ),
+        "write_throughput": _write_throughput_preflight(
+            args.out_dir,
+            min_mb_s=args.min_write_throughput_mb_s,
+            probe_mb=args.write_throughput_probe_mb,
+        ),
+    }
+
+
 def _cuda_launch_summary(
     torch_module: Any,
     *,
@@ -4792,6 +5117,7 @@ def write_runtime_metadata(
         },
         "environment": _runtime_environment_metadata(),
         "workspace": workspace_root_metadata(args, include_cwd=True),
+        "git": git_state_for_workspace(_configured_workspace_root(args)),
         "lockfiles": _runtime_lockfile_metadata(
             repo_root=_configured_workspace_root(args)
         ),
@@ -4813,13 +5139,22 @@ def validate_launch_preflight(
     if plan.total_steps <= 0 or not plan.stages:
         raise RuntimeError("Launch plan has no training steps to run")
 
+    resource_preflights = validate_resource_preflights(args)
     hf_assets = validate_hf_asset_preflight(args, manifest)
     checked_bucket_files = []
     for stage in plan.stages:
+        data_parallel_degree = _stage_data_parallel_degree(args, stage)
         if stage.steps <= 0:
             raise RuntimeError(f"Launch stage has no steps: {stage}")
         if stage.example_count <= 0:
             raise RuntimeError(f"Launch stage has no examples: {stage}")
+        if args.production_mode and stage.example_count < data_parallel_degree:
+            raise RuntimeError(
+                "Production bucket stage would leave data-parallel ranks empty: "
+                f"bucket={stage.bucket}, examples={stage.example_count}, "
+                f"data_parallel_degree={data_parallel_degree}. Refusing to rely "
+                "on empty-rank data reuse for a production data run."
+            )
         if not stage.bucket_file.is_file():
             raise RuntimeError(
                 f"Launch bucket file does not exist: {stage.bucket_file}"
@@ -4838,6 +5173,8 @@ def validate_launch_preflight(
                 "bytes": bucket_bytes,
                 "examples": stage.example_count,
                 "steps": stage.steps,
+                "data_parallel_degree": data_parallel_degree,
+                "allow_empty_rank_reuse": not args.production_mode,
             }
         )
 
@@ -4863,6 +5200,7 @@ def validate_launch_preflight(
             "resolved": resolved_torchrun,
         },
         "hf_assets": hf_assets,
+        "resources": resource_preflights,
         "bucket_files": checked_bucket_files,
         "out_dir": str(args.out_dir),
     }
@@ -5461,6 +5799,9 @@ def build_stage_env(
             "SWEHERO_BUCKET_FILE": str(stage.bucket_file),
             "SWEHERO_BUCKET_SEQ_LEN": str(stage.bucket),
             "SWEHERO_BUCKET_CP": str(stage.cp_degree),
+            "SWEHERO_ALLOW_EMPTY_RANK_REUSE": "0"
+            if args.production_mode
+            else "1",
             "SWEHERO_TOTAL_STEPS": str(total_steps),
             "SWEHERO_CUMULATIVE_STEPS": str(stage.cumulative_steps),
             "SWEHERO_WARMUP_STEPS": str(warmup_steps),
@@ -5534,6 +5875,23 @@ def _distributed_launch_summary(args: argparse.Namespace) -> dict[str, Any]:
         "rdzv_endpoint": args.rdzv_endpoint,
         "rdzv_id": args.rdzv_id or None,
     }
+
+
+def _stage_data_parallel_degree(
+    args: argparse.Namespace,
+    stage: BucketStage,
+) -> int:
+    world_size = args.nnodes * args.nproc_per_node
+    if stage.cp_degree <= 0:
+        raise RuntimeError(f"Stage CP degree must be positive: {stage}")
+    if world_size <= 0:
+        raise RuntimeError(f"Launch world size must be positive: {world_size}")
+    if world_size % stage.cp_degree != 0:
+        raise RuntimeError(
+            f"Launch world size {world_size} is not divisible by "
+            f"stage CP degree {stage.cp_degree}"
+        )
+    return world_size // stage.cp_degree
 
 
 def build_torchrun_command(args: argparse.Namespace) -> list[str]:
@@ -5630,6 +5988,7 @@ def build_run_spec(
             for field in RUN_SPEC_ARG_FIELDS
         },
         "workspace": workspace_root_metadata(args),
+        "git": git_state_for_workspace(_configured_workspace_root(args)),
         "paths": {
             "workspace_root": str(_configured_workspace_root(args)),
             "out_dir": str(args.out_dir),
@@ -5727,13 +6086,33 @@ def _run_command_with_signal_forwarding(
     *,
     env: Mapping[str, str],
     cwd: Path,
+    log_paths: Mapping[str, str] | None = None,
 ) -> None:
-    process = subprocess.Popen(
-        command,
-        env=dict(env),
-        cwd=cwd,
-        start_new_session=True,
-    )
+    stdout_handle = None
+    stderr_handle = None
+    if log_paths is not None:
+        stdout_path = Path(str(log_paths["stdout"]))
+        stderr_path = Path(str(log_paths["stderr"]))
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_handle = stdout_path.open("w")
+        stderr_handle = stderr_path.open("w")
+
+    try:
+        process = subprocess.Popen(
+            command,
+            env=dict(env),
+            cwd=cwd,
+            start_new_session=True,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+        )
+    except Exception:
+        if stdout_handle is not None:
+            stdout_handle.close()
+        if stderr_handle is not None:
+            stderr_handle.close()
+        raise
     received_signal: dict[str, Any] = {}
     killed_after_grace = False
 
@@ -5769,6 +6148,10 @@ def _run_command_with_signal_forwarding(
     finally:
         for signum, previous_handler in previous_handlers.items():
             signal.signal(signum, previous_handler)
+        if stdout_handle is not None:
+            stdout_handle.close()
+        if stderr_handle is not None:
+            stderr_handle.close()
 
     if received_signal:
         raise SignalTerminationError(
@@ -5788,6 +6171,7 @@ def run_stage(
     pad_token_id: int,
     *,
     load_dataloader_state: bool = False,
+    log_paths: Mapping[str, str] | None = None,
 ) -> None:
     env = build_stage_env(
         args,
@@ -5807,6 +6191,7 @@ def run_stage(
         command,
         env=env,
         cwd=_configured_workspace_root(args),
+        log_paths=log_paths,
     )
 
 
@@ -6058,6 +6443,48 @@ def _merge_existing_stage_status(
     new_document: dict[str, Any],
     existing_document: Mapping[str, Any],
 ) -> dict[str, Any]:
+    recovered_at = time.time()
+    recovered_failures: list[dict[str, Any]] = []
+
+    def recover_stale_attempts(
+        stage_id: str,
+        attempts: list[Any],
+    ) -> list[Any]:
+        recovered = []
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                recovered.append(attempt)
+                continue
+            if attempt.get("status") != "running":
+                recovered.append(attempt)
+                continue
+            failure = {
+                "phase": "stage_recovery",
+                "stage_id": stage_id,
+                "created_at_unix": recovered_at,
+                "exception_type": "StaleStageAttempt",
+                "message": (
+                    "Recovered stale running stage attempt while initializing "
+                    "stage status; the previous launcher exited before "
+                    "recording an attempt result."
+                ),
+                "attempt": attempt.get("attempt"),
+            }
+            attempt = dict(attempt)
+            attempt["status"] = "stale_recovered"
+            attempt["recovered_at_unix"] = recovered_at
+            attempt["finished_at_unix"] = recovered_at
+            started_at = attempt.get("started_at_unix")
+            attempt["duration_seconds"] = (
+                recovered_at - float(started_at)
+                if isinstance(started_at, (int, float))
+                else None
+            )
+            attempt["failure"] = failure
+            recovered_failures.append(failure)
+            recovered.append(attempt)
+        return recovered
+
     existing_by_id = {
         str(stage.get("id")): stage
         for stage in existing_document.get("stages", [])
@@ -6069,7 +6496,7 @@ def _merge_existing_stage_status(
             continue
         existing_attempts = existing.get("attempts")
         stage["attempts"] = (
-            list(existing_attempts)
+            recover_stale_attempts(stage["id"], list(existing_attempts))
             if isinstance(existing_attempts, list)
             else []
         )
@@ -6096,7 +6523,10 @@ def _merge_existing_stage_status(
     new_document["created_at_unix"] = existing_document.get(
         "created_at_unix", new_document["created_at_unix"]
     )
-    new_document["failures"] = list(existing_document.get("failures", []))
+    new_document["failures"] = [
+        *list(existing_document.get("failures", [])),
+        *recovered_failures,
+    ]
     first_step_validation = existing_document.get("first_step_checkpoint_validation")
     if isinstance(first_step_validation, Mapping):
         new_document["first_step_checkpoint_validation"] = {
@@ -6326,6 +6756,11 @@ def _record_stage_started(
     now = time.time()
     attempts = stage_record.setdefault("attempts", [])
     attempt_number = len(attempts) + 1
+    log_paths = _stage_attempt_log_paths(
+        args.out_dir,
+        stage_id=stage_id,
+        attempt_number=attempt_number,
+    )
     attempts.append(
         {
             "attempt": attempt_number,
@@ -6336,6 +6771,7 @@ def _record_stage_started(
             "torchrun_command": build_torchrun_command(args),
             "load_dataloader_state": load_dataloader_state,
             "target_cumulative_steps": stage.cumulative_steps,
+            "logs": log_paths,
             "env_overrides": _stage_env_overrides(
                 args,
                 stage=stage,
@@ -6413,6 +6849,11 @@ def run_stage_with_status(
         manifest,
         load_dataloader_state=load_dataloader_state,
     )
+    log_paths = _stage_attempt_log_paths(
+        args.out_dir,
+        stage_id=stage_id,
+        attempt_number=attempt_number,
+    )
     failure_phase = "stage"
     try:
         run_stage(
@@ -6421,6 +6862,7 @@ def run_stage_with_status(
             plan,
             int(manifest["pad_token_id"]),
             load_dataloader_state=load_dataloader_state,
+            log_paths=log_paths,
         )
         if should_validate_first_step_checkpoint_after_stage(args, stage, plan):
             failure_phase = "first_step_checkpoint_validation"

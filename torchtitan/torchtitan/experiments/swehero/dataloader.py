@@ -143,6 +143,7 @@ class SweHeroDataLoader(ParallelAwareDataloader):
         seed: int = 17
         shuffle: bool = True
         infinite: bool = True
+        allow_empty_rank_reuse: bool = False
 
     def __init__(
         self,
@@ -168,6 +169,12 @@ class SweHeroDataLoader(ParallelAwareDataloader):
         if total_records == 0:
             raise ValueError(f"SWE-HERO bucket file is empty: {dataset_path}")
         if not offsets:
+            if not config.allow_empty_rank_reuse:
+                raise ValueError(
+                    "SWE-HERO bucket file has no records for "
+                    f"dp_rank={dp_rank} with dp_world_size={dp_world_size}: "
+                    f"{dataset_path}. Refusing to reuse data on an empty rank."
+                )
             # Tiny smoke buckets can have fewer examples than DP ranks. Reuse
             # the bucket on empty ranks so distributed smoke tests do not fail
             # before the full filtered dataset is ready.

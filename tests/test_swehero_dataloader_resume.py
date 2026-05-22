@@ -43,6 +43,7 @@ class SweHeroDataLoaderResumeTests(unittest.TestCase):
         dp_world_size: int = 1,
         dp_rank: int = 0,
         shuffle: bool = True,
+        allow_empty_rank_reuse: bool = False,
     ) -> "SweHeroDataLoader":
         assert SweHeroDataLoader is not None
         config = SweHeroDataLoader.Config(
@@ -51,6 +52,7 @@ class SweHeroDataLoaderResumeTests(unittest.TestCase):
             seed=123,
             shuffle=shuffle,
             infinite=True,
+            allow_empty_rank_reuse=allow_empty_rank_reuse,
             pin_memory=False,
         )
         return SweHeroDataLoader(
@@ -93,11 +95,25 @@ class SweHeroDataLoaderResumeTests(unittest.TestCase):
                 dp_world_size=4,
                 dp_rank=3,
                 shuffle=False,
+                allow_empty_rank_reuse=True,
             )
             inputs, labels = next(iter(loader))
 
         self.assertEqual(inputs["input"][0, 0].item(), 1)
         self.assertEqual(labels[0, 0].item(), 1)
+
+    def test_empty_rank_reuse_is_rejected_unless_explicitly_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bucket_path = Path(tmp) / "bucket_8.jsonl"
+            self._write_bucket(bucket_path, count=1)
+
+            with self.assertRaisesRegex(ValueError, "Refusing to reuse data"):
+                self._build_loader(
+                    bucket_path,
+                    dp_world_size=4,
+                    dp_rank=3,
+                    shuffle=False,
+                )
 
     def test_state_dict_restores_next_batch_order(self):
         with tempfile.TemporaryDirectory() as tmp:
