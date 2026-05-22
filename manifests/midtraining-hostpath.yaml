@@ -31,5 +31,5 @@ spec:
   volumes:
     - name: workspace
       hostPath:
-        path: /home/johnkey/midtraining
-        type: DirectoryOrCreate
+        path: /workspace
+        type: Directory

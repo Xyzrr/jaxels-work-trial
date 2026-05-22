@@ -14,6 +14,11 @@ scripts/run_qwen_swehero_torchtitan_pod.sh \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
 ```
 
+The host and container workspace root are both `/workspace`. The pod manifest
+uses `hostPath.path: /workspace` with `type: Directory`, so the GPU node must
+prepare `/workspace` as a real directory or mountpoint before the pod is
+created. Do not rely on a host symlink for this path.
+
 The launcher pins the base checkpoint to
 `Qwen/Qwen2.5-Coder-7B-Instruct@c03e6d358207e414f1eca0bb1891e29f1db0e242`.
 That revision is passed to Hugging Face asset downloads, recorded in the data
