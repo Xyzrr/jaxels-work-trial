@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import shlex
 import sys
 import tempfile
@@ -1302,7 +1303,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             )
 
             with (
-                patch.object(train.subprocess, "run") as run_mock,
+                patch.object(train, "_run_command_with_signal_forwarding") as run_mock,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 train.run_stage_with_status(args, plan.stages[0], plan, manifest)
@@ -1335,7 +1336,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             )
 
             with (
-                patch.object(train.subprocess, "run", side_effect=error),
+                patch.object(
+                    train,
+                    "_run_command_with_signal_forwarding",
+                    side_effect=error,
+                ),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 with self.assertRaises(train.subprocess.CalledProcessError):
@@ -1352,6 +1357,93 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(status["failures"][0]["phase"], "stage")
         self.assertEqual(status["failures"][0]["stage_id"], stage["id"])
         self.assertEqual(status["summary"]["failure_count"], 1)
+
+    def test_stage_status_records_signal_terminated_stage_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+            error = train.SignalTerminationError(
+                signum=int(signal.SIGTERM),
+                command=["torchrun", "-m", "torchtitan.train"],
+                returncode=-int(signal.SIGTERM),
+            )
+
+            with (
+                patch.object(
+                    train,
+                    "_run_command_with_signal_forwarding",
+                    side_effect=error,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(train.SignalTerminationError):
+                    train.run_stage_with_status(args, plan.stages[0], plan, manifest)
+
+            status = json.loads(
+                (args.out_dir / train.STAGE_STATUS_FILENAME).read_text()
+            )
+
+        stage = status["stages"][0]
+        failure = stage["failure"]
+        self.assertEqual(stage["status"], "failed")
+        self.assertTrue(failure["terminated_by_signal"])
+        self.assertEqual(failure["signum"], int(signal.SIGTERM))
+        self.assertEqual(failure["signal_name"], "SIGTERM")
+        self.assertEqual(failure["returncode"], -int(signal.SIGTERM))
+        self.assertEqual(status["failures"][0], failure)
+
+    def test_stage_command_forwards_sigterm_to_process_group(self):
+        command = ["torchrun", "-m", "torchtitan.train"]
+
+        class FakeProcess:
+            pid = 12345
+
+            def __init__(self) -> None:
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        fake_process = FakeProcess()
+        installed_handlers = {}
+
+        def fake_signal(signum, handler):
+            signum = int(signum)
+            previous = installed_handlers.get(signum, signal.SIG_DFL)
+            installed_handlers[signum] = handler
+            return previous
+
+        def fake_sleep(_seconds):
+            handler = installed_handlers[int(signal.SIGTERM)]
+            handler(int(signal.SIGTERM), None)
+            fake_process.returncode = -int(signal.SIGTERM)
+
+        with (
+            patch.object(train.subprocess, "Popen", return_value=fake_process) as popen,
+            patch.object(train.signal, "signal", side_effect=fake_signal),
+            patch.object(train.time, "sleep", side_effect=fake_sleep),
+            patch.object(train, "_send_signal_to_process_group") as send_signal,
+        ):
+            with self.assertRaises(train.SignalTerminationError) as raised:
+                train._run_command_with_signal_forwarding(
+                    command,
+                    env={"A": "B"},
+                    cwd=Path("/tmp"),
+                )
+
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.kwargs["env"], {"A": "B"})
+        self.assertEqual(popen.call_args.kwargs["cwd"], Path("/tmp"))
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        send_signal.assert_called_with(fake_process.pid, int(signal.SIGTERM))
+        self.assertEqual(raised.exception.signum, int(signal.SIGTERM))
+        self.assertEqual(raised.exception.returncode, -int(signal.SIGTERM))
 
     def test_stage_status_marks_resume_completed_and_pending_stages(self):
         with tempfile.TemporaryDirectory() as tmp:

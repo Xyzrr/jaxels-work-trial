@@ -30,6 +30,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -103,6 +104,15 @@ WANDB_IDENTITY_FILENAME = "wandb_identity.json"
 WANDB_RESUME_CHOICES = ("allow", "never", "must", "auto")
 WANDB_MODE_CHOICES = ("online", "offline", "disabled", "shared")
 WANDB_RUN_ID_FORBIDDEN_CHARS = frozenset("/\\#?%:")
+TERMINATION_SIGNALS = tuple(
+    signal_number
+    for signal_number in (
+        getattr(signal, "SIGINT", None),
+        getattr(signal, "SIGTERM", None),
+    )
+    if signal_number is not None
+)
+SIGNAL_FORWARD_GRACE_SECONDS = 30.0
 CONTROLLED_WANDB_ENV_KEYS = (
     "WANDB_PROJECT",
     "WANDB_TEAM",
@@ -341,6 +351,35 @@ class LongExampleError(ValueError):
             f"encoded example has shifted input length {self.shifted_input_length}, "
             f"which exceeds --max-length={max_length}"
         )
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"SIG{signum}"
+
+
+class SignalTerminationError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        signum: int,
+        command: list[str],
+        returncode: int | None,
+        killed_after_grace: bool = False,
+    ) -> None:
+        self.signum = int(signum)
+        self.signal_name = _signal_name(self.signum)
+        self.command = list(command)
+        self.returncode = returncode
+        self.killed_after_grace = killed_after_grace
+        message = (
+            f"received {self.signal_name}; forwarded it to the torchrun process group"
+        )
+        if killed_after_grace:
+            message += " and sent SIGKILL after the grace period"
+        super().__init__(message)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -4523,6 +4562,72 @@ def write_or_validate_run_spec(
     return True
 
 
+def _send_signal_to_process_group(pid: int, signum: int) -> None:
+    try:
+        os.killpg(pid, signum)
+    except ProcessLookupError:
+        return
+
+
+def _run_command_with_signal_forwarding(
+    command: list[str],
+    *,
+    env: Mapping[str, str],
+    cwd: Path,
+) -> None:
+    process = subprocess.Popen(
+        command,
+        env=dict(env),
+        cwd=cwd,
+        start_new_session=True,
+    )
+    received_signal: dict[str, Any] = {}
+    killed_after_grace = False
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal killed_after_grace
+        now = time.monotonic()
+        if not received_signal:
+            received_signal["signum"] = int(signum)
+            received_signal["received_at_monotonic"] = now
+            _send_signal_to_process_group(process.pid, int(signum))
+            return
+        if not killed_after_grace and getattr(signal, "SIGKILL", None) is not None:
+            killed_after_grace = True
+            _send_signal_to_process_group(process.pid, int(signal.SIGKILL))
+
+    previous_handlers: dict[int, Any] = {}
+    try:
+        for signum in TERMINATION_SIGNALS:
+            previous_handlers[int(signum)] = signal.signal(signum, forward_signal)
+
+        while True:
+            returncode = process.poll()
+            if returncode is not None:
+                break
+            if received_signal and not killed_after_grace:
+                received_at = float(received_signal["received_at_monotonic"])
+                if time.monotonic() - received_at >= SIGNAL_FORWARD_GRACE_SECONDS:
+                    sigkill = getattr(signal, "SIGKILL", None)
+                    if sigkill is not None:
+                        killed_after_grace = True
+                        _send_signal_to_process_group(process.pid, int(sigkill))
+            time.sleep(0.1)
+    finally:
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
+
+    if received_signal:
+        raise SignalTerminationError(
+            signum=int(received_signal["signum"]),
+            command=command,
+            returncode=returncode,
+            killed_after_grace=killed_after_grace,
+        )
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, command)
+
+
 def run_stage(
     args: argparse.Namespace,
     stage: BucketStage,
@@ -4545,7 +4650,11 @@ def run_stage(
         f"{stage.bucket} (CP={stage.cp_degree}, examples={stage.example_count}, "
         f"target_step={stage.cumulative_steps})"
     )
-    subprocess.run(command, check=True, env=env, cwd=Path(__file__).resolve().parents[1])
+    _run_command_with_signal_forwarding(
+        command,
+        env=env,
+        cwd=Path(__file__).resolve().parents[1],
+    )
 
 
 def _stage_status_id(index: int, stage: BucketStage) -> str:
@@ -4877,6 +4986,13 @@ def _exception_failure_record(
     }
     if stage_id is not None:
         record["stage_id"] = stage_id
+    if isinstance(exc, SignalTerminationError):
+        record["terminated_by_signal"] = True
+        record["signum"] = exc.signum
+        record["signal_name"] = exc.signal_name
+        record["returncode"] = exc.returncode
+        record["command"] = _jsonable(exc.command)
+        record["killed_after_grace"] = exc.killed_after_grace
     if isinstance(exc, subprocess.CalledProcessError):
         record["returncode"] = exc.returncode
         record["command"] = _jsonable(exc.cmd)
