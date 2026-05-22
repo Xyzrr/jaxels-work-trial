@@ -94,6 +94,8 @@ REQUIRED_HF_ASSET_FILES = ("config.json", "tokenizer.json", "tokenizer_config.js
 FINAL_MODEL_EXPORT_FOLDER = "final_export"
 FINAL_ARTIFACT_VALIDATION_SCHEMA_VERSION = 1
 FINAL_ARTIFACT_VALIDATION_FILENAME = "final_artifact_validation.json"
+POST_TRAINING_EVAL_STATUS_SCHEMA_VERSION = 1
+POST_TRAINING_EVAL_STATUS_FILENAME = "post_training_eval_status.json"
 STAGE_STATUS_SCHEMA_VERSION = 1
 STAGE_STATUS_FILENAME = "stage_status.json"
 WANDB_IDENTITY_SCHEMA_VERSION = 1
@@ -221,6 +223,7 @@ RUN_SPEC_ARG_FIELDS = (
     "wandb_run_tags",
     "wandb_run_notes",
     "wandb_mode",
+    "post_training_eval_command",
     "nproc_per_node",
     "torchrun_bin",
     "log_rank",
@@ -876,6 +879,10 @@ def _run_spec_sha256_path(out_dir: Path) -> Path:
 
 def _final_artifact_validation_path(out_dir: Path) -> Path:
     return out_dir / FINAL_ARTIFACT_VALIDATION_FILENAME
+
+
+def _post_training_eval_status_path(out_dir: Path) -> Path:
+    return out_dir / POST_TRAINING_EVAL_STATUS_FILENAME
 
 
 def _stage_status_path(out_dir: Path) -> Path:
@@ -1645,6 +1652,15 @@ def parse_args(
         choices=WANDB_MODE_CHOICES,
         default=os.environ.get("WANDB_MODE"),
         help="Optional W&B mode such as 'online', 'offline', or 'disabled'.",
+    )
+    parser.add_argument(
+        "--post-training-eval-command",
+        default=os.environ.get("POST_TRAINING_EVAL_COMMAND", ""),
+        help=(
+            "Optional shell command to run after final artifact validation. "
+            "The command receives SWEHERO_* environment variables pointing at "
+            "the run spec, data manifest, final export, and validation report."
+        ),
     )
     parser.add_argument(
         "--nproc-per-node",
@@ -4311,6 +4327,9 @@ def build_run_spec(
             "torchtitan_dump": str(_torchtitan_dump_dir(args.out_dir)),
             "resumable_checkpoints": str(_checkpoint_dir(args.out_dir)),
             "final_model_exports": str(_final_model_export_dir(args.out_dir)),
+            "post_training_eval_status": str(
+                _post_training_eval_status_path(args.out_dir)
+            ),
         },
         "manifest": _resume_manifest_contract(manifest),
         "plan": {
@@ -4442,6 +4461,12 @@ def _stage_status_summary(document: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(final_validation, Mapping)
         else None
     )
+    post_training_eval = document.get("post_training_eval")
+    post_training_eval_status = (
+        post_training_eval.get("status")
+        if isinstance(post_training_eval, Mapping)
+        else None
+    )
     return {
         "stage_status_counts": counts,
         "completed_stage_count": sum(
@@ -4456,6 +4481,7 @@ def _stage_status_summary(document: Mapping[str, Any]) -> dict[str, Any]:
         ],
         "failure_count": len(document.get("failures", [])),
         "final_artifact_validation_status": final_validation_status,
+        "post_training_eval_status": post_training_eval_status,
     }
 
 
@@ -4560,6 +4586,9 @@ def _build_stage_status_document(
             "final_artifact_validation": str(
                 _final_artifact_validation_path(args.out_dir)
             ),
+            "post_training_eval_status": str(
+                _post_training_eval_status_path(args.out_dir)
+            ),
         },
         "wandb": {
             "enabled": bool(args.enable_wandb),
@@ -4593,6 +4622,17 @@ def _build_stage_status_document(
             "finished_at_unix": None,
             "duration_seconds": None,
             "report_path": str(_final_artifact_validation_path(args.out_dir)),
+            "report_sha256": None,
+            "summary": None,
+            "failure": None,
+        },
+        "post_training_eval": {
+            "status": "pending" if args.post_training_eval_command else "disabled",
+            "command": args.post_training_eval_command or None,
+            "started_at_unix": None,
+            "finished_at_unix": None,
+            "duration_seconds": None,
+            "report_path": str(_post_training_eval_status_path(args.out_dir)),
             "report_sha256": None,
             "summary": None,
             "failure": None,
@@ -4654,6 +4694,20 @@ def _merge_existing_stage_status(
             new_document["final_artifact_validation"]["status"] = "pending"
             new_document["final_artifact_validation"]["finished_at_unix"] = None
             new_document["final_artifact_validation"]["duration_seconds"] = None
+    post_training_eval = existing_document.get("post_training_eval")
+    if isinstance(post_training_eval, Mapping):
+        new_document["post_training_eval"] = {
+            **new_document["post_training_eval"],
+            **dict(post_training_eval),
+        }
+        if new_document["post_training_eval"].get("status") == "running":
+            new_document["post_training_eval"]["status"] = (
+                "pending"
+                if new_document["post_training_eval"].get("command")
+                else "disabled"
+            )
+            new_document["post_training_eval"]["finished_at_unix"] = None
+            new_document["post_training_eval"]["duration_seconds"] = None
     return new_document
 
 
@@ -4962,6 +5016,207 @@ def validate_final_artifacts_with_status(
     return report
 
 
+def _text_tail(text: str | None, limit: int = 20_000) -> str | None:
+    if text is None:
+        return None
+    return text[-limit:]
+
+
+def _post_training_eval_env(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    final_validation: Mapping[str, Any],
+) -> dict[str, str]:
+    final_export = final_validation.get("final_export")
+    final_export_path = ""
+    final_export_step = ""
+    if isinstance(final_export, Mapping):
+        final_export_path = str(final_export.get("path") or "")
+        final_export_step = str(final_export.get("step") or "")
+    return {
+        "SWEHERO_OUT_DIR": str(args.out_dir),
+        "SWEHERO_RUN_SPEC": str(_run_spec_path(args.out_dir)),
+        "SWEHERO_DATA_MANIFEST": str(args.out_dir / "data" / "manifest.json"),
+        "SWEHERO_LAUNCHER_PLAN": str(args.out_dir / "launcher_plan.json"),
+        "SWEHERO_STAGE_STATUS": str(_stage_status_path(args.out_dir)),
+        "SWEHERO_FINAL_ARTIFACT_VALIDATION": str(
+            _final_artifact_validation_path(args.out_dir)
+        ),
+        "SWEHERO_FINAL_EXPORT_PATH": final_export_path,
+        "SWEHERO_FINAL_EXPORT_STEP": final_export_step,
+        "SWEHERO_TOTAL_STEPS": str(plan.total_steps),
+        "SWEHERO_POST_TRAINING_EVAL_STATUS": str(
+            _post_training_eval_status_path(args.out_dir)
+        ),
+    }
+
+
+def _post_training_eval_status_record(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    final_validation: Mapping[str, Any],
+    *,
+    status: str,
+    started_at_unix: float,
+    finished_at_unix: float | None = None,
+    returncode: int | None = None,
+    stdout: str | None = None,
+    stderr: str | None = None,
+    failure: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    duration = (
+        finished_at_unix - started_at_unix
+        if finished_at_unix is not None
+        else None
+    )
+    env_overrides = _post_training_eval_env(args, plan, final_validation)
+    return {
+        "schema_version": POST_TRAINING_EVAL_STATUS_SCHEMA_VERSION,
+        "status": status,
+        "created_at_unix": started_at_unix,
+        "updated_at_unix": finished_at_unix or started_at_unix,
+        "started_at_unix": started_at_unix,
+        "finished_at_unix": finished_at_unix,
+        "duration_seconds": duration,
+        "command": args.post_training_eval_command,
+        "cwd": str(Path(__file__).resolve().parents[1]),
+        "env_overrides": env_overrides,
+        "returncode": returncode,
+        "stdout_tail": _text_tail(stdout),
+        "stderr_tail": _text_tail(stderr),
+        "failure": failure,
+    }
+
+
+def _record_post_training_eval_started(
+    args: argparse.Namespace,
+    status_record: Mapping[str, Any],
+) -> None:
+    path = _stage_status_path(args.out_dir)
+    if not path.exists():
+        return
+    document = _load_stage_status_document(path)
+    record = document["post_training_eval"]
+    record.update(
+        {
+            "status": "running",
+            "command": args.post_training_eval_command,
+            "started_at_unix": status_record.get("started_at_unix"),
+            "finished_at_unix": None,
+            "duration_seconds": None,
+            "report_path": str(_post_training_eval_status_path(args.out_dir)),
+            "report_sha256": None,
+            "summary": None,
+            "failure": None,
+        }
+    )
+    _write_stage_status_document(path, document)
+
+
+def _record_post_training_eval_finished(
+    args: argparse.Namespace,
+    *,
+    status_record: Mapping[str, Any],
+    failure: dict[str, Any] | None,
+) -> None:
+    path = _stage_status_path(args.out_dir)
+    if not path.exists():
+        return
+    document = _load_stage_status_document(path)
+    record = document["post_training_eval"]
+    report_path = _post_training_eval_status_path(args.out_dir)
+    record.update(
+        {
+            "status": status_record.get("status"),
+            "command": args.post_training_eval_command,
+            "started_at_unix": status_record.get("started_at_unix"),
+            "finished_at_unix": status_record.get("finished_at_unix"),
+            "duration_seconds": status_record.get("duration_seconds"),
+            "report_path": str(report_path),
+            "report_sha256": _hash_file(report_path) if report_path.is_file() else None,
+            "summary": {
+                "returncode": status_record.get("returncode"),
+                "stdout_tail": status_record.get("stdout_tail"),
+                "stderr_tail": status_record.get("stderr_tail"),
+            },
+            "failure": failure,
+        }
+    )
+    if failure is not None:
+        document.setdefault("failures", []).append(failure)
+    _write_stage_status_document(path, document)
+
+
+def run_post_training_eval(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    final_validation: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not args.post_training_eval_command:
+        return None
+
+    started_at = time.time()
+    status_record = _post_training_eval_status_record(
+        args,
+        plan,
+        final_validation,
+        status="running",
+        started_at_unix=started_at,
+    )
+    _write_json_atomic(_post_training_eval_status_path(args.out_dir), status_record)
+    _record_post_training_eval_started(args, status_record)
+
+    env = os.environ.copy()
+    env.update(_post_training_eval_env(args, plan, final_validation))
+    completed = subprocess.run(
+        args.post_training_eval_command,
+        shell=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    finished_at = time.time()
+    failure = None
+    status = "succeeded" if completed.returncode == 0 else "failed"
+    if completed.returncode != 0:
+        failure = {
+            "phase": "post_training_eval",
+            "created_at_unix": finished_at,
+            "exception_type": "CalledProcessError",
+            "message": (
+                "post-training eval command failed with return code "
+                f"{completed.returncode}"
+            ),
+            "returncode": completed.returncode,
+            "command": args.post_training_eval_command,
+            "stdout": _text_tail(completed.stdout),
+            "stderr": _text_tail(completed.stderr),
+        }
+    status_record = _post_training_eval_status_record(
+        args,
+        plan,
+        final_validation,
+        status=status,
+        started_at_unix=started_at,
+        finished_at_unix=finished_at,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        failure=failure,
+    )
+    _write_json_atomic(_post_training_eval_status_path(args.out_dir), status_record)
+    _record_post_training_eval_finished(
+        args,
+        status_record=status_record,
+        failure=failure,
+    )
+    if failure is not None:
+        raise RuntimeError(failure["message"])
+    return status_record
+
+
 def _write_launcher_plan(
     args: argparse.Namespace,
     plan: BucketPlan,
@@ -4990,6 +5245,7 @@ def _write_launcher_plan(
         "run_spec": str(_run_spec_path(args.out_dir)),
         "stage_status": str(_stage_status_path(args.out_dir)),
         "wandb_identity": str(_wandb_identity_path(args.out_dir)),
+        "post_training_eval_status": str(_post_training_eval_status_path(args.out_dir)),
     }
     (args.out_dir / "launcher_plan.json").write_text(
         json.dumps(launcher_plan, indent=2)
@@ -5123,6 +5379,9 @@ def main(argv: list[str] | None = None) -> None:
                     indent=2,
                 )
             )
+            eval_status = run_post_training_eval(args, plan, final_validation)
+            if eval_status is not None:
+                print(json.dumps({"post_training_eval": eval_status}, indent=2))
             print("No bucket stages remain; training is already complete for this plan.")
             return
     for stage in stages_to_run:
@@ -5137,6 +5396,9 @@ def main(argv: list[str] | None = None) -> None:
         )
     final_validation = validate_final_artifacts_with_status(args, plan)
     print(json.dumps({"final_artifact_validation": final_validation}, indent=2))
+    eval_status = run_post_training_eval(args, plan, final_validation)
+    if eval_status is not None:
+        print(json.dumps({"post_training_eval": eval_status}, indent=2))
 
 
 if __name__ == "__main__":

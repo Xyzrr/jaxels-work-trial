@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import sys
 import tempfile
 import types
@@ -1183,6 +1184,86 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual(report["final_export"]["layout"], "legacy_checkpoint_export")
 
+    def test_post_training_eval_hook_records_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_dcp_checkpoint(args.out_dir, step=4)
+            self._write_final_export(args.out_dir, step=5)
+            final_validation = train.validate_final_artifacts(args, plan)
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=(),
+                dataloader_resume_flags={},
+            )
+            code = (
+                "import os, pathlib; "
+                "pathlib.Path(os.environ['SWEHERO_OUT_DIR'], "
+                "'eval-step.txt').write_text("
+                "os.environ['SWEHERO_FINAL_EXPORT_STEP'])"
+            )
+            args.post_training_eval_command = (
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+            )
+
+            eval_status = train.run_post_training_eval(args, plan, final_validation)
+            persisted = json.loads(
+                (args.out_dir / train.POST_TRAINING_EVAL_STATUS_FILENAME).read_text()
+            )
+            stage_status = json.loads(
+                (args.out_dir / train.STAGE_STATUS_FILENAME).read_text()
+            )
+            eval_step_text = (args.out_dir / "eval-step.txt").read_text()
+
+        self.assertIsNotNone(eval_status)
+        self.assertEqual(eval_status, persisted)
+        self.assertEqual(eval_status["status"], "succeeded")
+        self.assertEqual(eval_status["returncode"], 0)
+        self.assertEqual(
+            eval_status["env_overrides"]["SWEHERO_FINAL_EXPORT_STEP"],
+            "5",
+        )
+        self.assertEqual(eval_step_text, "5")
+        self.assertEqual(stage_status["post_training_eval"]["status"], "succeeded")
+        self.assertEqual(
+            stage_status["summary"]["post_training_eval_status"], "succeeded"
+        )
+
+    def test_post_training_eval_hook_records_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_dcp_checkpoint(args.out_dir, step=4)
+            self._write_final_export(args.out_dir, step=5)
+            final_validation = train.validate_final_artifacts(args, plan)
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=(),
+                dataloader_resume_flags={},
+            )
+            code = "import sys; print('eval failed'); sys.exit(3)"
+            args.post_training_eval_command = (
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "return code 3"):
+                train.run_post_training_eval(args, plan, final_validation)
+
+            persisted = json.loads(
+                (args.out_dir / train.POST_TRAINING_EVAL_STATUS_FILENAME).read_text()
+            )
+            stage_status = json.loads(
+                (args.out_dir / train.STAGE_STATUS_FILENAME).read_text()
+            )
+
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["returncode"], 3)
+        self.assertIn("eval failed", persisted["stdout_tail"])
+        self.assertEqual(stage_status["post_training_eval"]["status"], "failed")
+        self.assertEqual(stage_status["summary"]["failure_count"], 1)
+
     def test_stage_status_records_successful_stage_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, manifest, plan = self._resume_test_setup(tmp)
@@ -2055,6 +2136,15 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(
             launcher_plan["wandb_identity"],
             str(out_dir / train.WANDB_IDENTITY_FILENAME),
+        )
+        self.assertEqual(run_spec["args"]["post_training_eval_command"], "")
+        self.assertEqual(
+            run_spec["paths"]["post_training_eval_status"],
+            str(out_dir / train.POST_TRAINING_EVAL_STATUS_FILENAME),
+        )
+        self.assertEqual(
+            launcher_plan["post_training_eval_status"],
+            str(out_dir / train.POST_TRAINING_EVAL_STATUS_FILENAME),
         )
 
     def test_main_writes_wandb_identity_for_dry_run_launch(self):
