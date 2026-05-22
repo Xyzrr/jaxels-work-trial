@@ -142,8 +142,8 @@ def _coder7b(attn_backend: str) -> Qwen3Model.Config:
             backend="cos_sin",
             scaling="yarn",
             rope_factor=QWEN25_CODER_7B_CONTEXT / QWEN25_NATIVE_CONTEXT,
-            beta_fast=1.0,
-            beta_slow=32.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
             original_seq_len=QWEN25_NATIVE_CONTEXT,
         ),
         layers=_build_qwen25_layers(

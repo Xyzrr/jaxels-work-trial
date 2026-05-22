@@ -34,6 +34,40 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.attention_backend, "sdpa")
         self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
 
+    def test_expected_qwen_yarn_rope_config_tracks_128k_extension(self):
+        rope = train.expected_qwen_yarn_rope_config()
+
+        self.assertEqual(rope["rope_type"], "yarn")
+        self.assertEqual(rope["max_position_embeddings"], train.PAPER_CONTEXT_LENGTH)
+        self.assertEqual(
+            rope["original_max_position_embeddings"],
+            train.QWEN_NATIVE_CONTEXT_LENGTH,
+        )
+        self.assertEqual(rope["factor"], 4.0)
+        self.assertEqual(rope["rope_theta"], 1_000_000.0)
+        self.assertEqual(rope["beta_fast"], 32.0)
+        self.assertEqual(rope["beta_slow"], 1.0)
+
+    def test_torchtitan_qwen_registry_uses_standard_yarn_beta_names(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (repo_root / "torchtitan/torchtitan/models/qwen2_5/__init__.py").read_text()
+
+        self.assertIn("max_seq_len=QWEN25_CODER_7B_CONTEXT", source)
+        self.assertIn("theta=1_000_000.0", source)
+        self.assertIn('scaling="yarn"', source)
+        self.assertIn("rope_factor=QWEN25_CODER_7B_CONTEXT / QWEN25_NATIVE_CONTEXT", source)
+        self.assertIn("beta_fast=32.0", source)
+        self.assertIn("beta_slow=1.0", source)
+        self.assertIn("original_seq_len=QWEN25_NATIVE_CONTEXT", source)
+
+    def test_cos_sin_yarn_uses_huggingface_correction_range_order(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (repo_root / "torchtitan/torchtitan/models/common/rope.py").read_text()
+
+        fast_index = source.index("cfg.beta_fast * 2 * math.pi")
+        slow_index = source.index("cfg.beta_slow * 2 * math.pi")
+        self.assertLess(fast_index, slow_index)
+
     def test_choose_bucket_ceilings(self):
         buckets = (8, 16, 32)
 

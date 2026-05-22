@@ -63,6 +63,9 @@ DEFAULT_BUCKET_CP = {
     65_536: 4,
     PAPER_CONTEXT_LENGTH: 8,
 }
+QWEN_ROPE_THETA = 1_000_000.0
+QWEN_YARN_BETA_FAST = 32.0
+QWEN_YARN_BETA_SLOW = 1.0
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,19 @@ def parse_bucket_cp_map(raw: str | Mapping[int, int]) -> dict[int, int]:
 
 def _format_bucket_cp_map(bucket_cp: Mapping[int, int]) -> str:
     return ",".join(f"{bucket}:{bucket_cp[bucket]}" for bucket in sorted(bucket_cp))
+
+
+def expected_qwen_yarn_rope_config() -> dict[str, Any]:
+    return {
+        "rope_type": "yarn",
+        "max_position_embeddings": PAPER_CONTEXT_LENGTH,
+        "original_max_position_embeddings": QWEN_NATIVE_CONTEXT_LENGTH,
+        "factor": PAPER_CONTEXT_LENGTH / QWEN_NATIVE_CONTEXT_LENGTH,
+        "rope_theta": QWEN_ROPE_THETA,
+        "beta_fast": QWEN_YARN_BETA_FAST,
+        "beta_slow": QWEN_YARN_BETA_SLOW,
+        "backend": "cos_sin",
+    }
 
 
 def choose_bucket(length: int, buckets: Iterable[int]) -> int:
@@ -611,6 +627,7 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
             "min_lr": args.min_learning_rate,
             "warmup_ratio": args.warmup_ratio,
             "context_length": PAPER_CONTEXT_LENGTH,
+            "qwen_yarn_rope": expected_qwen_yarn_rope_config(),
             "loss_masking": "assistant content and assistant tool calls only",
             "swe_zero_stage": "skipped for direct-to-hero",
         },
@@ -917,7 +934,7 @@ def download_hf_assets_if_requested(args: argparse.Namespace) -> None:
     subprocess.run(command, check=True)
 
 
-def validate_torchtitan_runtime() -> dict[str, str | None]:
+def validate_torchtitan_runtime() -> dict[str, Any]:
     try:
         import torch
         from torch.distributed.fsdp import DataParallelMeshDims
@@ -941,12 +958,46 @@ def validate_torchtitan_runtime() -> dict[str, str | None]:
             "scripts/setup_torchtitan_pod_venv.sh."
         ) from exc
 
+    try:
+        from torchtitan.models.qwen2_5 import qwen2_5_configs
+
+        qwen_config = qwen2_5_configs["coder7b"](attn_backend="sdpa")
+        rope = qwen_config.rope
+        qwen_yarn_rope = {
+            "rope_type": rope.scaling,
+            "max_position_embeddings": rope.max_seq_len,
+            "original_max_position_embeddings": rope.original_seq_len,
+            "factor": rope.rope_factor,
+            "rope_theta": rope.theta,
+            "beta_fast": rope.beta_fast,
+            "beta_slow": rope.beta_slow,
+            "backend": rope.backend,
+        }
+        expected_rope = expected_qwen_yarn_rope_config()
+        mismatches = {
+            key: {"expected": expected_rope[key], "actual": qwen_yarn_rope.get(key)}
+            for key in expected_rope
+            if qwen_yarn_rope.get(key) != expected_rope[key]
+        }
+        if mismatches:
+            raise RuntimeError(
+                "TorchTitan Qwen2.5-Coder-7B YaRN config does not match "
+                f"the paper/Qwen 128k contract: {mismatches}"
+            )
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(
+            "Could not validate the TorchTitan Qwen2.5-Coder-7B YaRN config."
+        ) from exc
+
     return {
         "python": sys.executable,
         "torch": getattr(torch, "__version__", None),
         "torch_cuda": getattr(torch.version, "cuda", None),
         "torchao": getattr(torchao, "__version__", None),
         "DataParallelMeshDims": repr(DataParallelMeshDims),
+        "qwen_yarn_rope": qwen_yarn_rope,
     }
 
 
