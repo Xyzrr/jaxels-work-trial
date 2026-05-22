@@ -175,6 +175,15 @@ class CheckpointManager(Configurable):
         When enable is set to true, checkpoints will be in {--dump_folder}/{--checkpoint.folder}.
         """
 
+        final_model_export_folder: str | None = None
+        """
+        Optional folder for the non-resumable final model-only checkpoint/export.
+        When unset, the final model-only checkpoint uses ``folder`` for backward
+        compatibility. When set, final model-only artifacts are written under
+        {--dump_folder}/{--checkpoint.final_model_export_folder}, separate from
+        resumable full checkpoints.
+        """
+
         interval: int = 500
         """Checkpointing interval in steps."""
 
@@ -346,6 +355,20 @@ class CheckpointManager(Configurable):
         self.pg: dist.ProcessGroup | None = None
 
         self.folder = os.path.join(base_folder, config.folder)
+        self.final_model_export_folder = (
+            os.path.join(base_folder, config.final_model_export_folder)
+            if config.final_model_export_folder
+            else self.folder
+        )
+        if (
+            os.path.abspath(self.final_model_export_folder)
+            == os.path.abspath(self.folder)
+            and config.final_model_export_folder
+        ):
+            raise ValueError(
+                "checkpoint.final_model_export_folder must differ from "
+                "checkpoint.folder"
+            )
 
         # Checkpoint policy related fields.
         self.initial_load_model_only = config.initial_load_model_only
@@ -401,6 +424,11 @@ class CheckpointManager(Configurable):
         logger.info(
             f"Checkpointing active. Checkpoints will be loaded from and saved to {self.folder}"
         )
+        if self.final_model_export_folder != self.folder:
+            logger.info(
+                "Final model-only checkpoint/export artifacts will be saved to "
+                f"{self.final_model_export_folder}"
+            )
 
     def __del__(self):
         self.close()
@@ -829,9 +857,14 @@ class CheckpointManager(Configurable):
                 self.last_save_model_only
             ), "Only model can be saved when saving in HF safetensors format."
 
+        output_folder = (
+            self.final_model_export_folder
+            if self.last_save_model_only
+            else self.folder
+        )
         self.dcp_save(
             states,
-            checkpoint_id=self._create_checkpoint_id(curr_step),
+            checkpoint_id=self._create_checkpoint_id(curr_step, folder=output_folder),
             async_mode=AsyncMode.DISABLED,
             enable_garbage_collection=True,
             to_hf=self.last_save_in_hf,

@@ -632,18 +632,21 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual([stage.cumulative_steps for stage in plan.stages], [4, 5])
         self.assertEqual([stage.cp_degree for stage in plan.stages], [1, 2])
 
-    def test_resume_requires_existing_full_dcp_checkpoint(self):
+    def test_resume_requires_existing_artifact_then_full_dcp_for_incomplete_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = train.parse_args(["--out-dir", str(Path(tmp) / "run"), "--resume"])
             with self.assertRaises(FileNotFoundError):
                 train.validate_resume_request(args)
 
-            checkpoint_dir = Path(tmp) / "run" / "torchtitan" / "checkpoint" / "step-5"
-            checkpoint_dir.mkdir(parents=True)
-            (checkpoint_dir / "model.safetensors.index.json").write_text("{}")
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            export = train._final_model_export_dir(args.out_dir) / "step-3"
+            export.mkdir(parents=True)
+            (export / "model.safetensors.index.json").write_text("{}")
+            args.resume = True
 
+            resume_state = train.validate_resume_request(args)
             with self.assertRaisesRegex(RuntimeError, "full DCP checkpoint"):
-                train.validate_resume_request(args)
+                train.validate_resume_progress(plan, resume_state)
 
     def test_resume_rejects_destructive_refresh_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -659,11 +662,12 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_resume_ignores_final_model_export_when_deciding_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
-            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            checkpoint_root = train._checkpoint_dir(args.out_dir)
+            final_export_root = train._final_model_export_dir(args.out_dir)
             full = checkpoint_root / "step-4"
-            export = checkpoint_root / "step-5"
+            export = final_export_root / "step-5"
             full.mkdir(parents=True)
-            export.mkdir()
+            export.mkdir(parents=True)
             (full / ".metadata").write_text("{}")
             (export / "model.safetensors.index.json").write_text("{}")
             args.resume = True
@@ -672,26 +676,63 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             train.validate_resume_progress(plan, resume_state)
 
         self.assertEqual(resume_state.latest_resumable_step, 4)
+        self.assertEqual(resume_state.latest_model_export_step, 5)
         self.assertEqual(resume_state.latest_any_step, 5)
+        self.assertEqual(train.stages_to_run_for_resume(plan, resume_state), ())
+
+    def test_resume_accepts_completed_final_export_without_full_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            export = train._final_model_export_dir(args.out_dir) / "step-5"
+            export.mkdir(parents=True)
+            (export / "model.safetensors.index.json").write_text("{}")
+            args.resume = True
+
+            resume_state = train.validate_resume_request(args)
+            train.validate_resume_progress(plan, resume_state)
+
+        self.assertIsNone(resume_state.latest_resumable_step)
+        self.assertEqual(resume_state.latest_model_export_step, 5)
         self.assertEqual(train.stages_to_run_for_resume(plan, resume_state), ())
 
     def test_resume_rejects_nonfinal_model_export_newer_than_full_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
-            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            checkpoint_root = train._checkpoint_dir(args.out_dir)
+            final_export_root = train._final_model_export_dir(args.out_dir)
             full = checkpoint_root / "step-2"
-            export = checkpoint_root / "step-3"
+            export = final_export_root / "step-3"
             full.mkdir(parents=True)
-            export.mkdir()
+            export.mkdir(parents=True)
             (full / ".metadata").write_text("{}")
             (export / "model.safetensors.index.json").write_text("{}")
             resume_state = train.ResumeCheckpointState(
                 checkpoint_dir=checkpoint_root,
+                final_export_dir=final_export_root,
                 latest_resumable_step=2,
+                latest_model_export_step=3,
                 latest_any_step=3,
             )
 
             with self.assertRaisesRegex(RuntimeError, "non-resumable export"):
+                train.validate_resume_progress(plan, resume_state)
+
+    def test_resume_rejects_incomplete_export_without_full_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            final_export_root = train._final_model_export_dir(args.out_dir)
+            export = final_export_root / "step-3"
+            export.mkdir(parents=True)
+            (export / "model.safetensors.index.json").write_text("{}")
+            resume_state = train.ResumeCheckpointState(
+                checkpoint_dir=train._checkpoint_dir(args.out_dir),
+                final_export_dir=final_export_root,
+                latest_resumable_step=None,
+                latest_model_export_step=3,
+                latest_any_step=3,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "full DCP"):
                 train.validate_resume_progress(plan, resume_state)
 
     def test_resume_contract_accepts_same_config_and_skips_completed_stages(self):
@@ -729,9 +770,21 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(spec["schema_version"], train.RUN_SPEC_SCHEMA_VERSION)
         self.assertEqual(spec["args"]["max_length"], 32768)
         self.assertEqual(spec["manifest"], train._resume_manifest_contract(manifest))
+        self.assertEqual(
+            spec["paths"]["resumable_checkpoints"],
+            str(train._checkpoint_dir(args.out_dir)),
+        )
+        self.assertEqual(
+            spec["paths"]["final_model_exports"],
+            str(train._final_model_export_dir(args.out_dir)),
+        )
         self.assertEqual(spec["plan"]["total_steps"], plan.total_steps)
         first_env = spec["plan"]["stages"][0]["env_overrides"]
         self.assertEqual(first_env["SWEHERO_BUCKET_SEQ_LEN"], "8192")
+        self.assertEqual(
+            first_env["SWEHERO_FINAL_EXPORT_FOLDER"],
+            train.FINAL_MODEL_EXPORT_FOLDER,
+        )
         self.assertNotIn("SWEHERO_SECRET", first_env)
 
     def test_run_spec_rejects_changed_launch_config(self):
@@ -791,10 +844,12 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_mid_stage_resume_loads_dataloader_state_for_current_stage_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
-            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            checkpoint_root = train._checkpoint_dir(args.out_dir)
             resume_state = train.ResumeCheckpointState(
                 checkpoint_dir=checkpoint_root,
+                final_export_dir=train._final_model_export_dir(args.out_dir),
                 latest_resumable_step=2,
+                latest_model_export_step=None,
                 latest_any_step=2,
             )
 
@@ -827,10 +882,12 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_stage_boundary_resume_does_not_load_previous_bucket_dataloader(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
-            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            checkpoint_root = train._checkpoint_dir(args.out_dir)
             resume_state = train.ResumeCheckpointState(
                 checkpoint_dir=checkpoint_root,
+                final_export_dir=train._final_model_export_dir(args.out_dir),
                 latest_resumable_step=4,
+                latest_model_export_step=None,
                 latest_any_step=4,
             )
 
@@ -850,6 +907,26 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("SWEHERO_LOAD_DATALOADER_STATE", source)
         self.assertIn("_checkpoint_exclude_from_loading()", source)
         self.assertNotIn("exclude_from_loading=[\"dataloader\"]", source)
+
+    def test_swehero_config_routes_final_export_outside_checkpoint_dir(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (
+            repo_root / "torchtitan/torchtitan/experiments/swehero/config_registry.py"
+        ).read_text()
+
+        self.assertIn("final_model_export_folder=", source)
+        self.assertIn("SWEHERO_FINAL_EXPORT_FOLDER", source)
+        self.assertIn('"final_export"', source)
+
+    def test_torchtitan_checkpoint_manager_supports_separate_final_exports(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (
+            repo_root / "torchtitan/torchtitan/components/checkpoint.py"
+        ).read_text()
+
+        self.assertIn("final_model_export_folder", source)
+        self.assertIn("self.final_model_export_folder", source)
+        self.assertIn("checkpoint.final_model_export_folder must differ", source)
 
     def test_resume_contract_rejects_changed_training_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1488,6 +1565,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(env["SWEHERO_BUCKET_SEQ_LEN"], "32768")
         self.assertEqual(env["SWEHERO_ENABLE_FP8"], "1")
         self.assertEqual(env["SWEHERO_CUMULATIVE_STEPS"], "3")
+        self.assertEqual(
+            env["SWEHERO_FINAL_EXPORT_FOLDER"],
+            train.FINAL_MODEL_EXPORT_FOLDER,
+        )
         self.assertIn("-m", command)
         self.assertIn("torchtitan.train", command)
         self.assertIn("--module", command)

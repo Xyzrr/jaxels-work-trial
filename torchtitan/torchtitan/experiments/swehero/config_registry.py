@@ -160,6 +160,10 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
         checkpoint=CheckpointManager.Config(
             enable=True,
             interval=_env_int("SWEHERO_CHECKPOINT_INTERVAL", 25),
+            final_model_export_folder=_env(
+                "SWEHERO_FINAL_EXPORT_FOLDER",
+                "final_export",
+            ),
             initial_load_in_hf=True,
             initial_load_model_only=True,
             last_save_model_only=is_final_stage,

@@ -84,6 +84,7 @@ RUN_SPEC_SHA256_FILENAME = "run_spec.sha256"
 RESUME_CONTRACT_SCHEMA_VERSION = 1
 RESUME_CONTRACT_FILENAME = "resume_contract.json"
 REQUIRED_HF_ASSET_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
+FINAL_MODEL_EXPORT_FOLDER = "final_export"
 RESUME_ARG_FIELDS = (
     "model_id",
     "dataset_id",
@@ -176,6 +177,7 @@ RESUME_STAGE_ENV_KEYS = (
     "SWEHERO_WARMUP_STEPS",
     "SWEHERO_HF_ASSETS_PATH",
     "SWEHERO_TORCHTITAN_DUMP_FOLDER",
+    "SWEHERO_FINAL_EXPORT_FOLDER",
     "SWEHERO_PAD_TOKEN_ID",
     "SWEHERO_SEED",
     "SWEHERO_GLOBAL_BATCH_SIZE",
@@ -224,7 +226,9 @@ class BucketPlan:
 @dataclass(frozen=True)
 class ResumeCheckpointState:
     checkpoint_dir: Path
-    latest_resumable_step: int
+    final_export_dir: Path
+    latest_resumable_step: int | None
+    latest_model_export_step: int | None
     latest_any_step: int
 
 
@@ -463,6 +467,18 @@ def _run_spec_sha256_path(out_dir: Path) -> Path:
     return out_dir / RUN_SPEC_SHA256_FILENAME
 
 
+def _torchtitan_dump_dir(out_dir: Path) -> Path:
+    return out_dir / "torchtitan"
+
+
+def _checkpoint_dir(out_dir: Path) -> Path:
+    return _torchtitan_dump_dir(out_dir) / "checkpoint"
+
+
+def _final_model_export_dir(out_dir: Path) -> Path:
+    return _torchtitan_dump_dir(out_dir) / FINAL_MODEL_EXPORT_FOLDER
+
+
 def _checkpoint_step(path: Path) -> int | None:
     match = re.fullmatch(r"step-(\d+)", path.name)
     return int(match.group(1)) if match else None
@@ -472,17 +488,7 @@ def _has_dcp_checkpoint_metadata(path: Path) -> bool:
     return (path / ".metadata").is_file()
 
 
-def _has_any_checkpoint_metadata(path: Path) -> bool:
-    return _has_dcp_checkpoint_metadata(path) or (
-        path / "model.safetensors.index.json"
-    ).is_file()
-
-
-def _checkpoint_steps(
-    checkpoint_dir: Path,
-    *,
-    include_model_exports: bool,
-) -> list[int]:
+def _checkpoint_steps(checkpoint_dir: Path) -> list[int]:
     if not checkpoint_dir.is_dir():
         return []
 
@@ -491,12 +497,35 @@ def _checkpoint_steps(
         step = _checkpoint_step(path)
         if step is None:
             continue
-        has_metadata = (
-            _has_any_checkpoint_metadata(path)
-            if include_model_exports
-            else _has_dcp_checkpoint_metadata(path)
-        )
-        if has_metadata:
+        if _has_dcp_checkpoint_metadata(path):
+            steps.append(step)
+    return sorted(steps)
+
+
+def _model_export_steps(export_dir: Path) -> list[int]:
+    if not export_dir.is_dir():
+        return []
+
+    steps = []
+    for path in export_dir.iterdir():
+        step = _checkpoint_step(path)
+        if step is not None and (path / "model.safetensors.index.json").is_file():
+            steps.append(step)
+    return sorted(steps)
+
+
+def _legacy_model_export_steps(checkpoint_dir: Path) -> list[int]:
+    if not checkpoint_dir.is_dir():
+        return []
+
+    steps = []
+    for path in checkpoint_dir.iterdir():
+        step = _checkpoint_step(path)
+        if step is None:
+            continue
+        if not _has_dcp_checkpoint_metadata(path) and (
+            path / "model.safetensors.index.json"
+        ).is_file():
             steps.append(step)
     return sorted(steps)
 
@@ -511,28 +540,35 @@ def validate_resume_request(args: argparse.Namespace) -> ResumeCheckpointState |
     if args.download_hf_assets:
         raise ValueError("--resume cannot be combined with --download-hf-assets")
 
-    checkpoint_dir = args.out_dir / "torchtitan" / "checkpoint"
-    if not checkpoint_dir.is_dir():
+    checkpoint_dir = _checkpoint_dir(args.out_dir)
+    final_export_dir = _final_model_export_dir(args.out_dir)
+    resumable_steps = _checkpoint_steps(checkpoint_dir)
+    model_export_steps = _model_export_steps(final_export_dir)
+    legacy_export_steps = _legacy_model_export_steps(checkpoint_dir)
+    all_steps = sorted(
+        {*resumable_steps, *model_export_steps, *legacy_export_steps}
+    )
+    if not all_steps:
+        if not checkpoint_dir.is_dir() and not final_export_dir.is_dir():
+            raise FileNotFoundError(
+                "--resume requires an existing TorchTitan checkpoint directory "
+                f"or final export directory: {checkpoint_dir} or {final_export_dir}"
+            )
         raise FileNotFoundError(
-            f"--resume requires an existing TorchTitan checkpoint directory: {checkpoint_dir}"
+            "--resume found no DCP checkpoints or final model exports under "
+            f"{checkpoint_dir} or {final_export_dir}"
         )
 
-    resumable_steps = _checkpoint_steps(checkpoint_dir, include_model_exports=False)
-    all_steps = _checkpoint_steps(checkpoint_dir, include_model_exports=True)
-    if not resumable_steps:
-        latest = max(all_steps) if all_steps else None
-        suffix = (
-            f" Found only non-resumable model export checkpoint(s), latest step {latest}."
-            if latest is not None
-            else ""
-        )
-        raise RuntimeError(
-            "--resume requires at least one full DCP checkpoint with optimizer, "
-            f"scheduler, and train-state metadata under {checkpoint_dir}.{suffix}"
-        )
+    latest_model_export_step = (
+        max([*model_export_steps, *legacy_export_steps])
+        if (model_export_steps or legacy_export_steps)
+        else None
+    )
     return ResumeCheckpointState(
         checkpoint_dir=checkpoint_dir,
-        latest_resumable_step=max(resumable_steps),
+        final_export_dir=final_export_dir,
+        latest_resumable_step=max(resumable_steps) if resumable_steps else None,
+        latest_model_export_step=latest_model_export_step,
         latest_any_step=max(all_steps),
     )
 
@@ -743,14 +779,25 @@ def validate_resume_progress(
             f"latest checkpoint step {resume_state.latest_any_step} exceeds the "
             f"current plan total_steps {plan.total_steps}; refusing incompatible resume"
         )
-    if resume_state.latest_any_step > resume_state.latest_resumable_step:
-        if resume_state.latest_any_step == plan.total_steps:
+
+    if resume_state.latest_model_export_step is not None:
+        if resume_state.latest_model_export_step == plan.total_steps:
             return
+        latest_resumable = resume_state.latest_resumable_step or -1
+        if resume_state.latest_model_export_step > latest_resumable:
+            raise RuntimeError(
+                "latest checkpoint is a non-resumable export without optimizer/train-state "
+                f"metadata at step {resume_state.latest_model_export_step}, while "
+                f"latest full DCP checkpoint is step {resume_state.latest_resumable_step}. "
+                "Refusing because TorchTitan can only resume from full DCP "
+                "checkpoints."
+            )
+
+    if resume_state.latest_resumable_step is None:
         raise RuntimeError(
-            "latest checkpoint is a model export without optimizer/train-state "
-            f"metadata at step {resume_state.latest_any_step}, while latest full "
-            f"checkpoint is step {resume_state.latest_resumable_step}. Refusing "
-            "because TorchTitan would try to load the non-resumable export."
+            "--resume requires at least one full DCP checkpoint with optimizer, "
+            "scheduler, and train-state metadata unless the separated final model "
+            "export already completes the run."
         )
 
 
@@ -760,9 +807,9 @@ def stages_to_run_for_resume(
 ) -> tuple[BucketStage, ...]:
     if resume_state is None:
         return plan.stages
-    progress_step = resume_state.latest_resumable_step
-    if resume_state.latest_any_step == plan.total_steps:
-        progress_step = resume_state.latest_any_step
+    if resume_state.latest_model_export_step == plan.total_steps:
+        return ()
+    progress_step = resume_state.latest_resumable_step or 0
     return tuple(
         stage
         for stage in plan.stages
@@ -776,7 +823,7 @@ def should_load_dataloader_state_for_stage(
     stage: BucketStage,
     resume_state: ResumeCheckpointState | None,
 ) -> bool:
-    if resume_state is None:
+    if resume_state is None or resume_state.latest_resumable_step is None:
         return False
     checkpoint_step = resume_state.latest_resumable_step
     return stage_start_step < checkpoint_step < stage.cumulative_steps
@@ -3009,7 +3056,8 @@ def build_stage_env(
             "SWEHERO_CUMULATIVE_STEPS": str(stage.cumulative_steps),
             "SWEHERO_WARMUP_STEPS": str(warmup_steps),
             "SWEHERO_HF_ASSETS_PATH": str(args.hf_assets_path),
-            "SWEHERO_TORCHTITAN_DUMP_FOLDER": str(args.out_dir / "torchtitan"),
+            "SWEHERO_TORCHTITAN_DUMP_FOLDER": str(_torchtitan_dump_dir(args.out_dir)),
+            "SWEHERO_FINAL_EXPORT_FOLDER": FINAL_MODEL_EXPORT_FOLDER,
             "SWEHERO_PAD_TOKEN_ID": str(pad_token_id),
             "SWEHERO_SEED": str(args.seed),
             "SWEHERO_GLOBAL_BATCH_SIZE": str(args.global_batch_size),
@@ -3131,7 +3179,9 @@ def build_run_spec(
             "data_manifest": str(args.out_dir / "data" / "manifest.json"),
             "launcher_plan": str(args.out_dir / "launcher_plan.json"),
             "resume_contract": str(_resume_contract_path(args.out_dir)),
-            "torchtitan_dump": str(args.out_dir / "torchtitan"),
+            "torchtitan_dump": str(_torchtitan_dump_dir(args.out_dir)),
+            "resumable_checkpoints": str(_checkpoint_dir(args.out_dir)),
+            "final_model_exports": str(_final_model_export_dir(args.out_dir)),
         },
         "manifest": _resume_manifest_contract(manifest),
         "plan": {
@@ -3283,12 +3333,17 @@ def main(argv: list[str] | None = None) -> None:
         shutil.rmtree(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    tt_dump = args.out_dir / "torchtitan"
-    checkpoint_dir = tt_dump / "checkpoint"
+    checkpoint_dir = _checkpoint_dir(args.out_dir)
+    final_export_dir = _final_model_export_dir(args.out_dir)
     if checkpoint_dir.exists() and not (args.resume or args.dry_run):
         raise RuntimeError(
             f"{checkpoint_dir} already exists. Pass --resume to continue or "
             "--overwrite-output to start fresh."
+        )
+    if final_export_dir.exists() and not (args.resume or args.dry_run):
+        raise RuntimeError(
+            f"{final_export_dir} already exists. Pass --resume to inspect the "
+            "completed export or --overwrite-output to start fresh."
         )
 
     download_hf_assets_if_requested(args)
@@ -3349,8 +3404,9 @@ def main(argv: list[str] | None = None) -> None:
     stages_to_run = stages_to_run_for_resume(plan, resume_state)
     if resume_state is not None:
         print(
-            "Resuming from full checkpoint step "
-            f"{resume_state.latest_resumable_step}; "
+            "Resume state: "
+            f"latest_full_checkpoint={resume_state.latest_resumable_step}, "
+            f"latest_final_export={resume_state.latest_model_export_step}; "
             f"{len(stages_to_run)} bucket stage(s) remain."
         )
         if not stages_to_run:
