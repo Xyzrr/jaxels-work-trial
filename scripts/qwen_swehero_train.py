@@ -2326,9 +2326,10 @@ def _qwen_tool_call_text(tool_call: object) -> str:
     if arguments is None:
         arguments = {}
     return (
-        '\n<tool_call>\n{"name": "'
-        + name
-        + '", "arguments": '
+        "\n<tool_call>\n"
+        + '{"name": '
+        + json.dumps(name, ensure_ascii=False)
+        + ', "arguments": '
         + json.dumps(arguments, ensure_ascii=False)
         + "}\n</tool_call>"
     )

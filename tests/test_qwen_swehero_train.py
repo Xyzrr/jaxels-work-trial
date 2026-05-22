@@ -2472,6 +2472,117 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertNotIn("<|assistant|>", rendered)
         self.assertNotIn("<|tool_calls|>", rendered)
 
+    def test_tool_call_serialization_keeps_valid_json_payloads(self):
+        text = train._qwen_tool_call_text(
+            {
+                "function": {
+                    "name": 'quoted"tool',
+                    "arguments": {"cmd": 'printf "hello"'},
+                }
+            }
+        )
+        payload = text.removeprefix("\n<tool_call>\n").removesuffix("\n</tool_call>")
+
+        decoded = json.loads(payload)
+
+        self.assertEqual(decoded["name"], 'quoted"tool')
+        self.assertEqual(decoded["arguments"], {"cmd": 'printf "hello"'})
+
+    def test_tool_call_serialization_preserves_argument_type(self):
+        string_arguments = train._qwen_tool_call_text(
+            {
+                "function": {
+                    "name": "think",
+                    "arguments": '{"thought": "keep as string"}',
+                }
+            }
+        )
+        mapping_arguments = train._qwen_tool_call_text(
+            {"name": "execute_bash", "arguments": {"cmd": "pytest -q"}}
+        )
+
+        self.assertEqual(
+            json.loads(
+                string_arguments.removeprefix("\n<tool_call>\n").removesuffix(
+                    "\n</tool_call>"
+                )
+            ),
+            {"name": "think", "arguments": '{"thought": "keep as string"}'},
+        )
+        self.assertEqual(
+            json.loads(
+                mapping_arguments.removeprefix("\n<tool_call>\n").removesuffix(
+                    "\n</tool_call>"
+                )
+            ),
+            {"name": "execute_bash", "arguments": {"cmd": "pytest -q"}},
+        )
+
+    def test_openhands_messages_match_hf_qwen_chat_template_when_available(self):
+        hf_assets = Path(
+            os.environ.get(
+                "SWEHERO_TEST_HF_ASSETS_PATH",
+                "/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct",
+            )
+        )
+        if not hf_assets.exists():
+            self.skipTest("Qwen HF tokenizer assets are not available")
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            self.skipTest(f"transformers is not available: {exc}")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(hf_assets),
+            local_files_only=True,
+        )
+        cases = [
+            [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "reported issue"},
+                {
+                    "role": "assistant",
+                    "content": "assistant analysis",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "think",
+                                "arguments": {"thought": "consider options"},
+                            },
+                        },
+                        {
+                            "name": "execute_bash",
+                            "arguments": {"cmd": "pytest -q"},
+                        },
+                    ],
+                },
+                {"role": "tool", "content": "first observation"},
+                {"role": "tool", "content": "second observation"},
+                {"role": "assistant", "content": "done"},
+            ],
+            [
+                {"role": "user", "content": "reported issue"},
+                {"role": "assistant", "content": "done"},
+            ],
+        ]
+        for messages in cases:
+            with self.subTest(first_role=messages[0]["role"]):
+                expected = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+                rendered = "".join(
+                    text
+                    for text, _is_trainable in train.qwen_openhands_segments(
+                        {"trajectory": messages}
+                    )
+                )
+
+                self.assertEqual(rendered, expected)
+
     def test_stage_environment_and_torchrun_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "run"
