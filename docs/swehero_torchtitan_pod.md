@@ -169,6 +169,19 @@ The production run should use the same wrapper without `--num-examples`, so the
 trainer tokenizes the full cached one-rollout dataset and uses the full bucket
 plan.
 
+## Launch Argument Files
+
+Long production launch commands can be placed in a reviewed argument file and
+passed with argparse's `@file` syntax:
+
+```bash
+scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
+```
+
+Each non-empty line in the argument file is parsed like shell input, and lines
+starting with `#` are ignored. Flags written after `@configs/swehero-7b.args`
+on the command line override earlier values from the file.
+
 ## Bucket Curriculum
 
 The launcher defaults to `--bucket-curriculum short-to-long`, which preserves

@@ -30,6 +30,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -461,6 +462,14 @@ def _default_torchrun_bin() -> str:
     if candidate.exists():
         return str(candidate)
     return "torchrun"
+
+
+class LaunchArgumentParser(argparse.ArgumentParser):
+    def convert_arg_line_to_args(self, arg_line: str) -> list[str]:
+        stripped = arg_line.strip()
+        if not stripped or stripped.startswith("#"):
+            return []
+        return shlex.split(stripped)
 
 
 def _argv_for_env_file_scan(argv: list[str] | None) -> list[str]:
@@ -1415,8 +1424,9 @@ def parse_args(
         if env_file_default is None
         else env_file_default
     )
-    parser = argparse.ArgumentParser(
-        description="Materialize bucketed SWE-HERO training data and launch TorchTitan."
+    parser = LaunchArgumentParser(
+        description="Materialize bucketed SWE-HERO training data and launch TorchTitan.",
+        fromfile_prefix_chars="@",
     )
     parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", MODEL_ID))
     parser.add_argument(

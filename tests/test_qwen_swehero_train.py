@@ -435,6 +435,33 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.num_examples, 3)
         self.assertTrue(args.enable_fp8)
 
+    def test_launch_argfile_supports_comments_quoting_and_cli_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "configured run"
+            argfile = Path(tmp) / "launch.args"
+            argfile.write_text(
+                "\n".join(
+                    [
+                        "# reviewed production launch flags",
+                        f"--out-dir {shlex.quote(str(out_dir))}",
+                        "--buckets 1024",
+                        "--bucket-cp 1024:1",
+                        "--max-length 1024",
+                        "--num-examples 4",
+                        "--no-enable-fp8",
+                    ]
+                )
+            )
+
+            args = train.parse_args([f"@{argfile}", "--num-examples", "7"])
+
+        self.assertEqual(args.out_dir, out_dir)
+        self.assertEqual(args.buckets, "1024")
+        self.assertEqual(args.bucket_cp, "1024:1")
+        self.assertEqual(args.max_length, 1024)
+        self.assertEqual(args.num_examples, 7)
+        self.assertFalse(args.enable_fp8)
+
     def test_process_env_overrides_launch_env_file_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / ".env"
