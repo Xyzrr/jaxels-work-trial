@@ -24,10 +24,12 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_PATH="${TORCHTITAN_POD_VENV:-/workspace/venvs/torchtitan-swehero-cu128}"
 REQUIREMENTS_PATH="${TORCHTITAN_POD_REQUIREMENTS:-$ROOT_DIR/requirements/torchtitan-pod-cu128.txt}"
 LOCK_PATH="${TORCHTITAN_POD_LOCK:-$ROOT_DIR/requirements/torchtitan-pod-cu128.lock}"
-PYTHON_BIN="${PYTHON:-python3}"
+PYTHON_BIN="${PYTHON:-}"
 UV_TOOL_DIR="${UV_TOOL_DIR:-/workspace/uv}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.cache/uv}"
+UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/workspace/python}"
 readonly TORCHTITAN_POD_UV_VERSION="0.11.16"
+readonly TORCHTITAN_POD_PYTHON_VERSION="3.10.12"
 readonly UV_X86_64_UNKNOWN_LINUX_GNU_SHA256="74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
 if [[ -n "${UV_VERSION:-}" && "$UV_VERSION" != "$TORCHTITAN_POD_UV_VERSION" ]]; then
   cat >&2 <<EOF
@@ -132,10 +134,23 @@ ensure_uv() {
     echo "uv $UV_VERSION is required. Install it or set UV_BIN=/path/to/uv." >&2
     exit 1
   fi
+  local bootstrap_python="${PYTHON_BIN:-python3}"
+  if ! command -v "$bootstrap_python" >/dev/null 2>&1; then
+    cat >&2 <<EOF
+Pinned uv binary is missing and no bootstrap Python is available.
+Expected uv at:
+  $uv_bin
+
+Either restore the pinned uv binary under /workspace or set PYTHON to a working
+interpreter for one-time uv bootstrapping.
+EOF
+    exit 1
+  fi
+
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   mkdir -p "$managed_dir"
-  "$PYTHON_BIN" - "$UV_VERSION" "$UV_X86_64_UNKNOWN_LINUX_GNU_SHA256" "$tmp_dir/uv.tar.gz" <<'PY'
+  "$bootstrap_python" - "$UV_VERSION" "$UV_X86_64_UNKNOWN_LINUX_GNU_SHA256" "$tmp_dir/uv.tar.gz" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -165,7 +180,29 @@ PY
   printf '%s\n' "$uv_bin"
 }
 
+ensure_python() {
+  local uv_bin="$1"
+  if [[ -n "$PYTHON_BIN" ]]; then
+    if [[ ! -x "$PYTHON_BIN" ]] && ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+      echo "PYTHON is not executable or on PATH: $PYTHON_BIN" >&2
+      exit 1
+    fi
+    printf '%s\n' "$PYTHON_BIN"
+    return
+  fi
+
+  mkdir -p "$UV_PYTHON_INSTALL_DIR"
+  UV_PYTHON_DOWNLOADS=automatic "$uv_bin" python install "$TORCHTITAN_POD_PYTHON_VERSION" \
+    --install-dir "$UV_PYTHON_INSTALL_DIR" \
+    --no-bin >&2
+  UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" \
+    "$uv_bin" python find "$TORCHTITAN_POD_PYTHON_VERSION" \
+      --managed-python \
+      --resolve-links
+}
+
 UV_BIN="$(ensure_uv)"
+PYTHON_BIN="$(ensure_python "$UV_BIN")"
 export UV_CACHE_DIR
 export UV_INDEX_STRATEGY="${UV_INDEX_STRATEGY:-unsafe-best-match}"
 export UV_LINK_MODE="${UV_LINK_MODE:-hardlink}"

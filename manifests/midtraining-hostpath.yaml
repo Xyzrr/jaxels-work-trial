@@ -16,7 +16,16 @@ spec:
     - name: trainer
       image: nvidia/cuda:12.8.0-base-ubuntu22.04
       imagePullPolicy: IfNotPresent
-      command: ["bash", "-lc", "sleep infinity"]
+      command:
+        - bash
+        - -lc
+        - |
+          export UV_CACHE_DIR=/workspace/.cache/uv
+          export UV_PYTHON_INSTALL_DIR=/workspace/python
+          /workspace/uv/uv-0.11.16/uv python install 3.10.12 \
+            --install-dir /workspace/python \
+            --no-bin
+          sleep infinity
       resources:
         limits:
           nvidia.com/gpu: 8

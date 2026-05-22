@@ -19,6 +19,12 @@ uses `hostPath.path: /workspace` with `type: Directory`, so the GPU node must
 prepare `/workspace` as a real directory or mountpoint before the pod is
 created. Do not rely on a host symlink for this path.
 
+The CUDA base image does not include Python. The pod entrypoint uses the pinned
+`/workspace/uv/uv-0.11.16/uv` binary to install CPython 3.10.12 under
+`/workspace/python` before idling, so the persisted uv-managed venv under
+`/workspace/venvs/torchtitan-swehero-cu128` has a valid interpreter after every
+pod recreation without relying on apt-managed Python.
+
 The launcher pins the base checkpoint to
 `Qwen/Qwen2.5-Coder-7B-Instruct@c03e6d358207e414f1eca0bb1891e29f1db0e242`.
 That revision is passed to Hugging Face asset downloads, recorded in the data
