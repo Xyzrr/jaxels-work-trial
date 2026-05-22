@@ -227,3 +227,26 @@ Profiler traces are written under the TorchTitan dump folder, normally
 `$OUT_DIR/torchtitan/profiling/traces`. CUDA memory snapshots can be captured
 with `--enable-memory-snapshot`; by default those files are written under
 `$OUT_DIR/torchtitan/profiling/memory_snapshot`.
+
+## Multi-Node Controls
+
+The launcher defaults to the current single-node pod contract:
+`--nnodes 1 --node-rank 0 --rdzv-backend c10d --rdzv-endpoint localhost:0`.
+That preserves the existing 8xH100 launch path and the paper-aligned 7B
+scale-study recipe.
+
+Multi-node launch is opt-in. For `--nnodes > 1`, provide a stable rendezvous
+endpoint and id, for example:
+
+```bash
+--nnodes 2 \
+--node-rank 0 \
+--rdzv-endpoint train-master.example:29400 \
+--rdzv-id qwen25-swehero-7b-run-001
+```
+
+Each node must use the same run spec, dataset artifact, model assets, bucket
+plan, and rendezvous settings, with only `--node-rank` changing per node. The
+launcher rejects multi-node settings that still point at `localhost:0` or omit
+`--rdzv-id`, so a multi-node attempt cannot silently fall back to a single-node
+rendezvous.

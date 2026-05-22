@@ -372,6 +372,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.min_learning_rate, 1e-8)
         self.assertEqual(args.warmup_ratio, 0.1)
         self.assertEqual(args.nproc_per_node, 8)
+        self.assertEqual(args.nnodes, 1)
+        self.assertEqual(args.node_rank, 0)
+        self.assertEqual(args.rdzv_backend, "c10d")
+        self.assertEqual(args.rdzv_endpoint, "localhost:0")
+        self.assertEqual(args.rdzv_id, "")
         self.assertTrue(args.enable_fp8)
         self.assertEqual(args.attention_backend, "sdpa")
         self.assertEqual(args.bucket_curriculum, train.DEFAULT_BUCKET_CURRICULUM)
@@ -499,6 +504,27 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 "--profiler-freq must be greater",
             ),
             (["--nproc-per-node", "0"], "--nproc-per-node"),
+            (["--nnodes", "0"], "--nnodes"),
+            (["--node-rank", "-1"], "--node-rank"),
+            (["--node-rank", "1"], "--node-rank must be 0"),
+            (
+                [
+                    "--nnodes",
+                    "2",
+                    "--node-rank",
+                    "2",
+                    "--rdzv-endpoint",
+                    "train-master:29400",
+                    "--rdzv-id",
+                    "run",
+                ],
+                "--node-rank must be less than --nnodes",
+            ),
+            (["--nnodes", "2"], "--rdzv-id is required"),
+            (
+                ["--nnodes", "2", "--rdzv-id", "run"],
+                "--rdzv-endpoint must be a stable host:port",
+            ),
             (
                 ["--smoke-synthetic-examples-per-bucket", "0"],
                 "--smoke-synthetic-examples-per-bucket",
@@ -2432,9 +2458,13 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(
             run_spec["plan"]["bucket_curriculum"], train.DEFAULT_BUCKET_CURRICULUM
         )
+        self.assertEqual(run_spec["plan"]["distributed"]["nnodes"], 1)
+        self.assertEqual(run_spec["plan"]["distributed"]["world_size"], 8)
         self.assertEqual(
             launcher_plan["bucket_curriculum"], train.DEFAULT_BUCKET_CURRICULUM
         )
+        self.assertEqual(launcher_plan["distributed"]["nnodes"], 1)
+        self.assertEqual(launcher_plan["distributed"]["world_size"], 8)
         self.assertEqual(run_spec["plan"]["total_steps"], 1)
         self.assertEqual(
             run_spec["manifest"]["data_provenance"]["included"]["source_ids"],
@@ -2863,6 +2893,47 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("swehero", command)
         self.assertIn("--config", command)
         self.assertIn("qwen25_coder7b_direct_to_hero", command)
+        self.assertNotIn("--nnodes", command)
+        self.assertNotIn("--node_rank", command)
+        self.assertIn("localhost:0", command)
+
+    def test_multinode_torchrun_command_requires_explicit_rendezvous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--nnodes",
+                    "2",
+                    "--node-rank",
+                    "1",
+                    "--rdzv-endpoint",
+                    "train-master:29400",
+                    "--rdzv-id",
+                    "swehero-run",
+                ]
+            )
+            buckets = train.parse_bucket_list(args.buckets)
+            bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+
+            train.validate_launch_inputs(
+                args,
+                buckets=buckets,
+                bucket_cp=bucket_cp,
+            )
+            command = train.build_torchrun_command(args)
+            distributed = train._distributed_launch_summary(args)
+
+        self.assertIn("--nnodes", command)
+        self.assertIn("2", command)
+        self.assertIn("--node_rank", command)
+        self.assertIn("1", command)
+        self.assertIn("--rdzv_endpoint", command)
+        self.assertIn("train-master:29400", command)
+        self.assertIn("--rdzv_id", command)
+        self.assertIn("swehero-run", command)
+        self.assertEqual(distributed["world_size"], 16)
+        self.assertEqual(distributed["rdzv_id"], "swehero-run")
 
     def test_launch_preflight_checks_executable_assets_and_bucket_files(self):
         with tempfile.TemporaryDirectory() as tmp:

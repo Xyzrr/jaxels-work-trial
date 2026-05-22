@@ -181,6 +181,11 @@ RESUME_ARG_FIELDS = (
     "wandb_run_notes",
     "wandb_mode",
     "nproc_per_node",
+    "nnodes",
+    "node_rank",
+    "rdzv_backend",
+    "rdzv_endpoint",
+    "rdzv_id",
 )
 RUN_SPEC_ARG_FIELDS = (
     "model_id",
@@ -248,6 +253,11 @@ RUN_SPEC_ARG_FIELDS = (
     "wandb_mode",
     "post_training_eval_command",
     "nproc_per_node",
+    "nnodes",
+    "node_rank",
+    "rdzv_backend",
+    "rdzv_endpoint",
+    "rdzv_id",
     "torchrun_bin",
     "log_rank",
     "torchrun_log_rank_filter",
@@ -636,6 +646,21 @@ def _validate_rank_filter(
             return
 
 
+def _rdzv_endpoint_is_local_or_ephemeral(endpoint: str | None) -> bool:
+    if endpoint is None or not endpoint.strip():
+        return True
+    normalized = endpoint.strip()
+    host = normalized
+    port = ""
+    if normalized.startswith("[") and "]:" in normalized:
+        host, port = normalized[1:].split("]:", 1)
+    elif ":" in normalized:
+        host, port = normalized.rsplit(":", 1)
+    host = host.strip().lower()
+    port = port.strip()
+    return host in {"localhost", "127.0.0.1", "::1"} or port in {"", "0"}
+
+
 def validate_launch_inputs(
     args: argparse.Namespace,
     *,
@@ -668,6 +693,8 @@ def validate_launch_inputs(
         ("--profiler-active", args.profiler_active, 1),
         ("--profiler-warmup", args.profiler_warmup, 0),
         ("--nproc-per-node", args.nproc_per_node, 1),
+        ("--nnodes", args.nnodes, 1),
+        ("--node-rank", args.node_rank, 0),
     )
     for name, value, minimum in int_minima:
         _add_min_error(errors, name=name, value=value, minimum=minimum)
@@ -805,6 +832,19 @@ def validate_launch_inputs(
             "--profiler-freq must be greater than or equal to "
             "--profiler-active + --profiler-warmup"
         )
+
+    if args.nnodes == 1 and args.node_rank != 0:
+        errors.append("--node-rank must be 0 when --nnodes=1")
+    if args.nnodes > 1:
+        if args.node_rank >= args.nnodes:
+            errors.append("--node-rank must be less than --nnodes")
+        if not args.rdzv_id:
+            errors.append("--rdzv-id is required when --nnodes > 1")
+        if _rdzv_endpoint_is_local_or_ephemeral(args.rdzv_endpoint):
+            errors.append(
+                "--rdzv-endpoint must be a stable host:port reachable from all "
+                "nodes when --nnodes > 1"
+            )
 
     if args.nproc_per_node > 0 and args.local_batch_size > 0:
         for bucket in buckets:
@@ -1822,6 +1862,36 @@ def parse_args(
         type=int,
         default=_env_int("NPROC_PER_NODE", 8),
         help="GPU processes per node. Target pod is 8xH100.",
+    )
+    parser.add_argument(
+        "--nnodes",
+        type=int,
+        default=_env_int("NNODES", 1),
+        help="Number of torchrun nodes. Defaults to the current single-node pod.",
+    )
+    parser.add_argument(
+        "--node-rank",
+        type=int,
+        default=_env_int("NODE_RANK", 0),
+        help="Rank of this node for multi-node torchrun launches.",
+    )
+    parser.add_argument(
+        "--rdzv-backend",
+        default=os.environ.get("RDZV_BACKEND", "c10d"),
+        help="torchrun rendezvous backend.",
+    )
+    parser.add_argument(
+        "--rdzv-endpoint",
+        default=os.environ.get("RDZV_ENDPOINT", "localhost:0"),
+        help=(
+            "torchrun rendezvous endpoint. Multi-node launches must provide a "
+            "stable host:port reachable from every node."
+        ),
+    )
+    parser.add_argument(
+        "--rdzv-id",
+        default=os.environ.get("RDZV_ID", ""),
+        help="torchrun rendezvous id. Required when --nnodes > 1.",
     )
     parser.add_argument(
         "--torchrun-bin",
@@ -4595,18 +4665,35 @@ def build_stage_env(
     return env
 
 
+def _distributed_launch_summary(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "nnodes": args.nnodes,
+        "node_rank": args.node_rank,
+        "nproc_per_node": args.nproc_per_node,
+        "world_size": args.nnodes * args.nproc_per_node,
+        "rdzv_backend": args.rdzv_backend,
+        "rdzv_endpoint": args.rdzv_endpoint,
+        "rdzv_id": args.rdzv_id or None,
+    }
+
+
 def build_torchrun_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.torchrun_bin,
         "--nproc_per_node",
         str(args.nproc_per_node),
         "--rdzv_backend",
-        "c10d",
+        args.rdzv_backend,
         "--rdzv_endpoint",
-        "localhost:0",
+        args.rdzv_endpoint,
         "--tee",
         "3",
     ]
+    if args.nnodes != 1 or args.node_rank != 0:
+        command.extend(["--nnodes", str(args.nnodes)])
+        command.extend(["--node_rank", str(args.node_rank)])
+    if args.rdzv_id:
+        command.extend(["--rdzv_id", args.rdzv_id])
     if args.torchrun_log_rank_filter:
         command.extend(["--local-ranks-filter", args.torchrun_log_rank_filter])
     command.extend(
@@ -4700,6 +4787,7 @@ def build_run_spec(
         "manifest": _resume_manifest_contract(manifest),
         "plan": {
             "bucket_curriculum": args.bucket_curriculum,
+            "distributed": _distributed_launch_summary(args),
             "total_steps": plan.total_steps,
             "warmup_steps": plan.warmup_steps,
             "stages": [
@@ -5040,6 +5128,7 @@ def _build_stage_status_document(
         },
         "launch": {
             "resume": bool(args.resume),
+            "distributed": _distributed_launch_summary(args),
             "resume_state": _resume_state_status_record(resume_state),
             "stages_to_run": [
                 _stage_status_id(index, stage)
@@ -5683,6 +5772,7 @@ def _write_launcher_plan(
             for stage in plan.stages
         ],
         "bucket_curriculum": args.bucket_curriculum,
+        "distributed": _distributed_launch_summary(args),
         "total_steps": plan.total_steps,
         "warmup_steps": plan.warmup_steps,
         "manifest": str(args.out_dir / "data" / "manifest.json"),
