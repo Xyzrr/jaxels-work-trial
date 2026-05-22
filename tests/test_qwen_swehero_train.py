@@ -23,6 +23,12 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual(args.model_id, train.MODEL_ID)
         self.assertEqual(args.dataset_id, train.DATASET_ID)
+        self.assertEqual(args.dataset_path, train.DEFAULT_DATASET_PATH)
+        self.assertEqual(args.source_dataset_id, train.SOURCE_DATASET_ID)
+        self.assertEqual(args.source_dataset_revision, train.SOURCE_DATASET_REVISION)
+        self.assertEqual(args.num_examples, 0)
+        self.assertEqual(args.max_streamed_examples, 0)
+        self.assertTrue(args.build_dataset_if_missing)
         self.assertEqual(args.max_length, train.PAPER_CONTEXT_LENGTH)
         self.assertEqual(args.num_train_epochs, 3.0)
         self.assertEqual(args.global_batch_size, 32)
@@ -108,6 +114,55 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 nproc_per_node=8,
                 attention_backend="varlen",
             )
+
+    def test_source_dataset_command_builds_pod_local_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = Path(tmp) / "dataset"
+            args = train.parse_args(
+                [
+                    "--dataset-path",
+                    str(dataset_path),
+                    "--source-dataset-revision",
+                    "source-sha",
+                    "--source-dataset-rows-per-shard",
+                    "123",
+                    "--source-dataset-build-batch-size",
+                    "17",
+                ]
+            )
+            command = train.build_source_dataset_command(args)
+
+        self.assertIn("prepare_swehero_historical_one_rollout.py", " ".join(command))
+        self.assertIn("--dataset-id", command)
+        self.assertEqual(command[command.index("--dataset-id") + 1], train.SOURCE_DATASET_ID)
+        self.assertIn("--revision", command)
+        self.assertEqual(command[command.index("--revision") + 1], "source-sha")
+        self.assertIn("--output-dir", command)
+        self.assertEqual(command[command.index("--output-dir") + 1], str(dataset_path))
+        self.assertIn("--rows-per-shard", command)
+        self.assertEqual(command[command.index("--rows-per-shard") + 1], "123")
+        self.assertIn("--batch-size", command)
+        self.assertEqual(command[command.index("--batch-size") + 1], "17")
+        self.assertNotIn("--overwrite", command)
+
+    def test_dataset_revision_alias_pins_source_revision(self):
+        args = train.parse_args(["--dataset-revision", "legacy-sha"])
+
+        self.assertEqual(args.source_dataset_revision, "legacy-sha")
+
+    def test_training_dataset_files_expect_hf_style_parquet_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_dir = Path(tmp) / "dataset"
+            data_dir = dataset_dir / "data"
+            data_dir.mkdir(parents=True)
+            later = data_dir / "train-00001-of-00002.parquet"
+            earlier = data_dir / "train-00000-of-00002.parquet"
+            later.write_bytes(b"")
+            earlier.write_bytes(b"")
+
+            files = train._training_dataset_files(dataset_dir)
+
+        self.assertEqual(files, [earlier, later])
 
     def test_encode_masks_user_system_and_tool_observations(self):
         example = {

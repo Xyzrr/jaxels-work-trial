@@ -4,8 +4,8 @@ This is the production entrypoint for the Qwen2.5-Coder-7B SWE-HERO
 scale-study run. It intentionally keeps the paper-facing recipe visible:
 
 * Qwen2.5-Coder-7B-Instruct initialized from the Hugging Face checkpoint;
-* public ``nvidia/SWE-Hero-openhands-trajectories`` traces as the current
-  canonical data source;
+* one-rollout SWE-Hero training artifact generated from the pinned public
+  historical ``nvidia/SWE-Hero-openhands-trajectories`` revision;
 * three SFT epochs, global batch size 32, cosine LR 1e-5 -> 1e-8 with 0.1
   warmup;
 * 128k YaRN context extension from Qwen2.5's native 32k context;
@@ -42,19 +42,24 @@ from typing import Any
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from scripts import prepare_swehero_historical_one_rollout as one_rollout
 from scripts import qwen_swehero_smoke as smoke
 
 
 IGNORE_INDEX = -100
 
 MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
-DATASET_ID = "nvidia/SWE-Hero-openhands-trajectories"
+TRAINING_DATASET_NAME = "swe-hero-openhands-trajectories-5b2ed21-one-rollout"
+DATASET_ID = TRAINING_DATASET_NAME
+SOURCE_DATASET_ID = one_rollout.DATASET_ID
+SOURCE_DATASET_REVISION = one_rollout.HISTORICAL_REVISION
 PAPER_CONTEXT_LENGTH = 131_072
 QWEN_NATIVE_CONTEXT_LENGTH = 32_768
 DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-torchtitan")
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
-DEFAULT_NUM_EXAMPLES = 64
-DEFAULT_MAX_STREAMED_EXAMPLES = 1_024
+DEFAULT_DATASET_PATH = Path("/workspace/datasets") / TRAINING_DATASET_NAME
+DEFAULT_NUM_EXAMPLES = 0
+DEFAULT_MAX_STREAMED_EXAMPLES = 0
 DEFAULT_BUCKETS = (8_192, 16_384, 32_768, 65_536, PAPER_CONTEXT_LENGTH)
 DEFAULT_BUCKET_CP = {
     8_192: 1,
@@ -274,7 +279,7 @@ def build_bucket_plan(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Materialize a bucketed SWE-HERO smoke subset and launch TorchTitan."
+        description="Materialize bucketed SWE-HERO training data and launch TorchTitan."
     )
     parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", MODEL_ID))
     parser.add_argument(
@@ -283,7 +288,59 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset-revision",
         default=os.environ.get("DATASET_REVISION"),
-        help="Optional Hugging Face dataset revision to materialize.",
+        help=(
+            "Deprecated alias for --source-dataset-revision. Kept so older "
+            "pod commands still pin the same source revision."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        default=_env_path("DATASET_PATH", DEFAULT_DATASET_PATH),
+        help=(
+            "Local one-rollout SWE-Hero dataset artifact. On pods this defaults "
+            "to /workspace/datasets/... and is built automatically when missing."
+        ),
+    )
+    parser.add_argument(
+        "--source-dataset-id",
+        default=os.environ.get("SOURCE_DATASET_ID", SOURCE_DATASET_ID),
+        help="Public source dataset used to build --dataset-path when missing.",
+    )
+    parser.add_argument(
+        "--source-dataset-revision",
+        default=(
+            os.environ.get("SOURCE_DATASET_REVISION")
+            or os.environ.get("DATASET_REVISION")
+            or SOURCE_DATASET_REVISION
+        ),
+        help="Pinned source dataset revision used to build --dataset-path.",
+    )
+    parser.add_argument(
+        "--build-dataset-if-missing",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("BUILD_DATASET_IF_MISSING", True),
+        help="Build --dataset-path from the pinned source dataset when it is absent.",
+    )
+    parser.add_argument(
+        "--rebuild-source-dataset",
+        action="store_true",
+        default=_env_flag("REBUILD_SOURCE_DATASET", False),
+        help="Rebuild --dataset-path from the pinned source dataset before tokenizing.",
+    )
+    parser.add_argument(
+        "--source-dataset-rows-per-shard",
+        type=int,
+        default=_env_int(
+            "SOURCE_DATASET_ROWS_PER_SHARD", one_rollout.DEFAULT_ROWS_PER_SHARD
+        ),
+        help="Rows per Parquet shard when building --dataset-path.",
+    )
+    parser.add_argument(
+        "--source-dataset-build-batch-size",
+        type=int,
+        default=_env_int("SOURCE_DATASET_BUILD_BATCH_SIZE", 64),
+        help="Parquet read batch size when building --dataset-path.",
     )
     parser.add_argument(
         "--out-dir",
@@ -317,7 +374,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--num-examples",
         type=int,
         default=_env_int("NUM_EXAMPLES", DEFAULT_NUM_EXAMPLES),
-        help="Usable examples to keep for the current smoke run.",
+        help="Usable examples to keep. Defaults to 0, meaning all examples.",
     )
     parser.add_argument(
         "--max-streamed-examples",
@@ -542,7 +599,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "parity check for the Qwen2.5-Coder-7B-Instruct initial load."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.dataset_revision:
+        args.source_dataset_revision = args.dataset_revision
+    return args
 
 
 def _run_git(args: list[str]) -> str | None:
@@ -582,6 +642,114 @@ def _dataset_revision_info(dataset_id: str, revision: str | None) -> dict[str, A
             "resolved_sha": None,
             "lookup_error": repr(exc),
         }
+
+
+def _training_dataset_files(dataset_path: Path) -> list[Path]:
+    if dataset_path.is_file():
+        if dataset_path.suffix != ".parquet":
+            raise ValueError(f"Expected a Parquet file, found {dataset_path}")
+        return [dataset_path]
+
+    data_dir = dataset_path / "data"
+    search_dir = data_dir if data_dir.exists() else dataset_path
+    files = sorted(search_dir.glob("*.parquet"))
+    if not files:
+        raise FileNotFoundError(
+            f"No Parquet training shards found under {dataset_path}. Expected "
+            "a Hugging Face-style dataset directory with data/*.parquet."
+        )
+    return files
+
+
+def _dataset_artifact_metadata(dataset_path: Path) -> dict[str, Any]:
+    metadata_path = dataset_path / "metadata.json"
+    selection_manifest_path = dataset_path / "selection_manifest.jsonl"
+    data_files = _training_dataset_files(dataset_path)
+    metadata: dict[str, Any] = {}
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except json.JSONDecodeError as exc:
+            metadata = {"metadata_json_error": repr(exc)}
+
+    return {
+        "path": str(dataset_path),
+        "metadata": metadata,
+        "metadata_json_sha256": _hash_file(metadata_path),
+        "selection_manifest_sha256": _hash_file(selection_manifest_path),
+        "data_files": [
+            {
+                "path": str(path),
+                "bytes": path.stat().st_size,
+                "sha256": _hash_file(path),
+            }
+            for path in data_files
+        ],
+        "total_data_bytes": sum(path.stat().st_size for path in data_files),
+    }
+
+
+def build_source_dataset_command(args: argparse.Namespace) -> list[str]:
+    repo_root = Path(__file__).resolve().parents[1]
+    command = [
+        sys.executable,
+        str(repo_root / "scripts" / "prepare_swehero_historical_one_rollout.py"),
+        "--dataset-id",
+        args.source_dataset_id,
+        "--revision",
+        args.source_dataset_revision,
+        "--output-dir",
+        str(args.dataset_path),
+        "--rows-per-shard",
+        str(args.source_dataset_rows_per_shard),
+        "--batch-size",
+        str(args.source_dataset_build_batch_size),
+    ]
+    if args.rebuild_source_dataset:
+        command.append("--overwrite")
+    return command
+
+
+def ensure_training_dataset(args: argparse.Namespace) -> None:
+    if args.dataset_path.exists() and not args.rebuild_source_dataset:
+        try:
+            _training_dataset_files(args.dataset_path)
+            return
+        except FileNotFoundError:
+            if not args.build_dataset_if_missing:
+                raise
+
+    if not (args.build_dataset_if_missing or args.rebuild_source_dataset):
+        raise FileNotFoundError(
+            f"{args.dataset_path} is missing. Either create it on the pod, or "
+            "rerun with --build-dataset-if-missing."
+        )
+
+    command = build_source_dataset_command(args)
+    if (
+        args.dataset_path.exists()
+        and any(args.dataset_path.iterdir())
+        and "--overwrite" not in command
+    ):
+        command.append("--overwrite")
+    print("Preparing SWE-Hero training dataset artifact:")
+    print(" ".join(command))
+    subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[1])
+
+
+def load_training_dataset(args: argparse.Namespace):
+    from datasets import load_dataset
+
+    data_files = [str(path) for path in _training_dataset_files(args.dataset_path)]
+    raw = load_dataset(
+        "parquet",
+        data_files={"train": data_files},
+        split="train",
+        streaming=True,
+    )
+    if args.shuffle_buffer > 0:
+        raw = raw.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
+    return raw
 
 
 def _hash_file(path: Path) -> str | None:
@@ -628,10 +796,18 @@ def _package_versions() -> dict[str, str | None]:
 
 
 def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
+    dataset_scope = (
+        "all materialized examples"
+        if args.num_examples == 0
+        else f"capped at {args.num_examples} examples for a smoke run"
+    )
     return {
         "kept": {
             "base_model": args.model_id,
             "dataset": args.dataset_id,
+            "dataset_path": str(args.dataset_path),
+            "source_dataset": args.source_dataset_id,
+            "source_dataset_revision": args.source_dataset_revision,
             "epochs": args.num_train_epochs,
             "global_batch_size": args.global_batch_size,
             "lr_schedule": "cosine",
@@ -645,14 +821,14 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
         },
         "paper_caveats": [
             "The paper reports direct-to-hero as a 32B ablation; this 7B run is a scale-study extension.",
-            "The public Hugging Face SWE-HERO release is used as canonical even though its row count differs from the paper wording.",
+            "The one-rollout public training artifact is generated from the closest public historical SWE-Hero revision and records the public-column filter limitation in metadata.json.",
         ],
         "intentional_engineering_deltas": [
             "TorchTitan distributed full-model SFT replaces the earlier local Transformers smoke script.",
             "FSDP uses BF16 mixed-precision parameters/reductions; FP8 is applied only to TorchTitan linear layers selected by its converter.",
             "Length buckets with per-bucket CP replace static 128k padding.",
             "TorchTitan VarlenAttention currently does not support CP, so CP buckets use the supported SDPA/Flex attention path.",
-            f"This smoke run materializes {args.num_examples} examples while the filtered production dataset is being prepared.",
+            f"The tokenized bucket manifest covers {dataset_scope}.",
         ],
     }
 
@@ -897,8 +1073,7 @@ def _load_manifest(out_dir: Path) -> dict[str, Any]:
     return json.loads(manifest_path.read_text())
 
 
-def materialize_smoke_subset(args: argparse.Namespace) -> dict[str, Any]:
-    from datasets import load_dataset
+def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
     data_dir = args.out_dir / "data"
@@ -918,13 +1093,7 @@ def materialize_smoke_subset(args: argparse.Namespace) -> dict[str, Any]:
     streamed_examples = 0
     usable_examples = 0
 
-    load_kwargs: dict[str, Any] = {"split": "train", "streaming": True}
-    if args.dataset_revision:
-        load_kwargs["revision"] = args.dataset_revision
-
-    raw = load_dataset(args.dataset_id, **load_kwargs)
-    if args.shuffle_buffer > 0:
-        raw = raw.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
+    raw = load_training_dataset(args)
 
     try:
         for example in raw:
@@ -955,9 +1124,12 @@ def materialize_smoke_subset(args: argparse.Namespace) -> dict[str, Any]:
                     length_histogram[rounded_length] += 1
                     usable_examples += 1
 
-            if usable_examples >= args.num_examples:
+            if args.num_examples > 0 and usable_examples >= args.num_examples:
                 break
-            if streamed_examples >= args.max_streamed_examples:
+            if (
+                args.max_streamed_examples > 0
+                and streamed_examples >= args.max_streamed_examples
+            ):
                 break
     finally:
         for handle in handles.values():
@@ -974,8 +1146,11 @@ def materialize_smoke_subset(args: argparse.Namespace) -> dict[str, Any]:
         "created_at_unix": time.time(),
         "model_id": args.model_id,
         "dataset_id": args.dataset_id,
-        "dataset_revision": _dataset_revision_info(
-            args.dataset_id, args.dataset_revision
+        "dataset_path": str(args.dataset_path),
+        "dataset_artifact": _dataset_artifact_metadata(args.dataset_path),
+        "source_dataset_id": args.source_dataset_id,
+        "source_dataset_revision": _dataset_revision_info(
+            args.source_dataset_id, args.source_dataset_revision
         ),
         "paper_alignment": paper_alignment(args),
         "tokenizer": _tokenizer_metadata(tokenizer, args.hf_assets_path),
@@ -1108,7 +1283,6 @@ def validate_torchtitan_runtime() -> dict[str, Any]:
     }
 
 
-
 def build_hf_logits_parity_command(args: argparse.Namespace) -> list[str]:
     repo_root = Path(__file__).resolve().parents[1]
     return [
@@ -1161,6 +1335,7 @@ def build_stage_env(
             "LOG_RANK": args.log_rank,
             "SWEHERO_MODEL_ID": args.model_id,
             "SWEHERO_DATASET_ID": args.dataset_id,
+            "SWEHERO_DATASET_PATH": str(args.dataset_path),
             "SWEHERO_BUCKET_FILE": str(stage.bucket_file),
             "SWEHERO_BUCKET_SEQ_LEN": str(stage.bucket),
             "SWEHERO_BUCKET_CP": str(stage.cp_degree),
@@ -1317,7 +1492,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.skip_data_prep:
         manifest = _load_manifest(args.out_dir)
     else:
-        manifest = materialize_smoke_subset(args)
+        ensure_training_dataset(args)
+        manifest = materialize_training_buckets(args)
 
     bucket_counts = _bucket_counts_from_manifest(manifest)
     bucket_files = _bucket_files_from_manifest(manifest)
