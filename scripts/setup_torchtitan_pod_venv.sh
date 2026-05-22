@@ -25,9 +25,19 @@ VENV_PATH="${TORCHTITAN_POD_VENV:-/workspace/venvs/torchtitan-swehero-cu128}"
 REQUIREMENTS_PATH="${TORCHTITAN_POD_REQUIREMENTS:-$ROOT_DIR/requirements/torchtitan-pod-cu128.txt}"
 LOCK_PATH="${TORCHTITAN_POD_LOCK:-$ROOT_DIR/requirements/torchtitan-pod-cu128.lock}"
 PYTHON_BIN="${PYTHON:-python3}"
-UV_VERSION="${UV_VERSION:-0.10.9}"
 UV_TOOL_DIR="${UV_TOOL_DIR:-/workspace/uv}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.cache/uv}"
+readonly TORCHTITAN_POD_UV_VERSION="0.11.16"
+readonly UV_X86_64_UNKNOWN_LINUX_GNU_SHA256="74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
+if [[ -n "${UV_VERSION:-}" && "$UV_VERSION" != "$TORCHTITAN_POD_UV_VERSION" ]]; then
+  cat >&2 <<EOF
+UV_VERSION override is not supported for this training runtime.
+Expected uv $TORCHTITAN_POD_UV_VERSION, but UV_VERSION=$UV_VERSION was set.
+Unset UV_VERSION and rerun this script.
+EOF
+  exit 2
+fi
+readonly UV_VERSION="$TORCHTITAN_POD_UV_VERSION"
 RECREATE=0
 VERIFY_ONLY=0
 
@@ -66,10 +76,32 @@ if [[ -f "$LOCK_PATH" ]]; then
   INSTALL_REQUIREMENTS_PATH="$LOCK_PATH"
 fi
 
+uv_version_matches() {
+  local uv_bin="$1"
+  local actual
+  actual="$("$uv_bin" --version 2>/dev/null || true)"
+  [[ "$actual" == "uv $UV_VERSION"* ]]
+}
+
+require_uv_version() {
+  local uv_bin="$1"
+  local actual
+  actual="$("$uv_bin" --version)"
+  if [[ "$actual" != "uv $UV_VERSION"* ]]; then
+    echo "Wrong uv binary at $uv_bin: expected uv $UV_VERSION, found: $actual" >&2
+    return 1
+  fi
+  echo "$actual" >&2
+}
+
 ensure_uv() {
   local uv_bin="${UV_BIN:-}"
-  if [[ -n "$uv_bin" && -x "$uv_bin" ]]; then
-    "$uv_bin" --version >&2
+  if [[ -n "$uv_bin" ]]; then
+    if [[ ! -x "$uv_bin" ]]; then
+      echo "UV_BIN is not executable: $uv_bin" >&2
+      exit 1
+    fi
+    require_uv_version "$uv_bin"
     printf '%s\n' "$uv_bin"
     return
   fi
@@ -77,16 +109,20 @@ ensure_uv() {
   local managed_dir="$UV_TOOL_DIR/uv-$UV_VERSION"
   uv_bin="$managed_dir/uv"
   if [[ -x "$uv_bin" ]]; then
-    "$uv_bin" --version >&2
-    printf '%s\n' "$uv_bin"
-    return
+    if uv_version_matches "$uv_bin"; then
+      require_uv_version "$uv_bin"
+      printf '%s\n' "$uv_bin"
+      return
+    fi
+    echo "Removing wrong uv binary from pinned tool directory: $uv_bin" >&2
+    rm -rf "$managed_dir"
   fi
 
   if command -v uv >/dev/null 2>&1; then
     local system_uv
     system_uv="$(command -v uv)"
-    if "$system_uv" --version | grep -Fq "uv $UV_VERSION"; then
-      "$system_uv" --version >&2
+    if uv_version_matches "$system_uv"; then
+      require_uv_version "$system_uv"
       printf '%s\n' "$system_uv"
       return
     fi
@@ -99,27 +135,33 @@ ensure_uv() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   mkdir -p "$managed_dir"
-  "$PYTHON_BIN" - "$UV_VERSION" "$tmp_dir/uv.tar.gz" <<'PY'
+  "$PYTHON_BIN" - "$UV_VERSION" "$UV_X86_64_UNKNOWN_LINUX_GNU_SHA256" "$tmp_dir/uv.tar.gz" <<'PY'
 from __future__ import annotations
 
+import hashlib
 import shutil
 import sys
 import urllib.request
 
-version, output_path = sys.argv[1], sys.argv[2]
+version, expected_sha256, output_path = sys.argv[1], sys.argv[2], sys.argv[3]
 url = (
     "https://github.com/astral-sh/uv/releases/download/"
     f"{version}/uv-x86_64-unknown-linux-gnu.tar.gz"
 )
 with urllib.request.urlopen(url, timeout=120) as response, open(output_path, "wb") as out:
     shutil.copyfileobj(response, out)
+actual_sha256 = hashlib.sha256(open(output_path, "rb").read()).hexdigest()
+if actual_sha256 != expected_sha256:
+    raise SystemExit(
+        f"uv archive checksum mismatch: expected {expected_sha256}, found {actual_sha256}"
+    )
 PY
   tar -xzf "$tmp_dir/uv.tar.gz" -C "$tmp_dir"
   cp "$tmp_dir/uv-x86_64-unknown-linux-gnu/uv" "$managed_dir/uv"
   cp "$tmp_dir/uv-x86_64-unknown-linux-gnu/uvx" "$managed_dir/uvx"
   chmod 0755 "$managed_dir/uv" "$managed_dir/uvx"
   rm -rf "$tmp_dir"
-  "$uv_bin" --version >&2
+  require_uv_version "$uv_bin"
   printf '%s\n' "$uv_bin"
 }
 
@@ -145,12 +187,13 @@ fi
 
 "$UV_BIN" pip check --python "$VENV_PATH/bin/python"
 
-"$VENV_PATH/bin/python" - "$ROOT_DIR" "$VENV_PATH" "$INSTALL_REQUIREMENTS_PATH" <<'PY'
+"$VENV_PATH/bin/python" - "$ROOT_DIR" "$VENV_PATH" "$INSTALL_REQUIREMENTS_PATH" "$UV_BIN" "$UV_VERSION" <<'PY'
 from __future__ import annotations
 
 import importlib
 import json
 import re
+import subprocess
 import sys
 import time
 from importlib.metadata import version
@@ -159,6 +202,15 @@ from pathlib import Path
 root = Path(sys.argv[1])
 venv = Path(sys.argv[2])
 requirements = Path(sys.argv[3])
+uv_bin = Path(sys.argv[4])
+expected_uv_version = sys.argv[5]
+actual_uv_version = subprocess.check_output(
+    [str(uv_bin), "--version"], text=True
+).strip()
+if not actual_uv_version.startswith(f"uv {expected_uv_version}"):
+    raise SystemExit(
+        f"uv version mismatch: expected uv {expected_uv_version}, found {actual_uv_version}"
+    )
 
 required: dict[str, str] = {}
 for line in requirements.read_text().splitlines():
@@ -217,6 +269,8 @@ record = {
     "venv": str(venv),
     "requirements": str(requirements),
     "repo_root": str(root),
+    "uv": actual_uv_version,
+    "uv_bin": str(uv_bin),
     "torch_cuda": torch.version.cuda,
     "cuda_device": torch.cuda.get_device_name(0),
     "critical_imports": {

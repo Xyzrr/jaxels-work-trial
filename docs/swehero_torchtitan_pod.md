@@ -20,8 +20,14 @@ that venv to `PATH`, and points `TORCHRUN_BIN` at the venv's `torchrun`.
 
 ## Locked Runtime
 
-The setup script bootstraps a pinned `uv 0.10.9` binary under `/workspace/uv`
-when `uv` is not already installed. It then creates the venv with `uv venv`,
+The setup script bootstraps exactly `uv 0.11.16` under
+`/workspace/uv/uv-0.11.16` when that exact version is not already installed.
+The version is pinned inside `scripts/setup_torchtitan_pod_venv.sh`; do not set
+`UV_VERSION` or use an unversioned installer URL. If `UV_BIN` is provided, the
+script verifies it reports `uv 0.11.16` before using it. The downloaded Linux
+x86_64 archive is also checked against its pinned SHA256.
+
+After `uv` is established, the setup script creates the venv with `uv venv`,
 syncs dependencies with `uv pip sync`, installs vendored TorchTitan with
 `uv pip install --no-deps -e torchtitan`, and verifies the result with
 `uv pip check`.
@@ -62,7 +68,7 @@ together and revalidated.
 
 It also writes a venv-local metadata file at
 `$TORCHTITAN_POD_VENV/torchtitan-swehero-runtime.json` with the exact package
-versions and critical imports used for the run.
+versions, `uv` binary path/version, and critical imports used for the run.
 
 `scripts/qwen_swehero_train.py` also validates the active runtime before
 launching training, so dependency mismatches fail before data prep or

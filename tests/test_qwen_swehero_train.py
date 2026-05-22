@@ -174,6 +174,16 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertNotIn("forward", method_names)
         self.assertNotIn("weight.clone", source)
 
+    def test_pod_setup_uses_pinned_uv(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (repo_root / "scripts/setup_torchtitan_pod_venv.sh").read_text()
+
+        self.assertIn('TORCHTITAN_POD_UV_VERSION="0.11.16"', source)
+        self.assertIn("UV_X86_64_UNKNOWN_LINUX_GNU_SHA256=", source)
+        self.assertIn("UV_VERSION override is not supported", source)
+        self.assertIn("require_uv_version", source)
+        self.assertNotIn('UV_VERSION="${UV_VERSION:-', source)
+
 
 if __name__ == "__main__":
     unittest.main()
