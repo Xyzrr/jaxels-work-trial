@@ -76,6 +76,7 @@ QWEN_ROPE_THETA = 1_000_000.0
 QWEN_YARN_BETA_FAST = 32.0
 QWEN_YARN_BETA_SLOW = 1.0
 MATERIALIZED_DATA_SCHEMA_VERSION = 1
+MODEL_ASSET_PROVENANCE_SCHEMA_VERSION = 1
 RUN_SPEC_SCHEMA_VERSION = 1
 RUN_SPEC_FILENAME = "run_spec.json"
 RUN_SPEC_SHA256_FILENAME = "run_spec.sha256"
@@ -588,6 +589,7 @@ def _resume_manifest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "dataset_artifact": manifest.get("dataset_artifact"),
         "source_dataset_id": manifest.get("source_dataset_id"),
         "source_dataset_revision": manifest.get("source_dataset_revision"),
+        "model_assets": manifest.get("model_assets"),
         "tokenizer": tokenizer_contract,
         "pad_token_id": manifest.get("pad_token_id"),
         "max_length": manifest.get("max_length"),
@@ -1308,6 +1310,181 @@ def _bucket_file_stats(path: Path) -> dict[str, int | str]:
     }
 
 
+def _read_json_if_present(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        return {"json_error": repr(exc)}
+    if isinstance(payload, dict):
+        return payload
+    return {"json_type": type(payload).__name__}
+
+
+def _asset_file_kind(relative_path: str) -> str:
+    name = Path(relative_path).name
+    if name == "config.json":
+        return "model_config"
+    if name == "generation_config.json":
+        return "generation_config"
+    if name == "model.safetensors.index.json":
+        return "safetensors_index"
+    if relative_path.endswith(".safetensors"):
+        return "safetensors_shard"
+    if name.startswith("tokenizer") or name in {
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+    }:
+        return "tokenizer"
+    return "auxiliary"
+
+
+def _asset_file_inventory(hf_assets_path: Path) -> list[dict[str, Any]]:
+    if not hf_assets_path.is_dir():
+        raise FileNotFoundError(
+            f"Hugging Face asset directory does not exist: {hf_assets_path}"
+        )
+
+    files = [
+        path
+        for path in hf_assets_path.rglob("*")
+        if path.is_file()
+    ]
+    inventory = []
+    files = sorted(
+        files,
+        key=lambda item: item.relative_to(hf_assets_path).as_posix(),
+    )
+    for path in files:
+        relative_path = path.relative_to(hf_assets_path).as_posix()
+        inventory.append(
+            {
+                "path": relative_path,
+                "kind": _asset_file_kind(relative_path),
+                "bytes": path.stat().st_size,
+                "sha256": _hash_file(path),
+            }
+        )
+    return inventory
+
+
+def _core_config_summary(config: Mapping[str, Any]) -> dict[str, Any]:
+    keys = (
+        "_name_or_path",
+        "architectures",
+        "auto_map",
+        "bos_token_id",
+        "eos_token_id",
+        "hidden_size",
+        "intermediate_size",
+        "max_position_embeddings",
+        "model_type",
+        "num_attention_heads",
+        "num_hidden_layers",
+        "num_key_value_heads",
+        "pad_token_id",
+        "rope_scaling",
+        "rope_theta",
+        "sliding_window",
+        "tie_word_embeddings",
+        "torch_dtype",
+        "transformers_version",
+        "use_sliding_window",
+        "vocab_size",
+    )
+    return {
+        key: config[key]
+        for key in keys
+        if key in config
+    }
+
+
+def _safetensors_index_summary(
+    hf_assets_path: Path,
+    inventory_by_path: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    index_path = hf_assets_path / "model.safetensors.index.json"
+    index = _read_json_if_present(index_path)
+    weight_map = index.get("weight_map") if isinstance(index, Mapping) else None
+    metadata = index.get("metadata") if isinstance(index, Mapping) else None
+    shard_paths = (
+        sorted(set(str(path) for path in weight_map.values()))
+        if isinstance(weight_map, Mapping)
+        else []
+    )
+    shard_path_set = set(shard_paths)
+    shard_files = []
+    for shard_path in shard_paths:
+        file_record = inventory_by_path.get(shard_path)
+        shard_files.append(
+            {
+                "path": shard_path,
+                "present": file_record is not None,
+                "bytes": file_record.get("bytes") if file_record else None,
+                "sha256": file_record.get("sha256") if file_record else None,
+            }
+        )
+
+    return {
+        "index_path": "model.safetensors.index.json" if index_path.exists() else None,
+        "index_sha256": _hash_file(index_path),
+        "metadata": metadata if isinstance(metadata, Mapping) else {},
+        "weight_map_entries": len(weight_map) if isinstance(weight_map, Mapping) else 0,
+        "shard_files": shard_files,
+        "unindexed_safetensors_files": [
+            record["path"]
+            for record in inventory_by_path.values()
+            if record.get("kind") == "safetensors_shard"
+            and record["path"] not in shard_path_set
+        ],
+        "index_error": index.get("json_error") if isinstance(index, Mapping) else None,
+    }
+
+
+def _model_asset_provenance(
+    *,
+    model_id: str,
+    hf_assets_path: Path,
+    tokenizer_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    inventory = _asset_file_inventory(hf_assets_path)
+    inventory_by_path = {record["path"]: record for record in inventory}
+    config = _read_json_if_present(hf_assets_path / "config.json")
+    generation_config = _read_json_if_present(hf_assets_path / "generation_config.json")
+    return {
+        "schema_version": MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
+        "model_id": model_id,
+        "hf_assets_path": str(hf_assets_path),
+        "hf_assets_realpath": str(hf_assets_path.resolve()),
+        "file_count": len(inventory),
+        "total_bytes": sum(int(record["bytes"]) for record in inventory),
+        "files": inventory,
+        "config": {
+            "path": "config.json" if (hf_assets_path / "config.json").exists() else None,
+            "sha256": _hash_file(hf_assets_path / "config.json"),
+            "summary": _core_config_summary(config),
+            "json_error": config.get("json_error"),
+        },
+        "generation_config": {
+            "path": "generation_config.json"
+            if (hf_assets_path / "generation_config.json").exists()
+            else None,
+            "sha256": _hash_file(hf_assets_path / "generation_config.json"),
+            "summary": {
+                key: generation_config[key]
+                for key in ("bos_token_id", "eos_token_id", "pad_token_id")
+                if key in generation_config
+            },
+            "json_error": generation_config.get("json_error"),
+        },
+        "safetensors": _safetensors_index_summary(hf_assets_path, inventory_by_path),
+        "tokenizer": dict(tokenizer_metadata),
+    }
+
+
 def _tokenizer_metadata(tokenizer: Any, hf_assets_path: Path) -> dict[str, Any]:
     tokenizer_config_path = hf_assets_path / "tokenizer_config.json"
     config: dict[str, Any] = {}
@@ -1630,6 +1807,40 @@ def validate_materialized_data_manifest(
             "Unsupported materialized data manifest schema version: "
             f"{schema_version!r}; expected {MATERIALIZED_DATA_SCHEMA_VERSION}"
         )
+    model_assets = manifest.get("model_assets")
+    if not isinstance(model_assets, Mapping):
+        raise RuntimeError(
+            "Materialized data manifest is missing complete model_assets provenance"
+        )
+    if model_assets.get("schema_version") != MODEL_ASSET_PROVENANCE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported model asset provenance schema version: "
+            f"{model_assets.get('schema_version')!r}; expected "
+            f"{MODEL_ASSET_PROVENANCE_SCHEMA_VERSION}"
+        )
+    model_asset_files = model_assets.get("files")
+    if not isinstance(model_asset_files, list):
+        raise RuntimeError("model_assets.files must contain the hashed asset inventory")
+    if int(model_assets.get("file_count", -1)) != len(model_asset_files):
+        raise RuntimeError(
+            "model_assets.file_count does not match model_assets.files length: "
+            f"{model_assets.get('file_count')!r} != {len(model_asset_files)}"
+        )
+    total_asset_bytes = 0
+    for record in model_asset_files:
+        if not isinstance(record, Mapping):
+            raise RuntimeError("model_assets.files entries must be objects")
+        for key in ("path", "kind", "bytes", "sha256"):
+            if key not in record:
+                raise RuntimeError(
+                    f"model_assets.files entry is missing {key!r}: {record!r}"
+                )
+        total_asset_bytes += int(record["bytes"])
+    if int(model_assets.get("total_bytes", -1)) != total_asset_bytes:
+        raise RuntimeError(
+            "model_assets.total_bytes does not match model_assets.files: "
+            f"{model_assets.get('total_bytes')!r} != {total_asset_bytes}"
+        )
 
     bucket_files = manifest.get("bucket_files")
     bucket_counts = manifest.get("bucket_counts")
@@ -1849,6 +2060,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
             str(bucket): _bucket_file_stats(staging_bucket_paths[bucket])
             for bucket in buckets
         }
+        tokenizer_metadata = _tokenizer_metadata(tokenizer, args.hf_assets_path)
         manifest = {
             "materialized_data_schema_version": MATERIALIZED_DATA_SCHEMA_VERSION,
             "created_at_unix": time.time(),
@@ -1861,7 +2073,12 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                 args.source_dataset_id, args.source_dataset_revision
             ),
             "paper_alignment": paper_alignment(args),
-            "tokenizer": _tokenizer_metadata(tokenizer, args.hf_assets_path),
+            "model_assets": _model_asset_provenance(
+                model_id=args.model_id,
+                hf_assets_path=args.hf_assets_path,
+                tokenizer_metadata=tokenizer_metadata,
+            ),
+            "tokenizer": tokenizer_metadata,
             "pad_token_id": pad_token_id,
             "max_length": args.max_length,
             "long_example_policy": args.long_example_policy,

@@ -75,6 +75,48 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 "requested_revision": args.source_dataset_revision,
                 "resolved_sha": "source-sha",
             },
+            "model_assets": {
+                "schema_version": train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
+                "model_id": args.model_id,
+                "hf_assets_path": str(args.hf_assets_path),
+                "hf_assets_realpath": str(args.hf_assets_path),
+                "file_count": 1,
+                "total_bytes": 10,
+                "files": [
+                    {
+                        "path": "config.json",
+                        "kind": "model_config",
+                        "bytes": 10,
+                        "sha256": "config-sha",
+                    }
+                ],
+                "config": {
+                    "path": "config.json",
+                    "sha256": "config-sha",
+                    "summary": {"model_type": "qwen2"},
+                    "json_error": None,
+                },
+                "generation_config": {
+                    "path": None,
+                    "sha256": None,
+                    "summary": {},
+                    "json_error": None,
+                },
+                "safetensors": {
+                    "index_path": None,
+                    "index_sha256": None,
+                    "metadata": {},
+                    "weight_map_entries": 0,
+                    "shard_files": [],
+                    "unindexed_safetensors_files": [],
+                    "index_error": None,
+                },
+                "tokenizer": {
+                    "hf_assets_path": str(args.hf_assets_path),
+                    "tokenizer_json_sha256": "tokenizer-sha",
+                    "tokenizer_config_sha256": "tokenizer-config-sha",
+                },
+            },
             "tokenizer": {
                 "hf_assets_path": str(args.hf_assets_path),
                 "tokenizer_json_sha256": "tokenizer-sha",
@@ -145,6 +187,51 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 return_value={
                     "hf_assets_path": str(args.hf_assets_path),
                     "pad_id": 0,
+                },
+            ),
+            patch.object(
+                train,
+                "_model_asset_provenance",
+                return_value={
+                    "schema_version": train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
+                    "model_id": args.model_id,
+                    "hf_assets_path": str(args.hf_assets_path),
+                    "hf_assets_realpath": str(args.hf_assets_path),
+                    "file_count": 1,
+                    "total_bytes": 10,
+                    "files": [
+                        {
+                            "path": "config.json",
+                            "kind": "model_config",
+                            "bytes": 10,
+                            "sha256": "config-sha",
+                        }
+                    ],
+                    "config": {
+                        "path": "config.json",
+                        "sha256": "config-sha",
+                        "summary": {"model_type": "qwen2"},
+                        "json_error": None,
+                    },
+                    "generation_config": {
+                        "path": None,
+                        "sha256": None,
+                        "summary": {},
+                        "json_error": None,
+                    },
+                    "safetensors": {
+                        "index_path": None,
+                        "index_sha256": None,
+                        "metadata": {},
+                        "weight_map_entries": 0,
+                        "shard_files": [],
+                        "unindexed_safetensors_files": [],
+                        "index_error": None,
+                    },
+                    "tokenizer": {
+                        "hf_assets_path": str(args.hf_assets_path),
+                        "pad_id": 0,
+                    },
                 },
             ),
             patch.object(train, "_package_versions", return_value={}),
@@ -277,6 +364,91 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("beta_fast=32.0", source)
         self.assertIn("beta_slow=1.0", source)
         self.assertIn("original_seq_len=QWEN25_NATIVE_CONTEXT", source)
+
+    def test_model_asset_provenance_records_complete_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hf_assets = Path(tmp) / "hf"
+            hf_assets.mkdir()
+            config = {
+                "_name_or_path": "Qwen/Qwen2.5-Coder-7B-Instruct",
+                "architectures": ["Qwen2ForCausalLM"],
+                "hidden_size": 3584,
+                "max_position_embeddings": 32768,
+                "model_type": "qwen2",
+                "num_hidden_layers": 28,
+                "rope_scaling": None,
+                "torch_dtype": "bfloat16",
+                "vocab_size": 152064,
+            }
+            (hf_assets / "config.json").write_text(json.dumps(config))
+            (hf_assets / "generation_config.json").write_text(
+                json.dumps({"eos_token_id": 151645, "pad_token_id": 151643})
+            )
+            (hf_assets / "tokenizer.json").write_text('{"tokenizer": true}')
+            (hf_assets / "tokenizer_config.json").write_text(
+                json.dumps({"chat_template": "template"})
+            )
+            (hf_assets / "model-00001-of-00002.safetensors").write_bytes(b"shard-1")
+            (hf_assets / "model-00002-of-00002.safetensors").write_bytes(b"shard-2")
+            (hf_assets / "orphan.safetensors").write_bytes(b"orphan")
+            (hf_assets / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"total_size": 13},
+                        "weight_map": {
+                            "lm_head.weight": "model-00002-of-00002.safetensors",
+                            "model.embed_tokens.weight": (
+                                "model-00001-of-00002.safetensors"
+                            ),
+                        },
+                    }
+                )
+            )
+            tokenizer_metadata = {
+                "hf_assets_path": str(hf_assets),
+                "tokenizer_json_sha256": train._hash_file(hf_assets / "tokenizer.json"),
+                "tokenizer_config_sha256": train._hash_file(
+                    hf_assets / "tokenizer_config.json"
+                ),
+            }
+
+            provenance = train._model_asset_provenance(
+                model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
+                hf_assets_path=hf_assets,
+                tokenizer_metadata=tokenizer_metadata,
+            )
+
+        files = {record["path"]: record for record in provenance["files"]}
+        self.assertEqual(
+            provenance["schema_version"],
+            train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
+        )
+        self.assertEqual(provenance["file_count"], len(files))
+        self.assertEqual(
+            provenance["total_bytes"],
+            sum(record["bytes"] for record in files.values()),
+        )
+        self.assertEqual(files["config.json"]["kind"], "model_config")
+        self.assertEqual(
+            files["model-00001-of-00002.safetensors"]["sha256"],
+            train._sha256_text("shard-1"),
+        )
+        self.assertEqual(provenance["config"]["summary"]["model_type"], "qwen2")
+        self.assertEqual(provenance["config"]["summary"]["hidden_size"], 3584)
+        self.assertEqual(
+            provenance["generation_config"]["summary"]["pad_token_id"],
+            151643,
+        )
+        self.assertEqual(provenance["safetensors"]["weight_map_entries"], 2)
+        self.assertEqual(
+            [record["path"] for record in provenance["safetensors"]["shard_files"]],
+            ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+        )
+        self.assertEqual(
+            provenance["safetensors"]["unindexed_safetensors_files"],
+            ["orphan.safetensors"],
+        )
+        self.assertEqual(provenance["tokenizer"], tokenizer_metadata)
 
     def test_cos_sin_yarn_uses_huggingface_correction_range_order(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -796,10 +968,49 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             )
             self.assertEqual(manifest, loaded_manifest)
             self.assertEqual(manifest["bucket_counts"], {"256": 1})
+            self.assertEqual(
+                manifest["model_assets"]["schema_version"],
+                train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
+            )
+            self.assertEqual(manifest["model_assets"]["file_count"], 1)
             integrity = manifest["bucket_file_integrity"]["256"]
             bucket_path = Path(manifest["bucket_files"]["256"])
             self.assertEqual(integrity["records"], 1)
             self.assertEqual(integrity, train._bucket_file_stats(bucket_path))
+
+    def test_load_manifest_rejects_missing_model_asset_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "256",
+                    "--max-length",
+                    "256",
+                    "--num-examples",
+                    "1",
+                ]
+            )
+            example = {
+                "instance_id": "short",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+            manifest = self._materialize_with_fake_runtime(args, [example])
+            manifest.pop("model_assets")
+            (args.out_dir / "data" / "manifest.json").write_text(
+                json.dumps(manifest, indent=2)
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "model_assets provenance"):
+                train._load_manifest(args.out_dir)
 
     def test_main_writes_run_spec_for_dry_run_launch(self):
         with tempfile.TemporaryDirectory() as tmp:
