@@ -1,8 +1,11 @@
 import ast
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import qwen_swehero_train as train
 
@@ -10,6 +13,7 @@ from scripts import qwen_swehero_train as train
 class FakeTokenizer:
     bos_id = None
     eos_id = None
+    pad_id = 0
 
     def encode(self, text, **kwargs):
         return [ord(ch) for ch in text]
@@ -100,6 +104,50 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             warmup_ratio=args.warmup_ratio,
         )
         return args, manifest, plan
+
+    def _materialize_with_fake_runtime(self, args, examples):
+        fake_tokenizer_module = types.ModuleType("torchtitan.components.tokenizer")
+
+        class FakeHuggingFaceTokenizer(FakeTokenizer):
+            def __init__(self, tokenizer_path):
+                self.tokenizer_path = tokenizer_path
+
+        fake_tokenizer_module.HuggingFaceTokenizer = FakeHuggingFaceTokenizer
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "torchtitan": types.ModuleType("torchtitan"),
+                    "torchtitan.components": types.ModuleType(
+                        "torchtitan.components"
+                    ),
+                    "torchtitan.components.tokenizer": fake_tokenizer_module,
+                },
+            ),
+            patch.object(train, "load_training_dataset", return_value=iter(examples)),
+            patch.object(
+                train,
+                "_dataset_artifact_metadata",
+                return_value={"path": str(args.dataset_path), "data_files": []},
+            ),
+            patch.object(
+                train,
+                "_dataset_revision_info",
+                return_value={"requested_revision": args.source_dataset_revision},
+            ),
+            patch.object(
+                train,
+                "_tokenizer_metadata",
+                return_value={
+                    "hf_assets_path": str(args.hf_assets_path),
+                    "pad_id": 0,
+                },
+            ),
+            patch.object(train, "_package_versions", return_value={}),
+            patch.object(train, "_run_git", return_value=None),
+        ):
+            return train.materialize_training_buckets(args)
 
     def test_defaults_track_paper_hyperparameters_and_target_pod(self):
         args = train.parse_args([])
@@ -464,6 +512,95 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertNotIn("secret failing output", trainable_text)
         self.assertNotIn("<|assistant|>", trainable_text)
         self.assertNotIn("<|im_start|>assistant", trainable_text)
+
+    def test_encode_rejects_long_examples_instead_of_truncating(self):
+        example = {
+            "trajectory": [
+                {"role": "user", "content": "issue"},
+                {"role": "assistant", "content": "x" * 100},
+            ],
+        }
+
+        with self.assertRaisesRegex(train.LongExampleError, "exceeds --max-length"):
+            train.encode_swehero_example(
+                FakeTokenizer(),
+                example,
+                max_length=32,
+                min_trainable_tokens=1,
+            )
+
+    def test_materialization_errors_on_long_examples_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "64",
+                    "--max-length",
+                    "64",
+                    "--max-streamed-examples",
+                    "1",
+                ]
+            )
+            example = {
+                "instance_id": "too-long",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "x" * 1000},
+                ],
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "would have been truncated"):
+                self._materialize_with_fake_runtime(args, [example])
+
+    def test_materialization_can_explicitly_skip_long_examples_with_manifest_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "256",
+                    "--max-length",
+                    "256",
+                    "--num-examples",
+                    "1",
+                    "--long-example-policy",
+                    "skip",
+                ]
+            )
+            examples = [
+                {
+                    "instance_id": "too-long",
+                    "trajectory": [
+                        {"role": "user", "content": "issue"},
+                        {"role": "assistant", "content": "x" * 1000},
+                    ],
+                },
+                {
+                    "instance_id": "short",
+                    "trajectory": [
+                        {"role": "user", "content": "issue"},
+                        {"role": "assistant", "content": "OK"},
+                    ],
+                },
+            ]
+
+            manifest = self._materialize_with_fake_runtime(args, examples)
+
+        self.assertEqual(manifest["long_example_policy"], "skip")
+        self.assertEqual(manifest["skipped"]["too_long_for_max_length"], 1)
+        self.assertEqual(manifest["long_examples_sample"][0]["source_id"], "too-long")
+        self.assertEqual(manifest["num_usable_examples"], 1)
 
     def test_openhands_messages_render_as_qwen_chatml(self):
         example = {

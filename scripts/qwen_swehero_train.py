@@ -89,6 +89,7 @@ RESUME_ARG_FIELDS = (
     "shuffle_buffer",
     "seed",
     "max_length",
+    "long_example_policy",
     "buckets",
     "bucket_cp",
     "min_trainable_tokens",
@@ -161,6 +162,18 @@ class ResumeCheckpointState:
     checkpoint_dir: Path
     latest_resumable_step: int
     latest_any_step: int
+
+
+class LongExampleError(ValueError):
+    def __init__(self, *, token_count: int, max_length: int) -> None:
+        self.token_count = token_count
+        self.max_length = max_length
+        self.max_token_count = max_length + 1
+        self.shifted_input_length = token_count - 1
+        super().__init__(
+            f"encoded example has shifted input length {self.shifted_input_length}, "
+            f"which exceeds --max-length={max_length}"
+        )
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -465,6 +478,7 @@ def _resume_manifest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "tokenizer": tokenizer_contract,
         "pad_token_id": manifest.get("pad_token_id"),
         "max_length": manifest.get("max_length"),
+        "long_example_policy": manifest.get("long_example_policy"),
         "buckets": manifest.get("buckets"),
         "bucket_files": manifest.get("bucket_files"),
         "bucket_counts": manifest.get("bucket_counts"),
@@ -777,6 +791,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=_env_int("MAX_LENGTH", PAPER_CONTEXT_LENGTH),
         help="Maximum shifted input length. Defaults to the paper 128k context.",
+    )
+    parser.add_argument(
+        "--long-example-policy",
+        choices=("error", "skip"),
+        default=os.environ.get("LONG_EXAMPLE_POLICY", "error"),
+        help=(
+            "How to handle examples whose shifted input length exceeds "
+            "--max-length. The production default is error so over-context "
+            "trajectories cannot be silently truncated."
+        ),
     )
     parser.add_argument(
         "--buckets",
@@ -1390,8 +1414,8 @@ def encode_swehero_example(
         token_ids.append(int(eos_id))
         labels.append(int(eos_id) if labels and labels[-1] != IGNORE_INDEX else IGNORE_INDEX)
 
-    token_ids = token_ids[: max_length + 1]
-    labels = labels[: max_length + 1]
+    if len(token_ids) > max_length + 1:
+        raise LongExampleError(token_count=len(token_ids), max_length=max_length)
     if len(token_ids) < 2:
         return None
 
@@ -1467,6 +1491,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     handles = {bucket: path.open("w") for bucket, path in bucket_paths.items()}
     bucket_counts: Counter[int] = Counter()
     skipped: Counter[str] = Counter()
+    long_examples_sample: list[dict[str, Any]] = []
     length_histogram: Counter[int] = Counter()
     streamed_examples = 0
     usable_examples = 0
@@ -1476,13 +1501,33 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     try:
         for example in raw:
             streamed_examples += 1
-            encoded = encode_swehero_example(
-                tokenizer,
-                example,
-                max_length=min(args.max_length, max(buckets)),
-                min_trainable_tokens=args.min_trainable_tokens,
-                include_model_patch=args.include_model_patch,
-            )
+            source_id = _example_id(example, streamed_examples)
+            try:
+                encoded = encode_swehero_example(
+                    tokenizer,
+                    example,
+                    max_length=args.max_length,
+                    min_trainable_tokens=args.min_trainable_tokens,
+                    include_model_patch=args.include_model_patch,
+                )
+            except LongExampleError as exc:
+                skipped["too_long_for_max_length"] += 1
+                long_example = {
+                    "source_id": source_id,
+                    "token_count": exc.token_count,
+                    "shifted_input_length": exc.shifted_input_length,
+                    "max_length": exc.max_length,
+                }
+                if len(long_examples_sample) < 20:
+                    long_examples_sample.append(long_example)
+                if args.long_example_policy == "error":
+                    raise RuntimeError(
+                        "SWE-HERO example exceeds --max-length and would have "
+                        f"been truncated by the old launcher: {long_example}. "
+                        "Use --long-example-policy skip only for explicit smoke "
+                        "runs or after accepting the dataset-scope change."
+                    ) from exc
+                continue
             if encoded is None:
                 skipped["not_enough_trainable_tokens"] += 1
             else:
@@ -1494,7 +1539,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                     record = {
                         **encoded,
                         "bucket": bucket,
-                        "source_id": _example_id(example, streamed_examples),
+                        "source_id": source_id,
                     }
                     handles[bucket].write(json.dumps(record) + "\n")
                     bucket_counts[bucket] += 1
@@ -1534,6 +1579,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
         "tokenizer": _tokenizer_metadata(tokenizer, args.hf_assets_path),
         "pad_token_id": pad_token_id,
         "max_length": args.max_length,
+        "long_example_policy": args.long_example_policy,
         "buckets": list(buckets),
         "bucket_files": {
             str(bucket): str(path) for bucket, path in bucket_paths.items()
@@ -1545,6 +1591,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
         "num_usable_examples": usable_examples,
         "streamed_examples_scanned": streamed_examples,
         "skipped": dict(skipped),
+        "long_examples_sample": long_examples_sample,
         "include_model_patch": args.include_model_patch,
         "git": {
             "branch": _run_git(["branch", "--show-current"]),
