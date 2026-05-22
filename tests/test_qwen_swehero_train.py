@@ -384,6 +384,14 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.rdzv_id, "")
         self.assertTrue(args.enable_fp8)
         self.assertEqual(args.attention_backend, "sdpa")
+        self.assertEqual(args.optimizer_impl, "foreach")
+        self.assertEqual(args.training_dtype, "float32")
+        self.assertEqual(args.mixed_precision_param_dtype, "bfloat16")
+        self.assertEqual(args.mixed_precision_reduce_dtype, "bfloat16")
+        self.assertEqual(args.fsdp_reshard_after_forward, "never")
+        self.assertFalse(args.detect_anomaly)
+        self.assertEqual(args.cuda_device_max_connections, "1")
+        self.assertEqual(args.torch_nccl_async_error_handling, "1")
         self.assertEqual(args.bucket_curriculum, train.DEFAULT_BUCKET_CURRICULUM)
         self.assertFalse(args.enable_profiler)
         self.assertEqual(args.profiler_freq, 10)
@@ -513,6 +521,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             (["--warmup-ratio", "1.1"], "--warmup-ratio"),
             (["--weight-decay", "-0.1"], "--weight-decay"),
             (["--max-grad-norm", "0"], "--max-grad-norm"),
+            (["--cuda-device-max-connections", "0"], "--cuda-device-max-connections"),
+            (
+                ["--torch-nccl-async-error-handling", ""],
+                "--torch-nccl-async-error-handling",
+            ),
             (["--chunked-ce-chunks", "0"], "--chunked-ce-chunks"),
             (["--checkpoint-interval", "0"], "--checkpoint-interval"),
             (["--metrics-log-freq", "0"], "--metrics-log-freq"),
@@ -1794,6 +1807,84 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(first_env["SWEHERO_ENABLE_MEMORY_SNAPSHOT"], "0")
         self.assertNotIn("SWEHERO_SECRET", first_env)
 
+    def test_hidden_torchtitan_env_inputs_are_recorded_as_launch_args(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "SWEHERO_OPTIMIZER_IMPL": "fused",
+                "SWEHERO_TRAINING_DTYPE": "bfloat16",
+                "SWEHERO_MP_PARAM_DTYPE": "float32",
+                "SWEHERO_MP_REDUCE_DTYPE": "float32",
+                "SWEHERO_FSDP_RESHARD_AFTER_FORWARD": "always",
+                "SWEHERO_DETECT_ANOMALY": "1",
+                "CUDA_DEVICE_MAX_CONNECTIONS": "2",
+                "TORCH_NCCL_ASYNC_ERROR_HANDLING": "3",
+            },
+            clear=True,
+        ):
+            args, manifest, plan = self._resume_test_setup(tmp)
+            spec = train.build_run_spec(args, plan, manifest)
+            first_env = spec["plan"]["stages"][0]["env_overrides"]
+
+        self.assertEqual(spec["args"]["optimizer_impl"], "fused")
+        self.assertEqual(spec["args"]["training_dtype"], "bfloat16")
+        self.assertEqual(spec["args"]["mixed_precision_param_dtype"], "float32")
+        self.assertEqual(spec["args"]["mixed_precision_reduce_dtype"], "float32")
+        self.assertEqual(spec["args"]["fsdp_reshard_after_forward"], "always")
+        self.assertTrue(spec["args"]["detect_anomaly"])
+        self.assertEqual(spec["args"]["cuda_device_max_connections"], "2")
+        self.assertEqual(spec["args"]["torch_nccl_async_error_handling"], "3")
+        self.assertEqual(first_env["SWEHERO_OPTIMIZER_IMPL"], "fused")
+        self.assertEqual(first_env["SWEHERO_TRAINING_DTYPE"], "bfloat16")
+        self.assertEqual(first_env["SWEHERO_MP_PARAM_DTYPE"], "float32")
+        self.assertEqual(first_env["SWEHERO_MP_REDUCE_DTYPE"], "float32")
+        self.assertEqual(first_env["SWEHERO_FSDP_RESHARD_AFTER_FORWARD"], "always")
+        self.assertEqual(first_env["SWEHERO_DETECT_ANOMALY"], "1")
+        self.assertEqual(first_env["CUDA_DEVICE_MAX_CONNECTIONS"], "2")
+        self.assertEqual(first_env["TORCH_NCCL_ASYNC_ERROR_HANDLING"], "3")
+
+    def test_run_spec_rejects_hidden_torchtitan_env_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            dataset_path = Path(tmp) / "dataset"
+            hf_assets_path = Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"
+            base_argv = [
+                "--out-dir",
+                str(out_dir),
+                "--dataset-path",
+                str(dataset_path),
+                "--hf-assets-path",
+                str(hf_assets_path),
+                "--buckets",
+                "8192,32768",
+                "--bucket-cp",
+                "8192:1,32768:2",
+                "--max-length",
+                "32768",
+                "--num-examples",
+                "34",
+                "--max-streamed-examples",
+                "100",
+            ]
+            with patch.dict(
+                os.environ,
+                {"SWEHERO_TRAINING_DTYPE": "bfloat16"},
+                clear=True,
+            ):
+                args, manifest, plan = self._resume_test_setup(tmp)
+                train.write_or_validate_run_spec(args, plan, manifest)
+
+            with patch.dict(os.environ, {}, clear=True):
+                changed = train.parse_args(base_argv)
+                changed.buckets = ",".join(
+                    str(b) for b in train.parse_bucket_list(changed.buckets)
+                )
+                bucket_cp = train.parse_bucket_cp_map(changed.bucket_cp)
+                changed.bucket_cp = train._format_bucket_cp_map(bucket_cp)
+
+            with self.assertRaisesRegex(RuntimeError, "training_dtype"):
+                train.write_or_validate_run_spec(changed, plan, manifest)
+
     def test_stage_env_exposes_profiler_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
@@ -2994,6 +3085,14 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(env["SWEHERO_MODEL_REVISION"], train.MODEL_REVISION)
         self.assertEqual(env["SWEHERO_ENABLE_FP8"], "1")
         self.assertEqual(env["SWEHERO_CUMULATIVE_STEPS"], "3")
+        self.assertEqual(env["SWEHERO_OPTIMIZER_IMPL"], "foreach")
+        self.assertEqual(env["SWEHERO_TRAINING_DTYPE"], "float32")
+        self.assertEqual(env["SWEHERO_MP_PARAM_DTYPE"], "bfloat16")
+        self.assertEqual(env["SWEHERO_MP_REDUCE_DTYPE"], "bfloat16")
+        self.assertEqual(env["SWEHERO_FSDP_RESHARD_AFTER_FORWARD"], "never")
+        self.assertEqual(env["SWEHERO_DETECT_ANOMALY"], "0")
+        self.assertEqual(env["CUDA_DEVICE_MAX_CONNECTIONS"], "1")
+        self.assertEqual(env["TORCH_NCCL_ASYNC_ERROR_HANDLING"], "1")
         self.assertEqual(
             env["SWEHERO_FINAL_EXPORT_FOLDER"],
             train.FINAL_MODEL_EXPORT_FOLDER,

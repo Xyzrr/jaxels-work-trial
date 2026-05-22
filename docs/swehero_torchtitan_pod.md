@@ -187,6 +187,30 @@ Each non-empty line in the argument file is parsed like shell input, and lines
 starting with `#` are ignored. Flags written after `@configs/swehero-7b.args`
 on the command line override earlier values from the file.
 
+## Recorded Training Environment Inputs
+
+Training-affecting TorchTitan environment controls should be set as launcher
+arguments, not as ambient pod-only overrides. The launcher records these values
+in `run_spec.json`, exports them to each `torchrun` stage, and rejects resume
+or relaunch attempts that drift from the original run spec.
+
+The currently explicit controls are:
+
+```bash
+--optimizer-impl foreach \
+--training-dtype float32 \
+--mixed-precision-param-dtype bfloat16 \
+--mixed-precision-reduce-dtype bfloat16 \
+--fsdp-reshard-after-forward never \
+--no-detect-anomaly \
+--cuda-device-max-connections 1 \
+--torch-nccl-async-error-handling 1
+```
+
+These defaults match the existing direct-to-hero TorchTitan config path. Change
+them only for an intentional experiment or debugging run, and keep the reviewed
+argument file as the source of truth.
+
 ## Bucket Curriculum
 
 The launcher defaults to `--bucket-curriculum short-to-long`, which preserves

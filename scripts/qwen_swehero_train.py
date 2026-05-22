@@ -109,6 +109,9 @@ WANDB_IDENTITY_FILENAME = "wandb_identity.json"
 WANDB_RESUME_CHOICES = ("allow", "never", "must", "auto")
 WANDB_MODE_CHOICES = ("online", "offline", "disabled", "shared")
 WANDB_RUN_ID_FORBIDDEN_CHARS = frozenset("/\\#?%:")
+OPTIMIZER_IMPL_CHOICES = ("for-loop", "foreach", "fused", "fused_opt_states_bf16")
+TORCH_DTYPE_CHOICES = ("float32", "bfloat16")
+FSDP_RESHARD_AFTER_FORWARD_CHOICES = ("default", "always", "never")
 TERMINATION_SIGNALS = tuple(
     signal_number
     for signal_number in (
@@ -164,12 +167,18 @@ RESUME_ARG_FIELDS = (
     "warmup_ratio",
     "weight_decay",
     "max_grad_norm",
+    "optimizer_impl",
     "attention_backend",
     "enable_fp8",
     "fp8_recipe",
     "compile",
+    "training_dtype",
+    "mixed_precision_param_dtype",
+    "mixed_precision_reduce_dtype",
+    "fsdp_reshard_after_forward",
     "activation_checkpoint_mode",
     "chunked_ce_chunks",
+    "detect_anomaly",
     "enable_wandb",
     "wandb_project",
     "wandb_entity",
@@ -189,6 +198,8 @@ RESUME_ARG_FIELDS = (
     "rdzv_backend",
     "rdzv_endpoint",
     "rdzv_id",
+    "cuda_device_max_connections",
+    "torch_nccl_async_error_handling",
 )
 RUN_SPEC_ARG_FIELDS = (
     "model_id",
@@ -223,12 +234,18 @@ RUN_SPEC_ARG_FIELDS = (
     "warmup_ratio",
     "weight_decay",
     "max_grad_norm",
+    "optimizer_impl",
     "attention_backend",
     "enable_fp8",
     "fp8_recipe",
     "compile",
+    "training_dtype",
+    "mixed_precision_param_dtype",
+    "mixed_precision_reduce_dtype",
+    "fsdp_reshard_after_forward",
     "activation_checkpoint_mode",
     "chunked_ce_chunks",
+    "detect_anomaly",
     "checkpoint_interval",
     "checkpoint_async_mode",
     "metrics_log_freq",
@@ -265,8 +282,14 @@ RUN_SPEC_ARG_FIELDS = (
     "torchrun_bin",
     "log_rank",
     "torchrun_log_rank_filter",
+    "cuda_device_max_connections",
+    "torch_nccl_async_error_handling",
 )
 RESUME_STAGE_ENV_KEYS = (
+    "PYTHONPATH",
+    "TOKENIZERS_PARALLELISM",
+    "CUDA_DEVICE_MAX_CONNECTIONS",
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING",
     "SWEHERO_MODEL_ID",
     "SWEHERO_MODEL_REVISION",
     "SWEHERO_DATASET_ID",
@@ -288,12 +311,18 @@ RESUME_STAGE_ENV_KEYS = (
     "SWEHERO_MIN_LEARNING_RATE",
     "SWEHERO_WEIGHT_DECAY",
     "SWEHERO_MAX_GRAD_NORM",
+    "SWEHERO_OPTIMIZER_IMPL",
     "SWEHERO_ATTENTION_BACKEND",
     "SWEHERO_ENABLE_FP8",
     "SWEHERO_FP8_RECIPE",
     "SWEHERO_COMPILE",
+    "SWEHERO_TRAINING_DTYPE",
+    "SWEHERO_MP_PARAM_DTYPE",
+    "SWEHERO_MP_REDUCE_DTYPE",
+    "SWEHERO_FSDP_RESHARD_AFTER_FORWARD",
     "SWEHERO_AC_MODE",
     "SWEHERO_CHUNKED_CE_CHUNKS",
+    "SWEHERO_DETECT_ANOMALY",
 )
 LAUNCH_STAGE_ENV_KEYS = (
     *RESUME_STAGE_ENV_KEYS,
@@ -799,6 +828,48 @@ def validate_launch_inputs(
             "--min-learning-rate cannot exceed --learning-rate; got "
             f"{args.min_learning_rate!r} > {args.learning_rate!r}"
         )
+
+    choice_fields = (
+        ("--optimizer-impl", args.optimizer_impl, OPTIMIZER_IMPL_CHOICES),
+        ("--training-dtype", args.training_dtype, TORCH_DTYPE_CHOICES),
+        (
+            "--mixed-precision-param-dtype",
+            args.mixed_precision_param_dtype,
+            TORCH_DTYPE_CHOICES,
+        ),
+        (
+            "--mixed-precision-reduce-dtype",
+            args.mixed_precision_reduce_dtype,
+            TORCH_DTYPE_CHOICES,
+        ),
+        (
+            "--fsdp-reshard-after-forward",
+            args.fsdp_reshard_after_forward,
+            FSDP_RESHARD_AFTER_FORWARD_CHOICES,
+        ),
+    )
+    for name, value, choices in choice_fields:
+        if value not in choices:
+            errors.append(
+                f"{name} must be one of {', '.join(choices)}; got {value!r}"
+            )
+
+    try:
+        cuda_device_max_connections = int(args.cuda_device_max_connections)
+    except ValueError:
+        errors.append(
+            "--cuda-device-max-connections must be an integer; got "
+            f"{args.cuda_device_max_connections!r}"
+        )
+    else:
+        _add_min_error(
+            errors,
+            name="--cuda-device-max-connections",
+            value=cuda_device_max_connections,
+            minimum=1,
+        )
+    if not str(args.torch_nccl_async_error_handling).strip():
+        errors.append("--torch-nccl-async-error-handling cannot be empty")
 
     if args.max_length > PAPER_CONTEXT_LENGTH:
         errors.append(
@@ -1693,6 +1764,16 @@ def parse_args(
         default=_env_float("MAX_GRAD_NORM", 1.0),
     )
     parser.add_argument(
+        "--optimizer-impl",
+        choices=OPTIMIZER_IMPL_CHOICES,
+        default=os.environ.get("SWEHERO_OPTIMIZER_IMPL", "foreach"),
+        help=(
+            "TorchTitan AdamW implementation. This used to be an implicit "
+            "SWEHERO_OPTIMIZER_IMPL environment input; it is now part of the "
+            "recorded launch contract."
+        ),
+    )
+    parser.add_argument(
         "--attention-backend",
         choices=("sdpa", "flex", "flex_flash", "varlen"),
         default=os.environ.get("ATTENTION_BACKEND", "sdpa"),
@@ -1714,6 +1795,36 @@ def parse_args(
         action=argparse.BooleanOptionalAction,
         default=_env_flag("COMPILE", True),
         help="Torch compile model/loss. Keep enabled for FP8 performance.",
+    )
+    parser.add_argument(
+        "--training-dtype",
+        choices=TORCH_DTYPE_CHOICES,
+        default=os.environ.get("SWEHERO_TRAINING_DTYPE", "float32"),
+        help=(
+            "TorchTitan training dtype. Defaults to the current direct-to-hero "
+            "config value and is exported as SWEHERO_TRAINING_DTYPE."
+        ),
+    )
+    parser.add_argument(
+        "--mixed-precision-param-dtype",
+        choices=TORCH_DTYPE_CHOICES,
+        default=os.environ.get("SWEHERO_MP_PARAM_DTYPE", "bfloat16"),
+        help="FSDP/autocast parameter dtype exported as SWEHERO_MP_PARAM_DTYPE.",
+    )
+    parser.add_argument(
+        "--mixed-precision-reduce-dtype",
+        choices=TORCH_DTYPE_CHOICES,
+        default=os.environ.get("SWEHERO_MP_REDUCE_DTYPE", "bfloat16"),
+        help="FSDP reduction dtype exported as SWEHERO_MP_REDUCE_DTYPE.",
+    )
+    parser.add_argument(
+        "--fsdp-reshard-after-forward",
+        choices=FSDP_RESHARD_AFTER_FORWARD_CHOICES,
+        default=os.environ.get("SWEHERO_FSDP_RESHARD_AFTER_FORWARD", "never"),
+        help=(
+            "TorchTitan FSDP reshard policy. Defaults to the current "
+            "direct-to-hero config value and is recorded in the run spec."
+        ),
     )
     parser.add_argument(
         "--activation-checkpoint-mode",
@@ -1800,6 +1911,15 @@ def parse_args(
             "profiling/memory_snapshot",
         ),
         help="Memory snapshot folder relative to the TorchTitan dump folder.",
+    )
+    parser.add_argument(
+        "--detect-anomaly",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("SWEHERO_DETECT_ANOMALY", False),
+        help=(
+            "Enable Torch autograd anomaly detection through TorchTitan. This "
+            "used to be an unrecorded SWEHERO_DETECT_ANOMALY environment input."
+        ),
     )
     parser.add_argument(
         "--enable-wandb",
@@ -1938,6 +2058,22 @@ def parse_args(
         "--torchrun-log-rank-filter",
         default=os.environ.get("TORCHRUN_LOG_RANK_FILTER", "0"),
         help="Optional torchrun --local-ranks-filter value.",
+    )
+    parser.add_argument(
+        "--cuda-device-max-connections",
+        default=os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
+        help=(
+            "Value exported to CUDA_DEVICE_MAX_CONNECTIONS for torchrun workers. "
+            "The previous implicit default was 1."
+        ),
+    )
+    parser.add_argument(
+        "--torch-nccl-async-error-handling",
+        default=os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"),
+        help=(
+            "Value exported to TORCH_NCCL_ASYNC_ERROR_HANDLING for torchrun "
+            "workers. The previous implicit default was 1."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -4668,9 +4804,9 @@ def build_stage_env(
         {
             "PYTHONPATH": os.pathsep.join(pythonpath_entries),
             "TOKENIZERS_PARALLELISM": "false",
-            "CUDA_DEVICE_MAX_CONNECTIONS": env.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
-            "TORCH_NCCL_ASYNC_ERROR_HANDLING": env.get(
-                "TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"
+            "CUDA_DEVICE_MAX_CONNECTIONS": str(args.cuda_device_max_connections),
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING": str(
+                args.torch_nccl_async_error_handling
             ),
             "LOG_RANK": args.log_rank,
             "SWEHERO_MODEL_ID": args.model_id,
@@ -4694,12 +4830,18 @@ def build_stage_env(
             "SWEHERO_MIN_LEARNING_RATE": repr(args.min_learning_rate),
             "SWEHERO_WEIGHT_DECAY": repr(args.weight_decay),
             "SWEHERO_MAX_GRAD_NORM": repr(args.max_grad_norm),
+            "SWEHERO_OPTIMIZER_IMPL": args.optimizer_impl,
             "SWEHERO_ATTENTION_BACKEND": args.attention_backend,
             "SWEHERO_ENABLE_FP8": "1" if args.enable_fp8 else "0",
             "SWEHERO_FP8_RECIPE": args.fp8_recipe,
             "SWEHERO_COMPILE": "1" if args.compile else "0",
+            "SWEHERO_TRAINING_DTYPE": args.training_dtype,
+            "SWEHERO_MP_PARAM_DTYPE": args.mixed_precision_param_dtype,
+            "SWEHERO_MP_REDUCE_DTYPE": args.mixed_precision_reduce_dtype,
+            "SWEHERO_FSDP_RESHARD_AFTER_FORWARD": args.fsdp_reshard_after_forward,
             "SWEHERO_AC_MODE": args.activation_checkpoint_mode,
             "SWEHERO_CHUNKED_CE_CHUNKS": str(args.chunked_ce_chunks),
+            "SWEHERO_DETECT_ANOMALY": "1" if args.detect_anomaly else "0",
             "SWEHERO_CHECKPOINT_INTERVAL": str(args.checkpoint_interval),
             "SWEHERO_CHECKPOINT_ASYNC_MODE": args.checkpoint_async_mode,
             "SWEHERO_METRICS_LOG_FREQ": str(args.metrics_log_freq),
