@@ -21,6 +21,7 @@ from typing import Any
 
 
 MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
+MODEL_REVISION = "c03e6d358207e414f1eca0bb1891e29f1db0e242"
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
 PAPER_CONTEXT_LENGTH = 131_072
 QWEN_NATIVE_CONTEXT_LENGTH = 32_768
@@ -99,6 +100,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("--hf-model-id", default=os.environ.get("MODEL_ID", MODEL_ID))
+    parser.add_argument(
+        "--hf-model-revision",
+        default=(
+            os.environ.get("MODEL_REVISION")
+            or os.environ.get("HF_MODEL_REVISION")
+            or MODEL_REVISION
+        ),
+        help=(
+            "Exact Hugging Face model commit SHA used when the parity reference "
+            "must resolve assets from the Hub."
+        ),
+    )
     parser.add_argument(
         "--hf-assets-path",
         type=Path,
@@ -208,6 +221,12 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def _remote_revision_kwargs(path_or_id: str | Path, revision: str) -> dict[str, str]:
+    if Path(path_or_id).exists():
+        return {}
+    return {"revision": revision}
+
+
 def _torch_dtype(torch: Any, raw: str) -> Any:
     return {
         "float32": torch.float32,
@@ -310,6 +329,7 @@ def _tokenize_prompts(args: argparse.Namespace, torch: Any) -> list[Any]:
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         trust_remote_code=args.trust_remote_code,
+        **_remote_revision_kwargs(tokenizer_path, args.hf_model_revision),
     )
     prompts = args.prompt or [DEFAULT_PROMPT]
     encoded_prompts = []
@@ -371,15 +391,21 @@ def _collect_hf_logits(
     if not Path(reference_path).exists():
         reference_path = args.hf_model_id
 
+    reference_revision_kwargs = _remote_revision_kwargs(
+        reference_path,
+        args.hf_model_revision,
+    )
     config = AutoConfig.from_pretrained(
         reference_path,
         trust_remote_code=args.trust_remote_code,
+        **reference_revision_kwargs,
     )
     config_summary = _apply_reference_to_hf_config(config, args.reference_context)
     model_kwargs: dict[str, Any] = {
         "config": config,
         "torch_dtype": dtype,
         "trust_remote_code": args.trust_remote_code,
+        **reference_revision_kwargs,
     }
     if args.hf_attn_implementation != "auto":
         model_kwargs["attn_implementation"] = args.hf_attn_implementation
@@ -580,6 +606,7 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
     report = {
         "passed": passed,
         "model_id": args.hf_model_id,
+        "model_revision": args.hf_model_revision,
         "hf_assets_path": str(args.hf_assets_path),
         "reference_model_path": str(args.reference_model_path or args.hf_assets_path),
         "reference_context": args.reference_context,

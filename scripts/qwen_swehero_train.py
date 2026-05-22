@@ -54,6 +54,7 @@ from scripts import qwen_swehero_smoke as smoke
 IGNORE_INDEX = -100
 
 MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
+MODEL_REVISION = "c03e6d358207e414f1eca0bb1891e29f1db0e242"
 TRAINING_DATASET_NAME = "swe-hero-openhands-trajectories-5b2ed21-one-rollout"
 DATASET_ID = TRAINING_DATASET_NAME
 SOURCE_DATASET_ID = one_rollout.DATASET_ID
@@ -138,6 +139,7 @@ CONTROLLED_WANDB_ENV_KEYS = (
 )
 RESUME_ARG_FIELDS = (
     "model_id",
+    "model_revision",
     "dataset_id",
     "dataset_path",
     "source_dataset_id",
@@ -190,6 +192,7 @@ RESUME_ARG_FIELDS = (
 )
 RUN_SPEC_ARG_FIELDS = (
     "model_id",
+    "model_revision",
     "dataset_id",
     "dataset_path",
     "source_dataset_id",
@@ -265,6 +268,7 @@ RUN_SPEC_ARG_FIELDS = (
 )
 RESUME_STAGE_ENV_KEYS = (
     "SWEHERO_MODEL_ID",
+    "SWEHERO_MODEL_REVISION",
     "SWEHERO_DATASET_ID",
     "SWEHERO_DATASET_PATH",
     "SWEHERO_BUCKET_FILE",
@@ -677,6 +681,11 @@ def validate_launch_inputs(
     bucket_cp: Mapping[int, int],
 ) -> None:
     errors: list[str] = []
+    if not re.fullmatch(r"[0-9a-f]{40}", str(args.model_revision)):
+        errors.append(
+            "--model-revision must be an exact 40-character lowercase "
+            f"Hugging Face commit SHA; got {args.model_revision!r}"
+        )
 
     int_minima = (
         ("--source-dataset-rows-per-shard", args.source_dataset_rows_per_shard, 1),
@@ -1201,6 +1210,7 @@ def _resume_manifest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "materialized_data_schema_version"
         ),
         "model_id": manifest.get("model_id"),
+        "model_revision": manifest.get("model_revision"),
         "dataset_id": manifest.get("dataset_id"),
         "dataset_path": manifest.get("dataset_path"),
         "dataset_artifact": manifest.get("dataset_artifact"),
@@ -1429,6 +1439,18 @@ def parse_args(
         fromfile_prefix_chars="@",
     )
     parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", MODEL_ID))
+    parser.add_argument(
+        "--model-revision",
+        default=(
+            os.environ.get("MODEL_REVISION")
+            or os.environ.get("HF_MODEL_REVISION")
+            or MODEL_REVISION
+        ),
+        help=(
+            "Exact Hugging Face model commit SHA. The default pins "
+            "Qwen/Qwen2.5-Coder-7B-Instruct so asset downloads cannot float."
+        ),
+    )
     parser.add_argument(
         "--dataset-id", default=os.environ.get("DATASET_ID", DATASET_ID)
     )
@@ -2292,6 +2314,7 @@ def _safetensors_index_summary(
 def _model_asset_provenance(
     *,
     model_id: str,
+    model_revision: str,
     hf_assets_path: Path,
     tokenizer_metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -2302,6 +2325,7 @@ def _model_asset_provenance(
     return {
         "schema_version": MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
         "model_id": model_id,
+        "model_revision": model_revision,
         "hf_assets_path": str(hf_assets_path),
         "hf_assets_realpath": str(hf_assets_path.resolve()),
         "file_count": len(inventory),
@@ -2517,6 +2541,7 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "kept": {
             "base_model": args.model_id,
+            "base_model_revision": args.model_revision,
             "dataset": args.dataset_id,
             "dataset_path": str(args.dataset_path),
             "source_dataset": args.source_dataset_id,
@@ -3101,6 +3126,19 @@ def validate_materialized_data_manifest(
             f"{model_assets.get('schema_version')!r}; expected "
             f"{MODEL_ASSET_PROVENANCE_SCHEMA_VERSION}"
         )
+    model_revision = manifest.get("model_revision")
+    if not isinstance(model_revision, str) or not re.fullmatch(
+        r"[0-9a-f]{40}",
+        model_revision,
+    ):
+        raise RuntimeError(
+            "Materialized data manifest is missing exact model_revision"
+        )
+    if model_assets.get("model_revision") != model_revision:
+        raise RuntimeError(
+            "model_assets.model_revision does not match manifest.model_revision: "
+            f"{model_assets.get('model_revision')!r} != {model_revision!r}"
+        )
     model_asset_files = model_assets.get("files")
     if not isinstance(model_asset_files, list):
         raise RuntimeError("model_assets.files must contain the hashed asset inventory")
@@ -3385,6 +3423,7 @@ def materialize_synthetic_smoke_buckets(args: argparse.Namespace) -> dict[str, A
             "materialized_data_schema_version": MATERIALIZED_DATA_SCHEMA_VERSION,
             "created_at_unix": time.time(),
             "model_id": args.model_id,
+            "model_revision": args.model_revision,
             "dataset_id": args.dataset_id,
             "dataset_path": str(args.dataset_path),
             "dataset_artifact": dataset_artifact,
@@ -3393,6 +3432,7 @@ def materialize_synthetic_smoke_buckets(args: argparse.Namespace) -> dict[str, A
             "paper_alignment": paper_alignment(args),
             "model_assets": _model_asset_provenance(
                 model_id=args.model_id,
+                model_revision=args.model_revision,
                 hf_assets_path=args.hf_assets_path,
                 tokenizer_metadata=tokenizer_metadata,
             ),
@@ -3598,6 +3638,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
             "materialized_data_schema_version": MATERIALIZED_DATA_SCHEMA_VERSION,
             "created_at_unix": time.time(),
             "model_id": args.model_id,
+            "model_revision": args.model_revision,
             "dataset_id": args.dataset_id,
             "dataset_path": str(args.dataset_path),
             "dataset_artifact": dataset_artifact,
@@ -3606,6 +3647,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
             "paper_alignment": paper_alignment(args),
             "model_assets": _model_asset_provenance(
                 model_id=args.model_id,
+                model_revision=args.model_revision,
                 hf_assets_path=args.hf_assets_path,
                 tokenizer_metadata=tokenizer_metadata,
             ),
@@ -3681,6 +3723,8 @@ def download_hf_assets_if_requested(args: argparse.Namespace) -> None:
         str(repo_root / "torchtitan" / "scripts" / "download_hf_assets.py"),
         "--repo_id",
         args.model_id,
+        "--revision",
+        args.model_revision,
         "--local_dir",
         str(local_dir),
         "--assets",
@@ -3797,6 +3841,12 @@ def _validate_manifest_model_asset_preflight(
             "Materialized model_assets.model_id does not match launch model_id: "
             f"{model_assets.get('model_id')!r} != {args.model_id!r}"
         )
+    if model_assets.get("model_revision") != args.model_revision:
+        raise RuntimeError(
+            "Materialized model_assets.model_revision does not match launch "
+            f"model_revision: {model_assets.get('model_revision')!r} != "
+            f"{args.model_revision!r}"
+        )
 
     recorded_realpath = model_assets.get("hf_assets_realpath")
     current_realpath = str(args.hf_assets_path.resolve())
@@ -3871,6 +3921,7 @@ def _validate_manifest_model_asset_preflight(
 
     return {
         "model_id": model_assets.get("model_id"),
+        "model_revision": model_assets.get("model_revision"),
         "file_count": checked_files,
         "total_bytes": checked_bytes,
     }
@@ -3912,6 +3963,7 @@ def validate_hf_asset_preflight(
     )
 
     return {
+        "model_revision": args.model_revision,
         "hf_assets_path": str(args.hf_assets_path),
         "required_files": list(REQUIRED_HF_ASSET_FILES),
         "config_model_type": config.get("model_type"),
@@ -4355,6 +4407,8 @@ def build_hf_logits_parity_command(args: argparse.Namespace) -> list[str]:
         str(repo_root / "scripts" / "qwen_swehero_logits_parity.py"),
         "--hf-model-id",
         args.model_id,
+        "--hf-model-revision",
+        args.model_revision,
         "--hf-assets-path",
         str(args.hf_assets_path),
         "--reference-model-path",
@@ -4620,6 +4674,7 @@ def build_stage_env(
             ),
             "LOG_RANK": args.log_rank,
             "SWEHERO_MODEL_ID": args.model_id,
+            "SWEHERO_MODEL_REVISION": args.model_revision,
             "SWEHERO_DATASET_ID": args.dataset_id,
             "SWEHERO_DATASET_PATH": str(args.dataset_path),
             "SWEHERO_BUCKET_FILE": str(stage.bucket_file),

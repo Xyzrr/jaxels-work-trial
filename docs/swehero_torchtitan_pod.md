@@ -14,6 +14,11 @@ scripts/run_qwen_swehero_torchtitan_pod.sh \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
 ```
 
+The launcher pins the base checkpoint to
+`Qwen/Qwen2.5-Coder-7B-Instruct@c03e6d358207e414f1eca0bb1891e29f1db0e242`.
+That revision is passed to Hugging Face asset downloads, recorded in the data
+manifest and run spec, and checked during preflight before launch.
+
 Do not launch this job with bare `python`, bare `torchrun`, or
 `/workspace/venv`. The run wrapper verifies the canonical venv first, prepends
 that venv to `PATH`, and points `TORCHRUN_BIN` at the venv's `torchrun`.

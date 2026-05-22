@@ -73,10 +73,21 @@ class QwenSweHeroLogitsParityTests(unittest.TestCase):
     def test_cli_defaults_to_paper_yarn_reference(self):
         args = parity.parse_args([])
 
+        self.assertEqual(args.hf_model_revision, parity.MODEL_REVISION)
         self.assertEqual(args.reference_context, "paper-yarn-128k")
         self.assertEqual(args.dtype, "float32")
         self.assertEqual(args.hf_attn_implementation, "eager")
         self.assertTrue(args.force_math_attention)
+
+    def test_remote_revision_kwargs_only_apply_to_hub_ids(self):
+        self.assertEqual(
+            parity._remote_revision_kwargs(
+                "Qwen/Qwen2.5-Coder-7B-Instruct",
+                parity.MODEL_REVISION,
+            ),
+            {"revision": parity.MODEL_REVISION},
+        )
+        self.assertEqual(parity._remote_revision_kwargs(".", parity.MODEL_REVISION), {})
 
 
 if __name__ == "__main__":

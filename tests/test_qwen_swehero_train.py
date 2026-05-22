@@ -63,6 +63,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             path.write_text("")
         manifest = {
             "model_id": args.model_id,
+            "model_revision": args.model_revision,
             "dataset_id": args.dataset_id,
             "dataset_path": str(args.dataset_path),
             "dataset_artifact": {
@@ -80,6 +81,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             "model_assets": {
                 "schema_version": train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
                 "model_id": args.model_id,
+                "model_revision": args.model_revision,
                 "hf_assets_path": str(args.hf_assets_path),
                 "hf_assets_realpath": str(args.hf_assets_path),
                 "file_count": 1,
@@ -197,6 +199,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 return_value={
                     "schema_version": train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
                     "model_id": args.model_id,
+                    "model_revision": args.model_revision,
                     "hf_assets_path": str(args.hf_assets_path),
                     "hf_assets_realpath": str(args.hf_assets_path),
                     "file_count": 1,
@@ -277,6 +280,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         return {
             "model_assets": train._model_asset_provenance(
                 model_id=args.model_id,
+                model_revision=args.model_revision,
                 hf_assets_path=args.hf_assets_path,
                 tokenizer_metadata=tokenizer_metadata,
             )
@@ -358,6 +362,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         )
 
         self.assertEqual(args.model_id, train.MODEL_ID)
+        self.assertEqual(args.model_revision, train.MODEL_REVISION)
         self.assertEqual(args.dataset_id, train.DATASET_ID)
         self.assertEqual(args.dataset_path, train.DEFAULT_DATASET_PATH)
         self.assertEqual(args.source_dataset_id, train.SOURCE_DATASET_ID)
@@ -489,6 +494,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
     def test_launch_input_validation_rejects_bad_numeric_values(self):
         cases = [
+            (["--model-revision", "main"], "--model-revision must be an exact"),
             (["--source-dataset-rows-per-shard", "0"], "--source-dataset-rows-per-shard"),
             (["--source-dataset-build-batch-size", "0"], "--source-dataset-build-batch-size"),
             (["--num-examples", "-1"], "--num-examples"),
@@ -873,6 +879,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
             provenance = train._model_asset_provenance(
                 model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
+                model_revision=train.MODEL_REVISION,
                 hf_assets_path=hf_assets,
                 tokenizer_metadata=tokenizer_metadata,
             )
@@ -882,6 +889,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             provenance["schema_version"],
             train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
         )
+        self.assertEqual(provenance["model_revision"], train.MODEL_REVISION)
         self.assertEqual(provenance["file_count"], len(files))
         self.assertEqual(
             provenance["total_bytes"],
@@ -938,6 +946,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             mismatched_manifest = json.loads(json.dumps(manifest))
             mismatched_manifest["model_assets"]["model_id"] = "other/model"
             with self.assertRaisesRegex(RuntimeError, "model_assets.model_id"):
+                train.validate_hf_asset_preflight(args, mismatched_manifest)
+
+            mismatched_manifest = json.loads(json.dumps(manifest))
+            mismatched_manifest["model_assets"]["model_revision"] = "0" * 40
+            with self.assertRaisesRegex(RuntimeError, "model_assets.model_revision"):
                 train.validate_hf_asset_preflight(args, mismatched_manifest)
 
             (hf_assets / "model-00001-of-00001.safetensors").write_bytes(
@@ -2042,6 +2055,28 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(command[command.index("--batch-size") + 1], "17")
         self.assertNotIn("--overwrite", command)
 
+    def test_hf_asset_download_pins_model_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
+                    "--download-hf-assets",
+                ]
+            )
+
+            with patch.object(train.subprocess, "run") as run:
+                train.download_hf_assets_if_requested(args)
+
+        command = run.call_args.args[0]
+        self.assertIn("--repo_id", command)
+        self.assertEqual(command[command.index("--repo_id") + 1], train.MODEL_ID)
+        self.assertIn("--revision", command)
+        self.assertEqual(
+            command[command.index("--revision") + 1],
+            train.MODEL_REVISION,
+        )
+
     def test_dataset_revision_alias_pins_source_revision(self):
         args = train.parse_args(["--dataset-revision", "legacy-sha"])
 
@@ -2251,6 +2286,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             )
             self.assertEqual(manifest, loaded_manifest)
             self.assertEqual(manifest["bucket_counts"], {"256": 1})
+            self.assertEqual(manifest["model_revision"], args.model_revision)
+            self.assertEqual(
+                manifest["model_assets"]["model_revision"],
+                args.model_revision,
+            )
             self.assertEqual(
                 manifest["model_assets"]["schema_version"],
                 train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
@@ -2386,6 +2426,40 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "model_assets provenance"):
                 train._load_manifest(args.out_dir)
 
+    def test_load_manifest_rejects_missing_model_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "256",
+                    "--max-length",
+                    "256",
+                    "--num-examples",
+                    "1",
+                ]
+            )
+            example = {
+                "instance_id": "short",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+            manifest = self._materialize_with_fake_runtime(args, [example])
+            manifest.pop("model_revision")
+            (args.out_dir / "data" / "manifest.json").write_text(
+                json.dumps(manifest, indent=2)
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "model_revision"):
+                train._load_manifest(args.out_dir)
+
     def test_load_manifest_rejects_inconsistent_data_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = train.parse_args(
@@ -2479,6 +2553,15 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             launcher_plan = json.loads((out_dir / "launcher_plan.json").read_text())
 
         self.assertEqual(run_spec["args"]["max_length"], 256)
+        self.assertEqual(run_spec["args"]["model_revision"], train.MODEL_REVISION)
+        self.assertEqual(
+            run_spec["paper_alignment"]["kept"]["base_model_revision"],
+            train.MODEL_REVISION,
+        )
+        self.assertEqual(
+            run_spec["manifest"]["model_revision"],
+            train.MODEL_REVISION,
+        )
         self.assertEqual(
             run_spec["args"]["bucket_curriculum"], train.DEFAULT_BUCKET_CURRICULUM
         )
@@ -2908,6 +2991,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual(env["SWEHERO_BUCKET_CP"], "2")
         self.assertEqual(env["SWEHERO_BUCKET_SEQ_LEN"], "32768")
+        self.assertEqual(env["SWEHERO_MODEL_REVISION"], train.MODEL_REVISION)
         self.assertEqual(env["SWEHERO_ENABLE_FP8"], "1")
         self.assertEqual(env["SWEHERO_CUMULATIVE_STEPS"], "3")
         self.assertEqual(
@@ -3018,6 +3102,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("--reference-model-path") + 1],
             str(hf_assets),
+        )
+        self.assertIn("--hf-model-revision", command)
+        self.assertEqual(
+            command[command.index("--hf-model-revision") + 1],
+            train.MODEL_REVISION,
         )
         self.assertIn("--json-out", command)
         self.assertEqual(
