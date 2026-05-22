@@ -506,6 +506,37 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual(detected, canonical_root)
 
+    def test_launch_lock_rejects_duplicate_and_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(["--out-dir", str(Path(tmp) / "run")])
+            lock_path = train._launch_lock_path(args.out_dir)
+
+            with train.launch_lock(args):
+                self.assertTrue(lock_path.is_file())
+                payload = json.loads(lock_path.read_text())
+                self.assertEqual(
+                    payload["schema_version"],
+                    train.LAUNCH_LOCK_SCHEMA_VERSION,
+                )
+                self.assertEqual(payload["out_dir"], str(args.out_dir))
+                with self.assertRaisesRegex(RuntimeError, "Launch lock already exists"):
+                    with train.launch_lock(args):
+                        pass
+
+            self.assertFalse(lock_path.exists())
+
+    def test_launch_lock_is_sidecar_to_survive_overwrite_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            args = train.parse_args(
+                ["--out-dir", str(out_dir), "--overwrite-output"]
+            )
+
+            lock_path = train._launch_lock_path(args.out_dir)
+
+        self.assertEqual(lock_path, out_dir.with_name("run.launch.lock"))
+        self.assertNotEqual(lock_path.parent, out_dir)
+
     def test_production_mode_rejects_smoke_and_subset_controls(self):
         cases = [
             (["--dry-run"], "--dry-run"),
@@ -2140,6 +2171,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             str(train._configured_workspace_root(args)),
         )
         self.assertEqual(
+            spec["paths"]["launch_lock"],
+            str(train._launch_lock_path(args.out_dir)),
+        )
+        self.assertEqual(
             spec["workspace"]["configured_root"],
             str(train._configured_workspace_root(args)),
         )
@@ -3152,6 +3187,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             str(out_dir / train.RUN_SPEC_FILENAME),
         )
         self.assertEqual(
+            launcher_plan["launch_lock"],
+            str(train._launch_lock_path(out_dir)),
+        )
+        self.assertEqual(
             launcher_plan["wandb_identity"],
             str(out_dir / train.WANDB_IDENTITY_FILENAME),
         )
@@ -3176,6 +3215,36 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             launcher_plan["post_training_eval_status"],
             str(out_dir / train.POST_TRAINING_EVAL_STATUS_FILENAME),
         )
+        self.assertFalse(train._launch_lock_path(out_dir).exists())
+
+    def test_main_rejects_duplicate_launch_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            args = train.parse_args(["--out-dir", str(out_dir)])
+            lock_path = train._launch_lock_path(out_dir)
+
+            with train.launch_lock(args):
+                with self.assertRaisesRegex(RuntimeError, "Launch lock already exists"):
+                    train.main(
+                        [
+                            "--out-dir",
+                            str(out_dir),
+                            "--smoke-synthetic-buckets",
+                            "--max-length",
+                            "256",
+                            "--buckets",
+                            "256",
+                            "--bucket-cp",
+                            "256:1",
+                            "--global-batch-size",
+                            "8",
+                            "--num-train-epochs",
+                            "1",
+                            "--dry-run",
+                        ]
+                    )
+
+            self.assertFalse(lock_path.exists())
 
     def test_main_writes_wandb_identity_for_dry_run_launch(self):
         with tempfile.TemporaryDirectory() as tmp:

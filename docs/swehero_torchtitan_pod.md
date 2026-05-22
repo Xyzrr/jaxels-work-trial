@@ -203,6 +203,22 @@ Reviewed argument files for the actual direct-to-hero run should include
 `--production-mode`. Leave that flag out for smoke, profiler, and bounded soak
 commands because those intentionally use prototype settings.
 
+## Output Launch Lock
+
+Every launcher invocation acquires an atomic sidecar lock before reading,
+rewriting, or resuming an output directory:
+
+```text
+<out-dir>.launch.lock
+```
+
+This lock is outside `--out-dir`, so `--overwrite-output` cannot delete a lock
+held by another process. If a second launcher targets the same `--out-dir`, it
+fails before data prep or TorchTitan startup and reports the lock metadata
+(`pid`, `hostname`, and creation time). The lock is removed on normal exit and
+on handled exceptions; if the process is killed with `SIGKILL` or the pod dies,
+remove the sidecar only after confirming no matching launcher is still running.
+
 ## Recorded Training Environment Inputs
 
 Training-affecting TorchTitan environment controls should be set as launcher
