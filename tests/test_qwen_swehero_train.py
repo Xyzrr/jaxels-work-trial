@@ -1,4 +1,5 @@
 import ast
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,88 @@ class FakeTokenizer:
 
 
 class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
+    def _resume_test_setup(self, tmp: str):
+        out_dir = Path(tmp) / "run"
+        data_dir = out_dir / "data"
+        data_dir.mkdir(parents=True)
+        args = train.parse_args(
+            [
+                "--out-dir",
+                str(out_dir),
+                "--dataset-path",
+                str(Path(tmp) / "dataset"),
+                "--hf-assets-path",
+                str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
+                "--buckets",
+                "8192,32768",
+                "--bucket-cp",
+                "8192:1,32768:2",
+                "--max-length",
+                "32768",
+                "--num-examples",
+                "34",
+                "--max-streamed-examples",
+                "100",
+            ]
+        )
+        args.buckets = ",".join(str(b) for b in train.parse_bucket_list(args.buckets))
+        bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+        args.bucket_cp = train._format_bucket_cp_map(bucket_cp)
+        bucket_files = {
+            8192: data_dir / "bucket_8192.jsonl",
+            32768: data_dir / "bucket_32768.jsonl",
+        }
+        for path in bucket_files.values():
+            path.write_text("")
+        manifest = {
+            "model_id": args.model_id,
+            "dataset_id": args.dataset_id,
+            "dataset_path": str(args.dataset_path),
+            "dataset_artifact": {
+                "path": str(args.dataset_path),
+                "metadata_json_sha256": "metadata-sha",
+                "selection_manifest_sha256": "selection-sha",
+                "data_files": [],
+                "total_data_bytes": 0,
+            },
+            "source_dataset_id": args.source_dataset_id,
+            "source_dataset_revision": {
+                "requested_revision": args.source_dataset_revision,
+                "resolved_sha": "source-sha",
+            },
+            "tokenizer": {
+                "hf_assets_path": str(args.hf_assets_path),
+                "tokenizer_json_sha256": "tokenizer-sha",
+                "tokenizer_config_sha256": "tokenizer-config-sha",
+                "chat_template_sha256": "chat-template-sha",
+                "bos_id": None,
+                "eos_id": 151645,
+                "pad_id": 151643,
+                "trace_serializer": "test serializer",
+            },
+            "pad_token_id": 151643,
+            "max_length": args.max_length,
+            "buckets": [8192, 32768],
+            "bucket_files": {
+                str(bucket): str(path) for bucket, path in bucket_files.items()
+            },
+            "bucket_counts": {"8192": 33, "32768": 1},
+            "num_usable_examples": 34,
+            "streamed_examples_scanned": 34,
+            "skipped": {},
+            "include_model_patch": args.include_model_patch,
+        }
+        (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        plan = train.build_bucket_plan(
+            bucket_counts={8192: 33, 32768: 1},
+            bucket_files=bucket_files,
+            bucket_cp=bucket_cp,
+            epochs=args.num_train_epochs,
+            global_batch_size=args.global_batch_size,
+            warmup_ratio=args.warmup_ratio,
+        )
+        return args, manifest, plan
+
     def test_defaults_track_paper_hyperparameters_and_target_pod(self):
         args = train.parse_args([])
 
@@ -105,6 +188,120 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual([stage.steps for stage in plan.stages], [4, 1])
         self.assertEqual([stage.cumulative_steps for stage in plan.stages], [4, 5])
         self.assertEqual([stage.cp_degree for stage in plan.stages], [1, 2])
+
+    def test_resume_requires_existing_full_dcp_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(["--out-dir", str(Path(tmp) / "run"), "--resume"])
+            with self.assertRaises(FileNotFoundError):
+                train.validate_resume_request(args)
+
+            checkpoint_dir = Path(tmp) / "run" / "torchtitan" / "checkpoint" / "step-5"
+            checkpoint_dir.mkdir(parents=True)
+            (checkpoint_dir / "model.safetensors.index.json").write_text("{}")
+
+            with self.assertRaisesRegex(RuntimeError, "full DCP checkpoint"):
+                train.validate_resume_request(args)
+
+    def test_resume_rejects_destructive_refresh_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            (out_dir / "torchtitan" / "checkpoint" / "step-1").mkdir(parents=True)
+            args = train.parse_args(
+                ["--out-dir", str(out_dir), "--resume", "--overwrite-output"]
+            )
+
+            with self.assertRaisesRegex(ValueError, "overwrite-output"):
+                train.validate_resume_request(args)
+
+    def test_resume_ignores_final_model_export_when_deciding_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            full = checkpoint_root / "step-4"
+            export = checkpoint_root / "step-5"
+            full.mkdir(parents=True)
+            export.mkdir()
+            (full / ".metadata").write_text("{}")
+            (export / "model.safetensors.index.json").write_text("{}")
+            args.resume = True
+
+            resume_state = train.validate_resume_request(args)
+            train.validate_resume_progress(plan, resume_state)
+
+        self.assertEqual(resume_state.latest_resumable_step, 4)
+        self.assertEqual(resume_state.latest_any_step, 5)
+        self.assertEqual(train.stages_to_run_for_resume(plan, resume_state), ())
+
+    def test_resume_rejects_nonfinal_model_export_newer_than_full_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            full = checkpoint_root / "step-2"
+            export = checkpoint_root / "step-3"
+            full.mkdir(parents=True)
+            export.mkdir()
+            (full / ".metadata").write_text("{}")
+            (export / "model.safetensors.index.json").write_text("{}")
+            resume_state = train.ResumeCheckpointState(
+                checkpoint_dir=checkpoint_root,
+                latest_resumable_step=2,
+                latest_any_step=3,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "non-resumable export"):
+                train.validate_resume_progress(plan, resume_state)
+
+    def test_resume_contract_accepts_same_config_and_skips_completed_stages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            train._write_resume_contract(args, plan, manifest)
+            args.resume = True
+            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            latest = checkpoint_root / "step-4"
+            latest.mkdir(parents=True)
+            (latest / ".metadata").write_text("{}")
+            resume_state = train.validate_resume_request(args)
+
+            train.validate_resume_contract(args, plan, manifest)
+            stages = train.stages_to_run_for_resume(plan, resume_state)
+
+        self.assertEqual([stage.bucket for stage in stages], [32768])
+
+    def test_resume_contract_rejects_changed_training_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            train._write_resume_contract(args, plan, manifest)
+            changed = train.parse_args(
+                [
+                    "--out-dir",
+                    str(args.out_dir),
+                    "--dataset-path",
+                    str(args.dataset_path),
+                    "--hf-assets-path",
+                    str(args.hf_assets_path),
+                    "--buckets",
+                    args.buckets,
+                    "--bucket-cp",
+                    args.bucket_cp,
+                    "--max-length",
+                    str(args.max_length),
+                    "--num-examples",
+                    str(args.num_examples),
+                    "--max-streamed-examples",
+                    str(args.max_streamed_examples),
+                    "--learning-rate",
+                    "2e-5",
+                ]
+            )
+            changed.buckets = ",".join(
+                str(b) for b in train.parse_bucket_list(changed.buckets)
+            )
+            changed.bucket_cp = train._format_bucket_cp_map(
+                train.parse_bucket_cp_map(changed.bucket_cp)
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "learning_rate"):
+                train.validate_resume_contract(changed, plan, manifest)
 
     def test_varlen_attention_is_rejected_when_any_bucket_uses_cp(self):
         with self.assertRaisesRegex(ValueError, "VarlenAttention"):

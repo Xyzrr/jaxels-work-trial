@@ -28,6 +28,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -74,6 +75,68 @@ QWEN_DEFAULT_SYSTEM_PROMPT = (
 QWEN_ROPE_THETA = 1_000_000.0
 QWEN_YARN_BETA_FAST = 32.0
 QWEN_YARN_BETA_SLOW = 1.0
+RESUME_CONTRACT_SCHEMA_VERSION = 1
+RESUME_CONTRACT_FILENAME = "resume_contract.json"
+RESUME_ARG_FIELDS = (
+    "model_id",
+    "dataset_id",
+    "dataset_path",
+    "source_dataset_id",
+    "source_dataset_revision",
+    "hf_assets_path",
+    "num_examples",
+    "max_streamed_examples",
+    "shuffle_buffer",
+    "seed",
+    "max_length",
+    "buckets",
+    "bucket_cp",
+    "min_trainable_tokens",
+    "include_model_patch",
+    "num_train_epochs",
+    "max_steps",
+    "global_batch_size",
+    "local_batch_size",
+    "learning_rate",
+    "min_learning_rate",
+    "warmup_ratio",
+    "weight_decay",
+    "max_grad_norm",
+    "attention_backend",
+    "enable_fp8",
+    "fp8_recipe",
+    "compile",
+    "activation_checkpoint_mode",
+    "chunked_ce_chunks",
+    "nproc_per_node",
+)
+RESUME_STAGE_ENV_KEYS = (
+    "SWEHERO_MODEL_ID",
+    "SWEHERO_DATASET_ID",
+    "SWEHERO_DATASET_PATH",
+    "SWEHERO_BUCKET_FILE",
+    "SWEHERO_BUCKET_SEQ_LEN",
+    "SWEHERO_BUCKET_CP",
+    "SWEHERO_TOTAL_STEPS",
+    "SWEHERO_CUMULATIVE_STEPS",
+    "SWEHERO_WARMUP_STEPS",
+    "SWEHERO_HF_ASSETS_PATH",
+    "SWEHERO_TORCHTITAN_DUMP_FOLDER",
+    "SWEHERO_PAD_TOKEN_ID",
+    "SWEHERO_SEED",
+    "SWEHERO_GLOBAL_BATCH_SIZE",
+    "SWEHERO_LOCAL_BATCH_SIZE",
+    "SWEHERO_LEARNING_RATE",
+    "SWEHERO_MIN_LEARNING_RATE",
+    "SWEHERO_WEIGHT_DECAY",
+    "SWEHERO_MAX_GRAD_NORM",
+    "SWEHERO_ATTENTION_BACKEND",
+    "SWEHERO_ENABLE_FP8",
+    "SWEHERO_FP8_RECIPE",
+    "SWEHERO_COMPILE",
+    "SWEHERO_AC_MODE",
+    "SWEHERO_CHUNKED_CE_CHUNKS",
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +154,13 @@ class BucketPlan:
     stages: tuple[BucketStage, ...]
     total_steps: int
     warmup_steps: int
+
+
+@dataclass(frozen=True)
+class ResumeCheckpointState:
+    checkpoint_dir: Path
+    latest_resumable_step: int
+    latest_any_step: int
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -275,6 +345,286 @@ def build_bucket_plan(
         else 0
     )
     return BucketPlan(tuple(stages), cumulative, warmup_steps)
+
+
+def _resume_contract_path(out_dir: Path) -> Path:
+    return out_dir / RESUME_CONTRACT_FILENAME
+
+
+def _checkpoint_step(path: Path) -> int | None:
+    match = re.fullmatch(r"step-(\d+)", path.name)
+    return int(match.group(1)) if match else None
+
+
+def _has_dcp_checkpoint_metadata(path: Path) -> bool:
+    return (path / ".metadata").is_file()
+
+
+def _has_any_checkpoint_metadata(path: Path) -> bool:
+    return _has_dcp_checkpoint_metadata(path) or (
+        path / "model.safetensors.index.json"
+    ).is_file()
+
+
+def _checkpoint_steps(
+    checkpoint_dir: Path,
+    *,
+    include_model_exports: bool,
+) -> list[int]:
+    if not checkpoint_dir.is_dir():
+        return []
+
+    steps = []
+    for path in checkpoint_dir.iterdir():
+        step = _checkpoint_step(path)
+        if step is None:
+            continue
+        has_metadata = (
+            _has_any_checkpoint_metadata(path)
+            if include_model_exports
+            else _has_dcp_checkpoint_metadata(path)
+        )
+        if has_metadata:
+            steps.append(step)
+    return sorted(steps)
+
+
+def validate_resume_request(args: argparse.Namespace) -> ResumeCheckpointState | None:
+    if not args.resume:
+        return None
+    if args.overwrite_output:
+        raise ValueError("--resume cannot be combined with --overwrite-output")
+    if args.rebuild_source_dataset:
+        raise ValueError("--resume cannot be combined with --rebuild-source-dataset")
+    if args.download_hf_assets:
+        raise ValueError("--resume cannot be combined with --download-hf-assets")
+
+    checkpoint_dir = args.out_dir / "torchtitan" / "checkpoint"
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(
+            f"--resume requires an existing TorchTitan checkpoint directory: {checkpoint_dir}"
+        )
+
+    resumable_steps = _checkpoint_steps(checkpoint_dir, include_model_exports=False)
+    all_steps = _checkpoint_steps(checkpoint_dir, include_model_exports=True)
+    if not resumable_steps:
+        latest = max(all_steps) if all_steps else None
+        suffix = (
+            f" Found only non-resumable model export checkpoint(s), latest step {latest}."
+            if latest is not None
+            else ""
+        )
+        raise RuntimeError(
+            "--resume requires at least one full DCP checkpoint with optimizer, "
+            f"scheduler, and train-state metadata under {checkpoint_dir}.{suffix}"
+        )
+    return ResumeCheckpointState(
+        checkpoint_dir=checkpoint_dir,
+        latest_resumable_step=max(resumable_steps),
+        latest_any_step=max(all_steps),
+    )
+
+
+def _jsonable(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _jsonable(item)
+            for key, item in sorted(value.items(), key=lambda entry: str(entry[0]))
+        }
+    return value
+
+
+def _resume_manifest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    tokenizer = manifest.get("tokenizer")
+    tokenizer_contract = {}
+    if isinstance(tokenizer, Mapping):
+        tokenizer_contract = {
+            "hf_assets_path": tokenizer.get("hf_assets_path"),
+            "tokenizer_json_sha256": tokenizer.get("tokenizer_json_sha256"),
+            "tokenizer_config_sha256": tokenizer.get("tokenizer_config_sha256"),
+            "chat_template_sha256": tokenizer.get("chat_template_sha256"),
+            "bos_id": tokenizer.get("bos_id"),
+            "eos_id": tokenizer.get("eos_id"),
+            "pad_id": tokenizer.get("pad_id"),
+            "trace_serializer": tokenizer.get("trace_serializer"),
+        }
+
+    return {
+        "model_id": manifest.get("model_id"),
+        "dataset_id": manifest.get("dataset_id"),
+        "dataset_path": manifest.get("dataset_path"),
+        "dataset_artifact": manifest.get("dataset_artifact"),
+        "source_dataset_id": manifest.get("source_dataset_id"),
+        "source_dataset_revision": manifest.get("source_dataset_revision"),
+        "tokenizer": tokenizer_contract,
+        "pad_token_id": manifest.get("pad_token_id"),
+        "max_length": manifest.get("max_length"),
+        "buckets": manifest.get("buckets"),
+        "bucket_files": manifest.get("bucket_files"),
+        "bucket_counts": manifest.get("bucket_counts"),
+        "num_usable_examples": manifest.get("num_usable_examples"),
+        "streamed_examples_scanned": manifest.get("streamed_examples_scanned"),
+        "skipped": manifest.get("skipped"),
+        "include_model_patch": manifest.get("include_model_patch"),
+    }
+
+
+def build_resume_contract(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    pad_token_id = int(manifest["pad_token_id"])
+    stages = []
+    for stage in plan.stages:
+        env = build_stage_env(
+            args,
+            stage=stage,
+            total_steps=plan.total_steps,
+            warmup_steps=plan.warmup_steps,
+            pad_token_id=pad_token_id,
+        )
+        stages.append(
+            {
+                "stage": {
+                    **asdict(stage),
+                    "bucket_file": str(stage.bucket_file),
+                },
+                "env": {
+                    key: env[key]
+                    for key in RESUME_STAGE_ENV_KEYS
+                    if key in env
+                },
+            }
+        )
+
+    return {
+        "schema_version": RESUME_CONTRACT_SCHEMA_VERSION,
+        "args": {
+            field: _jsonable(getattr(args, field))
+            for field in RESUME_ARG_FIELDS
+        },
+        "manifest": _resume_manifest_contract(manifest),
+        "plan": {
+            "total_steps": plan.total_steps,
+            "warmup_steps": plan.warmup_steps,
+            "stages": [
+                {
+                    **asdict(stage),
+                    "bucket_file": str(stage.bucket_file),
+                }
+                for stage in plan.stages
+            ],
+        },
+        "stage_env": stages,
+    }
+
+
+def _write_resume_contract(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+) -> None:
+    contract = build_resume_contract(args, plan, manifest)
+    _resume_contract_path(args.out_dir).write_text(json.dumps(contract, indent=2))
+
+
+def _contract_diffs(expected: object, actual: object, path: str = "$") -> list[str]:
+    if isinstance(expected, Mapping) and isinstance(actual, Mapping):
+        diffs = []
+        keys = sorted(set(expected) | set(actual))
+        for key in keys:
+            child_path = f"{path}.{key}"
+            if key not in expected:
+                diffs.append(f"{child_path}: unexpected current value {actual[key]!r}")
+            elif key not in actual:
+                diffs.append(
+                    f"{child_path}: missing current value; expected {expected[key]!r}"
+                )
+            else:
+                diffs.extend(_contract_diffs(expected[key], actual[key], child_path))
+        return diffs
+    if isinstance(expected, list) and isinstance(actual, list):
+        diffs = []
+        if len(expected) != len(actual):
+            diffs.append(
+                f"{path}: expected list length {len(expected)}, found {len(actual)}"
+            )
+        for index, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            diffs.extend(
+                _contract_diffs(expected_item, actual_item, f"{path}[{index}]")
+            )
+        return diffs
+    if expected != actual:
+        return [f"{path}: expected {expected!r}, found {actual!r}"]
+    return []
+
+
+def validate_resume_contract(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+) -> None:
+    contract_path = _resume_contract_path(args.out_dir)
+    if not contract_path.exists():
+        raise RuntimeError(
+            f"--resume cannot be validated because {contract_path} is missing. "
+            "Start a fresh run with the current launcher so future resumes have "
+            "a recorded config contract."
+        )
+
+    expected = json.loads(contract_path.read_text())
+    actual = build_resume_contract(args, plan, manifest)
+    diffs = _contract_diffs(expected, actual)
+    if diffs:
+        preview = "\n".join(f"- {diff}" for diff in diffs[:20])
+        extra = "" if len(diffs) <= 20 else f"\n... and {len(diffs) - 20} more"
+        raise RuntimeError(
+            "--resume launch config does not match the original run contract:\n"
+            f"{preview}{extra}"
+        )
+
+
+def validate_resume_progress(
+    plan: BucketPlan,
+    resume_state: ResumeCheckpointState,
+) -> None:
+    if resume_state.latest_any_step > plan.total_steps:
+        raise RuntimeError(
+            f"latest checkpoint step {resume_state.latest_any_step} exceeds the "
+            f"current plan total_steps {plan.total_steps}; refusing incompatible resume"
+        )
+    if resume_state.latest_any_step > resume_state.latest_resumable_step:
+        if resume_state.latest_any_step == plan.total_steps:
+            return
+        raise RuntimeError(
+            "latest checkpoint is a model export without optimizer/train-state "
+            f"metadata at step {resume_state.latest_any_step}, while latest full "
+            f"checkpoint is step {resume_state.latest_resumable_step}. Refusing "
+            "because TorchTitan would try to load the non-resumable export."
+        )
+
+
+def stages_to_run_for_resume(
+    plan: BucketPlan,
+    resume_state: ResumeCheckpointState | None,
+) -> tuple[BucketStage, ...]:
+    if resume_state is None:
+        return plan.stages
+    progress_step = resume_state.latest_resumable_step
+    if resume_state.latest_any_step == plan.total_steps:
+        progress_step = resume_state.latest_any_step
+    return tuple(
+        stage
+        for stage in plan.stages
+        if stage.cumulative_steps > progress_step
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1455,6 +1805,7 @@ def main(argv: list[str] | None = None) -> None:
     args.buckets = ",".join(str(b) for b in parse_bucket_list(args.buckets))
     buckets = parse_bucket_list(args.buckets)
     bucket_cp = parse_bucket_cp_map(args.bucket_cp)
+    args.bucket_cp = _format_bucket_cp_map(bucket_cp)
     validate_bucket_config(
         buckets=buckets,
         bucket_cp=bucket_cp,
@@ -1468,6 +1819,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     if args.max_length > max(buckets):
         raise ValueError("--max-length cannot exceed the largest bucket")
+
+    resume_state = validate_resume_request(args)
+    if resume_state is not None:
+        args.skip_data_prep = True
 
     if args.overwrite_output and args.out_dir.exists():
         shutil.rmtree(args.out_dir)
@@ -1506,6 +1861,11 @@ def main(argv: list[str] | None = None) -> None:
         warmup_ratio=args.warmup_ratio,
         max_steps=args.max_steps,
     )
+    if resume_state is not None:
+        validate_resume_contract(args, plan, manifest)
+        validate_resume_progress(plan, resume_state)
+    else:
+        _write_resume_contract(args, plan, manifest)
     _write_launcher_plan(args, plan, manifest)
 
     print(json.dumps({"bucket_plan": [asdict(stage) for stage in plan.stages]}, default=str, indent=2))
@@ -1514,7 +1874,17 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     pad_token_id = int(manifest["pad_token_id"])
-    for stage in plan.stages:
+    stages_to_run = stages_to_run_for_resume(plan, resume_state)
+    if resume_state is not None:
+        print(
+            "Resuming from full checkpoint step "
+            f"{resume_state.latest_resumable_step}; "
+            f"{len(stages_to_run)} bucket stage(s) remain."
+        )
+        if not stages_to_run:
+            print("No bucket stages remain; training is already complete for this plan.")
+            return
+    for stage in stages_to_run:
         run_stage(args, stage, plan, pad_token_id)
 
 
