@@ -50,8 +50,9 @@ created. Do not rely on a host symlink for this path.
 
 The CUDA base image does not include Python. The pod entrypoint uses the pinned
 `/workspace/uv/uv-0.11.16/uv` binary to install CPython 3.10.12 under
-`/workspace/python` before idling. It also installs `tmux` when the base image
-does not provide it, so reconnectable launches are available before training.
+`/workspace/python` before idling. It also installs `tmux` and `git` when the
+base image does not provide them, so reconnectable launches and production Git
+metadata checks are available before training.
 The persisted uv-managed venv under `/workspace/venvs/torchtitan-swehero-cu128`
 has a valid interpreter after every pod recreation without relying on
 apt-managed Python.
@@ -254,9 +255,11 @@ not silently duplicate records because a length bucket is too small for the
 configured rank topology.
 
 Production mode also requires `git` to be available in the launch environment
-and the repository worktree to be clean. Commit or stash local edits before the
-paper-aligned run; non-production smoke runs record whatever Git state is
-available but do not enforce cleanliness.
+and the repository worktree to be clean. The canonical pod manifest installs
+`git` at container startup; recreate older running pods from
+`manifests/midtraining-hostpath.yaml` before a paper-aligned production run.
+Commit or stash local edits before launch; non-production smoke runs record
+whatever Git state is available but do not enforce cleanliness.
 
 Production mode requires W&B metrics with a durable mode. Include
 `--enable-wandb` and do not set `--wandb-mode offline` or

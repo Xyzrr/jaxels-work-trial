@@ -20,10 +20,13 @@ spec:
         - bash
         - -lc
         - |
-          if ! command -v tmux >/dev/null 2>&1; then
+          missing_packages=()
+          command -v tmux >/dev/null 2>&1 || missing_packages+=(tmux)
+          command -v git >/dev/null 2>&1 || missing_packages+=(git)
+          if ((${#missing_packages[@]})); then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y --no-install-recommends tmux
+            apt-get install -y --no-install-recommends "${missing_packages[@]}"
             rm -rf /var/lib/apt/lists/*
           fi
           export UV_CACHE_DIR=/workspace/.cache/uv
