@@ -21,11 +21,34 @@ from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
 
 
+def _jsonl_offsets_for_rank(
+    dataset_path: Path,
+    *,
+    dp_rank: int | None,
+    dp_world_size: int,
+) -> tuple[list[int], int]:
+    offsets: list[int] = []
+    record_index = 0
+    with dataset_path.open("rb") as handle:
+        while True:
+            offset = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            if not line.strip():
+                continue
+            if dp_rank is None or record_index % dp_world_size == dp_rank:
+                offsets.append(offset)
+            record_index += 1
+    return offsets, record_index
+
+
 class _SweHeroJsonlDataset(IterableDataset, Stateful):
     def __init__(
         self,
         *,
-        records: list[dict[str, Any]],
+        dataset_path: Path,
+        offsets: list[int],
         dp_rank: int,
         dp_world_size: int,
         seed: int,
@@ -33,7 +56,8 @@ class _SweHeroJsonlDataset(IterableDataset, Stateful):
         infinite: bool,
     ) -> None:
         super().__init__()
-        self.records = records
+        self.dataset_path = dataset_path
+        self.offsets = offsets
         self.dp_rank = dp_rank
         self.dp_world_size = dp_world_size
         self.seed = seed
@@ -42,41 +66,37 @@ class _SweHeroJsonlDataset(IterableDataset, Stateful):
         self._epoch = 0
         self._offset = 0
 
-    def _records_for_iterator(self) -> list[dict[str, Any]]:
-        records = self.records[self.dp_rank :: self.dp_world_size]
-        if not records:
-            # Tiny smoke buckets can have fewer examples than DP ranks. Reuse
-            # the bucket on empty ranks so distributed smoke tests do not fail
-            # before the full filtered dataset is ready.
-            records = self.records
-
+    def _offsets_for_iterator(self) -> list[int]:
+        offsets = self.offsets
         worker = get_worker_info()
         if worker is not None and worker.num_workers > 1:
-            records = records[worker.id :: worker.num_workers] or records
-        return records
+            offsets = offsets[worker.id :: worker.num_workers] or offsets
+        return offsets
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        records = self._records_for_iterator()
+        offsets = self._offsets_for_iterator()
         epoch = self._epoch
         offset = self._offset
-        while True:
-            order = list(range(len(records)))
-            if self.shuffle:
-                random.Random(self.seed + self.dp_rank + epoch * 1_000_003).shuffle(
-                    order
-                )
-            while offset < len(order):
-                index = order[offset]
-                offset += 1
+        with self.dataset_path.open("rb") as handle:
+            while True:
+                order = list(range(len(offsets)))
+                if self.shuffle:
+                    random.Random(self.seed + self.dp_rank + epoch * 1_000_003).shuffle(
+                        order
+                    )
+                while offset < len(order):
+                    index = order[offset]
+                    offset += 1
+                    self._epoch = epoch
+                    self._offset = offset
+                    handle.seek(offsets[index])
+                    yield json.loads(handle.readline())
+                epoch += 1
+                offset = 0
                 self._epoch = epoch
                 self._offset = offset
-                yield records[index]
-            epoch += 1
-            offset = 0
-            self._epoch = epoch
-            self._offset = offset
-            if not self.infinite:
-                break
+                if not self.infinite:
+                    break
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -87,7 +107,7 @@ class _SweHeroJsonlDataset(IterableDataset, Stateful):
             "seed": self.seed,
             "shuffle": self.shuffle,
             "infinite": self.infinite,
-            "record_count": len(self._records_for_iterator()),
+            "record_count": len(self._offsets_for_iterator()),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -99,7 +119,7 @@ class _SweHeroJsonlDataset(IterableDataset, Stateful):
             "seed": self.seed,
             "shuffle": self.shuffle,
             "infinite": self.infinite,
-            "record_count": len(self._records_for_iterator()),
+            "record_count": len(self._offsets_for_iterator()),
         }
         mismatches = {
             key: {"expected": expected[key], "actual": state_dict.get(key)}
@@ -140,18 +160,28 @@ class SweHeroDataLoader(ParallelAwareDataloader):
         if not dataset_path.exists():
             raise FileNotFoundError(f"SWE-HERO bucket file not found: {dataset_path}")
 
-        records = [
-            json.loads(line)
-            for line in dataset_path.read_text().splitlines()
-            if line.strip()
-        ]
-        if not records:
+        offsets, total_records = _jsonl_offsets_for_rank(
+            dataset_path,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+        )
+        if total_records == 0:
             raise ValueError(f"SWE-HERO bucket file is empty: {dataset_path}")
+        if not offsets:
+            # Tiny smoke buckets can have fewer examples than DP ranks. Reuse
+            # the bucket on empty ranks so distributed smoke tests do not fail
+            # before the full filtered dataset is ready.
+            offsets, _total_records = _jsonl_offsets_for_rank(
+                dataset_path,
+                dp_rank=None,
+                dp_world_size=dp_world_size,
+            )
 
         self.seq_len = seq_len
         self.pad_token_id = config.pad_token_id
         dataset = _SweHeroJsonlDataset(
-            records=records,
+            dataset_path=dataset_path,
+            offsets=offsets,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             seed=config.seed,
@@ -174,11 +204,11 @@ class SweHeroDataLoader(ParallelAwareDataloader):
     def _legacy_dataset_state_from_num_yielded(
         self, num_yielded: int
     ) -> dict[str, Any]:
-        records = self._swehero_dataset._records_for_iterator()
+        offsets = self._swehero_dataset._offsets_for_iterator()
         consumed_records = num_yielded * int(self.batch_size or 1)
         state = self._swehero_dataset.state_dict()
-        state["epoch"] = consumed_records // len(records)
-        state["offset"] = consumed_records % len(records)
+        state["epoch"] = consumed_records // len(offsets)
+        state["offset"] = consumed_records % len(offsets)
         return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:

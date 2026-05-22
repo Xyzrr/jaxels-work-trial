@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,24 +36,68 @@ class SweHeroDataLoaderResumeTests(unittest.TestCase):
                     + "\n"
                 )
 
-    def _build_loader(self, bucket_path: Path) -> "SweHeroDataLoader":
+    def _build_loader(
+        self,
+        bucket_path: Path,
+        *,
+        dp_world_size: int = 1,
+        dp_rank: int = 0,
+        shuffle: bool = True,
+    ) -> "SweHeroDataLoader":
         assert SweHeroDataLoader is not None
         config = SweHeroDataLoader.Config(
             dataset_path=str(bucket_path),
             pad_token_id=0,
             seed=123,
-            shuffle=True,
+            shuffle=shuffle,
             infinite=True,
             pin_memory=False,
         )
         return SweHeroDataLoader(
             config,
-            dp_world_size=1,
-            dp_rank=0,
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
             tokenizer=None,
             seq_len=8,
             local_batch_size=2,
         )
+
+    def test_loader_streams_rank_offsets_without_full_jsonl_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bucket_path = Path(tmp) / "bucket_8.jsonl"
+            self._write_bucket(bucket_path, count=6)
+
+            with patch.object(
+                Path,
+                "read_text",
+                side_effect=AssertionError("full JSONL read is not allowed"),
+            ):
+                loader = self._build_loader(
+                    bucket_path,
+                    dp_world_size=2,
+                    dp_rank=1,
+                    shuffle=False,
+                )
+                inputs, labels = next(iter(loader))
+
+        self.assertEqual(inputs["input"][:, 0].tolist(), [2, 4])
+        self.assertEqual(labels[:, 0].tolist(), [2, 4])
+
+    def test_empty_rank_reuses_tiny_bucket_for_smoke_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bucket_path = Path(tmp) / "bucket_8.jsonl"
+            self._write_bucket(bucket_path, count=1)
+
+            loader = self._build_loader(
+                bucket_path,
+                dp_world_size=4,
+                dp_rank=3,
+                shuffle=False,
+            )
+            inputs, labels = next(iter(loader))
+
+        self.assertEqual(inputs["input"][0, 0].item(), 1)
+        self.assertEqual(labels[0, 0].item(), 1)
 
     def test_state_dict_restores_next_batch_order(self):
         with tempfile.TemporaryDirectory() as tmp:
