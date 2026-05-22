@@ -19,6 +19,14 @@ class MidtrainingHostpathManifestTests(unittest.TestCase):
             manifest,
         )
         self.assertIn(
+            "command -v cc >/dev/null 2>&1 || missing_packages+=(build-essential)",
+            manifest,
+        )
+        self.assertIn(
+            "command -v lspci >/dev/null 2>&1 || missing_packages+=(pciutils)",
+            manifest,
+        )
+        self.assertIn(
             'apt-get install -y --no-install-recommends "${missing_packages[@]}"',
             manifest,
         )

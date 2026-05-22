@@ -50,9 +50,10 @@ created. Do not rely on a host symlink for this path.
 
 The CUDA base image does not include Python. The pod entrypoint uses the pinned
 `/workspace/uv/uv-0.11.16/uv` binary to install CPython 3.10.12 under
-`/workspace/python` before idling. It also installs `tmux` and `git` when the
-base image does not provide them, so reconnectable launches and production Git
-metadata checks are available before training.
+`/workspace/python` before idling. It also installs `tmux`, `git`, a C/C++
+toolchain, and `lspci` when the base image does not provide them, so
+reconnectable launches, production Git metadata checks, TorchInductor/Triton
+compilation, and hardware inventory are available before training.
 The persisted uv-managed venv under `/workspace/venvs/torchtitan-swehero-cu128`
 has a valid interpreter after every pod recreation without relying on
 apt-managed Python.
