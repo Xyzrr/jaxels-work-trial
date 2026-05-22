@@ -1393,11 +1393,22 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(report["final_export"]["layout"], "final_export")
         self.assertEqual(report["final_export"]["shard_count"], 2)
         self.assertEqual(report["final_export"]["weight_map_entries"], 2)
+        self.assertEqual(report["final_export"]["index_metadata_total_size"], 14)
+        self.assertEqual(
+            report["final_export"]["shards"][0]["sha256"],
+            train._sha256_text("shard-1"),
+        )
         self.assertEqual(report["resumable_checkpoints"]["steps"], [5])
         self.assertEqual(report["resumable_checkpoints"]["latest_step"], 5)
         self.assertEqual(
             report["resumable_checkpoints"]["checkpoints"][0]["payload_file_count"],
             1,
+        )
+        self.assertEqual(
+            report["resumable_checkpoints"]["checkpoints"][0]["payload_files"][0][
+                "rank"
+            ],
+            0,
         )
 
     def test_final_artifact_validation_requires_final_resumable_checkpoint(self):
@@ -1418,6 +1429,29 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "final model export shard"):
                 train.validate_final_artifacts(args, plan, write_report=False)
 
+    def test_final_artifact_validation_rejects_unindexed_export_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_dcp_checkpoint(args.out_dir, step=5)
+            export = self._write_final_export(args.out_dir, step=5)
+            (export / "orphan.safetensors").write_bytes(b"orphan")
+
+            with self.assertRaisesRegex(RuntimeError, "unindexed"):
+                train.validate_final_artifacts(args, plan, write_report=False)
+
+    def test_final_artifact_validation_rejects_impossible_export_total_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_dcp_checkpoint(args.out_dir, step=5)
+            export = self._write_final_export(args.out_dir, step=5)
+            index_path = export / "model.safetensors.index.json"
+            index = json.loads(index_path.read_text())
+            index["metadata"]["total_size"] = 10_000
+            index_path.write_text(json.dumps(index))
+
+            with self.assertRaisesRegex(RuntimeError, "total_size"):
+                train.validate_final_artifacts(args, plan, write_report=False)
+
     def test_final_artifact_validation_rejects_empty_dcp_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
@@ -1426,6 +1460,16 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             self._write_final_export(args.out_dir, step=5)
 
             with self.assertRaisesRegex(RuntimeError, "DCP checkpoint payload"):
+                train.validate_final_artifacts(args, plan, write_report=False)
+
+    def test_final_artifact_validation_rejects_malformed_dcp_payload_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            checkpoint = self._write_dcp_checkpoint(args.out_dir, step=5)
+            (checkpoint / "__0_0.distcp").replace(checkpoint / "rank0.distcp")
+            self._write_final_export(args.out_dir, step=5)
+
+            with self.assertRaisesRegex(RuntimeError, "payload file name"):
                 train.validate_final_artifacts(args, plan, write_report=False)
 
     def test_final_artifact_validation_rejects_duplicate_legacy_export(self):

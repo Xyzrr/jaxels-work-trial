@@ -4425,7 +4425,19 @@ def _validate_dcp_checkpoint_step(step_dir: Path) -> dict[str, Any]:
 
     payloads = []
     total_payload_bytes = 0
+    rank_ids: set[int] = set()
+    shard_ids: set[int] = set()
     for path in distcp_files:
+        match = re.fullmatch(r"__(\d+)_(\d+)\.distcp", path.name)
+        if not match:
+            raise RuntimeError(
+                "DCP checkpoint payload file name does not match the expected "
+                f"'__<rank>_<shard>.distcp' pattern: {path}"
+            )
+        rank_id = int(match.group(1))
+        shard_id = int(match.group(2))
+        rank_ids.add(rank_id)
+        shard_ids.add(shard_id)
         _require_nonempty_file(path, "DCP checkpoint payload")
         payload_bytes = path.stat().st_size
         total_payload_bytes += payload_bytes
@@ -4433,6 +4445,8 @@ def _validate_dcp_checkpoint_step(step_dir: Path) -> dict[str, Any]:
             {
                 "path": str(path),
                 "bytes": payload_bytes,
+                "rank": rank_id,
+                "shard": shard_id,
             }
         )
 
@@ -4441,8 +4455,12 @@ def _validate_dcp_checkpoint_step(step_dir: Path) -> dict[str, Any]:
         "path": str(step_dir),
         "metadata_path": str(metadata_path),
         "metadata_bytes": metadata_path.stat().st_size,
+        "metadata_sha256": _hash_file(metadata_path),
         "payload_file_count": len(payloads),
         "payload_total_bytes": total_payload_bytes,
+        "payload_rank_count": len(rank_ids),
+        "payload_ranks": sorted(rank_ids),
+        "payload_shards": sorted(shard_ids),
         "payload_files": payloads,
     }
 
@@ -4498,8 +4516,36 @@ def _validate_final_export_step(
         raise RuntimeError(
             f"Final model export index has no weight_map entries: {index_path}"
         )
+    metadata = index.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError(
+            f"Final model export index metadata must be an object: {index_path}"
+        )
+    metadata_total_size = metadata.get("total_size")
+    if (
+        not isinstance(metadata_total_size, int)
+        or isinstance(metadata_total_size, bool)
+        or metadata_total_size <= 0
+    ):
+        raise RuntimeError(
+            "Final model export index metadata.total_size must be a positive "
+            f"integer: {metadata_total_size!r}"
+        )
 
-    shard_names = sorted(set(str(path) for path in weight_map.values()))
+    for tensor_name, shard_name in weight_map.items():
+        if not isinstance(tensor_name, str) or not tensor_name:
+            raise RuntimeError(
+                "Final model export index contains a non-string or empty tensor "
+                f"name: {tensor_name!r}"
+            )
+        if not isinstance(shard_name, str) or not shard_name:
+            raise RuntimeError(
+                "Final model export index contains a non-string or empty shard "
+                f"path for tensor {tensor_name!r}: {shard_name!r}"
+            )
+
+    shard_names = sorted(set(weight_map.values()))
+    referenced_shard_paths: set[str] = set()
     shards = []
     total_shard_bytes = 0
     for shard_name in shard_names:
@@ -4514,13 +4560,32 @@ def _validate_final_export_step(
             label="Final model export index",
         )
         _require_nonempty_file(shard_path, "final model export shard")
+        relative_shard_path = shard_path.relative_to(step_dir).as_posix()
+        referenced_shard_paths.add(relative_shard_path)
         shard_bytes = shard_path.stat().st_size
         total_shard_bytes += shard_bytes
         shards.append(
             {
-                "path": shard_name,
+                "path": relative_shard_path,
                 "bytes": shard_bytes,
+                "sha256": _hash_file(shard_path),
             }
+        )
+    top_level_safetensors = {
+        path.relative_to(step_dir).as_posix()
+        for path in step_dir.glob("*.safetensors")
+        if path.is_file()
+    }
+    unindexed_shards = sorted(top_level_safetensors - referenced_shard_paths)
+    if unindexed_shards:
+        raise RuntimeError(
+            "Final model export contains unindexed safetensors shard(s): "
+            f"{unindexed_shards}"
+        )
+    if metadata_total_size > total_shard_bytes:
+        raise RuntimeError(
+            "Final model export index metadata.total_size exceeds total shard "
+            f"bytes: {metadata_total_size} > {total_shard_bytes}"
         )
 
     return {
@@ -4529,6 +4594,8 @@ def _validate_final_export_step(
         "path": str(step_dir),
         "index_path": str(index_path),
         "index_sha256": _hash_file(index_path),
+        "index_metadata": dict(metadata),
+        "index_metadata_total_size": metadata_total_size,
         "weight_map_entries": len(weight_map),
         "shard_count": len(shards),
         "total_shard_bytes": total_shard_bytes,
