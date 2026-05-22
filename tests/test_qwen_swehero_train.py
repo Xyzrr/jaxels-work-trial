@@ -468,6 +468,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.mixed_precision_reduce_dtype, "bfloat16")
         self.assertEqual(args.fsdp_reshard_after_forward, "never")
         self.assertFalse(args.production_mode)
+        self.assertFalse(args.production_acceptance_smoke)
         self.assertFalse(args.detect_anomaly)
         self.assertEqual(args.min_free_disk_gb, train.DEFAULT_MIN_FREE_DISK_GB)
         self.assertEqual(
@@ -509,6 +510,66 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertTrue(args.validate_first_step_checkpoint)
         self.assertEqual(args.workspace_root, train.CANONICAL_WORKSPACE_ROOT)
         self.assertTrue(args.enable_wandb)
+        self.assertFalse(args.production_acceptance_smoke)
+
+    def test_production_acceptance_smoke_allows_bounded_real_subset(self):
+        args = self._validate_default_production_launch_args(
+            [
+                "--production-acceptance-smoke",
+                "--num-examples",
+                "8",
+                "--max-streamed-examples",
+                "64",
+                "--max-length",
+                "8192",
+                "--long-example-policy",
+                "skip",
+                "--buckets",
+                "8192",
+                "--bucket-cp",
+                "8192:1",
+                "--bucket-curriculum",
+                "single-bucket",
+                "--num-train-epochs",
+                "1",
+                "--max-steps",
+                "1",
+                "--global-batch-size",
+                "8",
+                "--no-compile",
+                "--no-enable-fp8",
+            ]
+        )
+
+        self.assertTrue(args.production_mode)
+        self.assertTrue(args.production_acceptance_smoke)
+        self.assertEqual(args.num_examples, 8)
+        self.assertEqual(args.max_steps, 1)
+        self.assertEqual(args.bucket_curriculum, "single-bucket")
+
+    def test_production_acceptance_smoke_requires_production_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
+                    "--production-acceptance-smoke",
+                    "--num-examples",
+                    "8",
+                    "--max-streamed-examples",
+                    "64",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "--production-mode"):
+                train.validate_launch_inputs(
+                    args,
+                    buckets=train.parse_bucket_list(args.buckets),
+                    bucket_cp=train.parse_bucket_cp_map(args.bucket_cp),
+                )
 
     def test_production_mode_requires_clean_git_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2658,7 +2719,12 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertTrue(spec["args"]["production_mode"])
         self.assertTrue(contract["args"]["production_mode"])
+        self.assertFalse(spec["args"]["production_acceptance_smoke"])
+        self.assertFalse(contract["args"]["production_acceptance_smoke"])
         self.assertTrue(spec["paper_alignment"]["run_safety"]["production_mode"])
+        self.assertFalse(
+            spec["paper_alignment"]["run_safety"]["production_acceptance_smoke"]
+        )
         self.assertEqual(spec["workspace"]["configured_root"], str(args.workspace_root))
         self.assertEqual(contract["workspace"]["configured_root"], str(args.workspace_root))
         self.assertEqual(
@@ -2670,6 +2736,30 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(
             contract["stage_env"][0]["env"]["SWEHERO_ALLOW_EMPTY_RANK_REUSE"],
             "0",
+        )
+
+    def test_production_acceptance_smoke_records_empty_rank_reuse_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            args.production_mode = True
+            args.production_acceptance_smoke = True
+            spec = train.build_run_spec(args, plan, manifest)
+            contract = train.build_resume_contract(args, plan, manifest)
+
+        self.assertTrue(spec["args"]["production_mode"])
+        self.assertTrue(spec["args"]["production_acceptance_smoke"])
+        self.assertTrue(
+            spec["paper_alignment"]["run_safety"]["production_acceptance_smoke"]
+        )
+        self.assertEqual(
+            spec["plan"]["stages"][0]["env_overrides"][
+                "SWEHERO_ALLOW_EMPTY_RANK_REUSE"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            contract["stage_env"][0]["env"]["SWEHERO_ALLOW_EMPTY_RANK_REUSE"],
+            "1",
         )
 
     def test_hidden_torchtitan_env_inputs_are_recorded_as_launch_args(self):

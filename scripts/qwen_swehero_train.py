@@ -173,6 +173,7 @@ RESUME_ARG_FIELDS = (
     "source_dataset_revision",
     "hf_assets_path",
     "production_mode",
+    "production_acceptance_smoke",
     "num_examples",
     "max_streamed_examples",
     "shuffle_buffer",
@@ -245,6 +246,7 @@ RUN_SPEC_ARG_FIELDS = (
     "source_dataset_build_batch_size",
     "hf_assets_path",
     "production_mode",
+    "production_acceptance_smoke",
     "num_examples",
     "max_streamed_examples",
     "shuffle_buffer",
@@ -926,6 +928,7 @@ def _production_mode_errors(
     if not args.production_mode:
         return []
 
+    acceptance_smoke = bool(args.production_acceptance_smoke)
     errors: list[str] = []
     forbidden_flags = (
         ("--dry-run", args.dry_run, "it does not launch training"),
@@ -1009,6 +1012,8 @@ def _production_mode_errors(
             DEFAULT_VALIDATE_FIRST_STEP_CHECKPOINT,
         ),
     )
+    if acceptance_smoke:
+        required_values = required_values[:3] + required_values[-1:]
     for name, actual, expected in required_values:
         if not _values_match(actual, expected):
             errors.append(
@@ -1017,21 +1022,42 @@ def _production_mode_errors(
                 "being recorded as the production direct-to-hero run."
             )
 
-    if buckets != DEFAULT_BUCKETS:
+    if acceptance_smoke:
+        if args.num_examples <= 0:
+            errors.append(
+                "--production-acceptance-smoke requires --num-examples > 0 "
+                "so the run is a bounded real dataset subset."
+            )
+        if args.max_streamed_examples <= 0:
+            errors.append(
+                "--production-acceptance-smoke requires "
+                "--max-streamed-examples > 0 so the real-data smoke is bounded."
+            )
+        elif args.num_examples > 0 and args.max_streamed_examples < args.num_examples:
+            errors.append(
+                "--production-acceptance-smoke requires "
+                "--max-streamed-examples >= --num-examples."
+            )
+        if args.max_steps <= 0:
+            errors.append(
+                "--production-acceptance-smoke requires --max-steps > 0 "
+                "so acceptance cannot accidentally launch the full training run."
+            )
+    elif buckets != DEFAULT_BUCKETS:
         errors.append(
             "--production-mode requires "
             f"--buckets={','.join(str(bucket) for bucket in DEFAULT_BUCKETS)}; "
             f"got {','.join(str(bucket) for bucket in buckets)}. This preserves "
             "the reviewed full-context bucket plan."
         )
-    if dict(bucket_cp) != DEFAULT_BUCKET_CP:
+    if not acceptance_smoke and dict(bucket_cp) != DEFAULT_BUCKET_CP:
         errors.append(
             "--production-mode requires "
             f"--bucket-cp={_format_bucket_cp_map(DEFAULT_BUCKET_CP)}; got "
             f"{_format_bucket_cp_map(bucket_cp)}. This preserves the reviewed "
             "per-bucket context-parallel plan."
         )
-    if args.bucket_curriculum != DEFAULT_BUCKET_CURRICULUM:
+    if not acceptance_smoke and args.bucket_curriculum != DEFAULT_BUCKET_CURRICULUM:
         errors.append(
             "--production-mode requires "
             f"--bucket-curriculum={DEFAULT_BUCKET_CURRICULUM!r}; got "
@@ -1060,6 +1086,8 @@ def validate_launch_inputs(
 ) -> None:
     errors: list[str] = []
     errors.extend(_artifact_path_safety_errors(args))
+    if args.production_acceptance_smoke and not args.production_mode:
+        errors.append("--production-acceptance-smoke requires --production-mode")
     if args.model_id != MODEL_ID:
         errors.append(
             "--model-id must be "
@@ -1563,6 +1591,7 @@ def _launch_lock_payload(args: argparse.Namespace) -> dict[str, Any]:
         "lock_path": str(_launch_lock_path(args.out_dir)),
         "workspace_root": str(_configured_workspace_root(args)),
         "production_mode": bool(args.production_mode),
+        "production_acceptance_smoke": bool(args.production_acceptance_smoke),
         "resume": bool(args.resume),
         "overwrite_output": bool(args.overwrite_output),
         "argv": sys.argv,
@@ -2668,6 +2697,17 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--production-acceptance-smoke",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("PRODUCTION_ACCEPTANCE_SMOKE", False),
+        help=(
+            "Explicit final-acceptance exception inside --production-mode. "
+            "This keeps production provenance, real-data, checkpoint, export, "
+            "validation, and durable W&B gates enabled while allowing a bounded "
+            "tiny real dataset subset and step cap."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         default=_env_flag("DRY_RUN", False),
@@ -3343,7 +3383,14 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "run_safety": {
             "production_mode": args.production_mode,
+            "production_acceptance_smoke": args.production_acceptance_smoke,
             "production_gate": (
+                "enabled for final acceptance smoke: production provenance, "
+                "real dataset, checkpoint/export/validation, and durable W&B "
+                "gates are enforced; bounded subset and step-cap deviations "
+                "are explicitly recorded"
+                if args.production_mode and args.production_acceptance_smoke
+                else
                 "enabled: smoke, subset, step-capped, and shortened-context "
                 "settings are rejected before launch"
                 if args.production_mode
@@ -3370,6 +3417,10 @@ def _stringify(value: object) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False)
+
+
+def allow_empty_rank_reuse(args: argparse.Namespace) -> bool:
+    return (not args.production_mode) or bool(args.production_acceptance_smoke)
 
 
 def _message_content_text(content: object) -> str:
@@ -5148,7 +5199,11 @@ def validate_launch_preflight(
             raise RuntimeError(f"Launch stage has no steps: {stage}")
         if stage.example_count <= 0:
             raise RuntimeError(f"Launch stage has no examples: {stage}")
-        if args.production_mode and stage.example_count < data_parallel_degree:
+        if (
+            args.production_mode
+            and not args.production_acceptance_smoke
+            and stage.example_count < data_parallel_degree
+        ):
             raise RuntimeError(
                 "Production bucket stage would leave data-parallel ranks empty: "
                 f"bucket={stage.bucket}, examples={stage.example_count}, "
@@ -5174,7 +5229,7 @@ def validate_launch_preflight(
                 "examples": stage.example_count,
                 "steps": stage.steps,
                 "data_parallel_degree": data_parallel_degree,
-                "allow_empty_rank_reuse": not args.production_mode,
+                "allow_empty_rank_reuse": allow_empty_rank_reuse(args),
             }
         )
 
@@ -5799,9 +5854,9 @@ def build_stage_env(
             "SWEHERO_BUCKET_FILE": str(stage.bucket_file),
             "SWEHERO_BUCKET_SEQ_LEN": str(stage.bucket),
             "SWEHERO_BUCKET_CP": str(stage.cp_degree),
-            "SWEHERO_ALLOW_EMPTY_RANK_REUSE": "0"
-            if args.production_mode
-            else "1",
+            "SWEHERO_ALLOW_EMPTY_RANK_REUSE": "1"
+            if allow_empty_rank_reuse(args)
+            else "0",
             "SWEHERO_TOTAL_STEPS": str(total_steps),
             "SWEHERO_CUMULATIVE_STEPS": str(stage.cumulative_steps),
             "SWEHERO_WARMUP_STEPS": str(warmup_steps),
@@ -6387,6 +6442,8 @@ def _build_stage_status_document(
             "mode": args.wandb_mode,
         },
         "launch": {
+            "production_mode": bool(args.production_mode),
+            "production_acceptance_smoke": bool(args.production_acceptance_smoke),
             "resume": bool(args.resume),
             "distributed": _distributed_launch_summary(args),
             "resume_state": _resume_state_status_record(resume_state),

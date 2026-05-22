@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-lifecycle-smoke")
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
 DEFAULT_BUCKET = 1024
+DEFAULT_ACCEPTANCE_BUCKET = 16_384
 DEFAULT_CP_DEGREE = 1
 DEFAULT_TIMEOUT_SECONDS = 4 * 60 * 60
 
@@ -38,8 +39,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run the existing Qwen SWE-HERO TorchTitan launcher on a tiny "
-            "synthetic GPU workload, then resume the completed run and verify "
-            "checkpoint/export validation artifacts."
+            "GPU workload, then resume the completed run and verify "
+            "checkpoint/export validation artifacts. By default this uses "
+            "synthetic tokenized buckets; --production-acceptance-smoke uses "
+            "a bounded real SWE-HERO subset under the production gate."
         )
     )
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
@@ -47,6 +50,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--hf-assets-path",
         type=Path,
         default=DEFAULT_HF_ASSETS_PATH,
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional real SWE-HERO dataset artifact for "
+            "--production-acceptance-smoke. Defaults to the launcher dataset."
+        ),
     )
     parser.add_argument(
         "--launcher",
@@ -60,7 +72,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=_env_int("NPROC_PER_NODE", 8),
         help="GPU processes for torchrun. Defaults to NPROC_PER_NODE or 8.",
     )
-    parser.add_argument("--bucket", type=int, default=DEFAULT_BUCKET)
+    parser.add_argument(
+        "--bucket",
+        type=int,
+        default=None,
+        help=(
+            f"Sequence bucket. Defaults to {DEFAULT_BUCKET} for synthetic "
+            f"lifecycle smoke and {DEFAULT_ACCEPTANCE_BUCKET} for production "
+            "acceptance smoke."
+        ),
+    )
     parser.add_argument("--cp-degree", type=int, default=DEFAULT_CP_DEGREE)
     parser.add_argument("--local-batch-size", type=int, default=1)
     parser.add_argument(
@@ -68,6 +89,58 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="Total optimizer steps for the smoke. One step is enough to cover checkpoint/export.",
+    )
+    parser.add_argument(
+        "--production-acceptance-smoke",
+        action="store_true",
+        help=(
+            "Run a final acceptance smoke with --production-mode enabled and "
+            "a tiny real dataset subset instead of synthetic records."
+        ),
+    )
+    parser.add_argument(
+        "--num-examples",
+        type=int,
+        default=_env_int("NUM_EXAMPLES", 1),
+        help="Accepted real examples for --production-acceptance-smoke.",
+    )
+    parser.add_argument(
+        "--max-streamed-examples",
+        type=int,
+        default=_env_int("MAX_STREAMED_EXAMPLES", 1),
+        help="Raw streamed real examples to inspect for --production-acceptance-smoke.",
+    )
+    parser.add_argument(
+        "--shuffle-buffer",
+        type=int,
+        default=_env_int("SHUFFLE_BUFFER", 0),
+        help=(
+            "Streaming shuffle buffer for --production-acceptance-smoke. "
+            "Defaults to 0 so the final smoke does not fill a large buffer "
+            "before accepting a tiny subset."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("online", "shared"),
+        default=os.environ.get("WANDB_MODE", "online"),
+        help="Durable W&B mode for --production-acceptance-smoke.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        default=os.environ.get(
+            "WANDB_RUN_NAME",
+            "qwen25-coder7b-swehero-final-acceptance-smoke",
+        ),
+        help="W&B run name for --production-acceptance-smoke.",
+    )
+    parser.add_argument(
+        "--wandb-run-tags",
+        default=os.environ.get(
+            "WANDB_RUN_TAGS",
+            "direct-to-hero,final-acceptance-smoke",
+        ),
+        help="Comma-separated W&B tags for --production-acceptance-smoke.",
     )
     parser.add_argument(
         "--timeout-seconds",
@@ -105,7 +178,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=16,
         help="Smaller write probe for the lifecycle smoke.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.bucket is None:
+        args.bucket = (
+            DEFAULT_ACCEPTANCE_BUCKET
+            if args.production_acceptance_smoke
+            else DEFAULT_BUCKET
+        )
+    return args
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -122,6 +202,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         errors.append("--local-batch-size must be positive")
     if args.timeout_seconds <= 0:
         errors.append("--timeout-seconds must be positive")
+    if args.shuffle_buffer < 0:
+        errors.append("--shuffle-buffer must be non-negative")
+    if args.production_acceptance_smoke:
+        if args.num_examples <= 0:
+            errors.append("--num-examples must be positive for production acceptance")
+        if args.max_streamed_examples <= 0:
+            errors.append(
+                "--max-streamed-examples must be positive for production acceptance"
+            )
+        elif args.max_streamed_examples < args.num_examples:
+            errors.append(
+                "--max-streamed-examples must be >= --num-examples for production acceptance"
+            )
     if args.nproc_per_node > 0 and args.cp_degree > 0:
         if args.nproc_per_node % args.cp_degree != 0:
             errors.append("--cp-degree must divide --nproc-per-node")
@@ -143,56 +236,90 @@ def _synthetic_examples_per_bucket(args: argparse.Namespace) -> int:
 
 def _common_launcher_args(args: argparse.Namespace) -> list[str]:
     bucket = str(args.bucket)
-    return [
+    command = [
         "--out-dir",
         str(args.out_dir),
         "--hf-assets-path",
         str(args.hf_assets_path),
-        "--smoke-synthetic-buckets",
-        "--smoke-synthetic-examples-per-bucket",
-        str(_synthetic_examples_per_bucket(args)),
-        "--max-length",
-        bucket,
-        "--buckets",
-        bucket,
-        "--bucket-cp",
-        f"{bucket}:{args.cp_degree}",
-        "--bucket-curriculum",
-        "single-bucket",
-        "--nproc-per-node",
-        str(args.nproc_per_node),
-        "--global-batch-size",
-        str(_global_batch_size(args)),
-        "--local-batch-size",
-        str(args.local_batch_size),
-        "--num-train-epochs",
-        "1",
-        "--max-steps",
-        str(args.max_steps),
-        "--checkpoint-interval",
-        "1",
-        "--checkpoint-async-mode",
-        "disabled",
-        "--validate-first-step-checkpoint",
-        "--metrics-log-freq",
-        "1",
-        "--log-rank",
-        "0",
-        "--torchrun-log-rank-filter",
-        "0",
-        "--no-compile",
-        "--no-enable-fp8",
-        "--min-free-disk-gb",
-        repr(args.min_free_disk_gb),
-        "--min-free-gpu-memory-gb",
-        repr(args.min_free_gpu_memory_gb),
-        "--min-free-cpu-memory-gb",
-        repr(args.min_free_cpu_memory_gb),
-        "--min-write-throughput-mb-s",
-        repr(args.min_write_throughput_mb_s),
-        "--write-throughput-probe-mb",
-        str(args.write_throughput_probe_mb),
     ]
+    if args.dataset_path is not None:
+        command.extend(["--dataset-path", str(args.dataset_path)])
+    if args.production_acceptance_smoke:
+        command.extend(
+            [
+                "--production-mode",
+                "--production-acceptance-smoke",
+                "--num-examples",
+                str(args.num_examples),
+                "--max-streamed-examples",
+                str(args.max_streamed_examples),
+                "--long-example-policy",
+                "skip",
+                "--shuffle-buffer",
+                str(args.shuffle_buffer),
+                "--enable-wandb",
+                "--wandb-mode",
+                args.wandb_mode,
+                "--wandb-run-name",
+                args.wandb_run_name,
+                "--wandb-run-tags",
+                args.wandb_run_tags,
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "--smoke-synthetic-buckets",
+                "--smoke-synthetic-examples-per-bucket",
+                str(_synthetic_examples_per_bucket(args)),
+            ]
+        )
+    command.extend(
+        [
+            "--max-length",
+            bucket,
+            "--buckets",
+            bucket,
+            "--bucket-cp",
+            f"{bucket}:{args.cp_degree}",
+            "--bucket-curriculum",
+            "single-bucket",
+            "--nproc-per-node",
+            str(args.nproc_per_node),
+            "--global-batch-size",
+            str(_global_batch_size(args)),
+            "--local-batch-size",
+            str(args.local_batch_size),
+            "--num-train-epochs",
+            "1",
+            "--max-steps",
+            str(args.max_steps),
+            "--checkpoint-interval",
+            "1",
+            "--checkpoint-async-mode",
+            "disabled",
+            "--validate-first-step-checkpoint",
+            "--metrics-log-freq",
+            "1",
+            "--log-rank",
+            "0",
+            "--torchrun-log-rank-filter",
+            "0",
+            "--no-compile",
+            "--no-enable-fp8",
+            "--min-free-disk-gb",
+            repr(args.min_free_disk_gb),
+            "--min-free-gpu-memory-gb",
+            repr(args.min_free_gpu_memory_gb),
+            "--min-free-cpu-memory-gb",
+            repr(args.min_free_cpu_memory_gb),
+            "--min-write-throughput-mb-s",
+            repr(args.min_write_throughput_mb_s),
+            "--write-throughput-probe-mb",
+            str(args.write_throughput_probe_mb),
+        ]
+    )
+    return command
 
 
 def fresh_launch_command(args: argparse.Namespace) -> list[str]:
@@ -323,7 +450,100 @@ def _validate_stage_status(out_dir: Path, max_steps: int) -> dict[str, Any]:
     }
 
 
-def validate_smoke_outputs(out_dir: Path, *, max_steps: int) -> dict[str, Any]:
+def _validate_production_acceptance_metadata(out_dir: Path) -> dict[str, Any]:
+    run_spec = _read_json_object(out_dir / "run_spec.json", "run spec")
+    args = run_spec.get("args")
+    _require(isinstance(args, Mapping), "Run spec has no args object")
+    _require(args.get("production_mode") is True, "Run spec did not record production mode")
+    _require(
+        args.get("production_acceptance_smoke") is True,
+        "Run spec did not record production acceptance smoke mode",
+    )
+    _require(
+        args.get("smoke_synthetic_buckets") is False,
+        "Production acceptance smoke must not use synthetic buckets",
+    )
+    _require(
+        int(args.get("num_examples") or 0) > 0,
+        "Production acceptance smoke must record a bounded real subset",
+    )
+
+    manifest = _read_json_object(out_dir / "data" / "manifest.json", "data manifest")
+    provenance = manifest.get("data_provenance")
+    _require(isinstance(provenance, Mapping), "Data manifest has no provenance")
+    materialization = provenance.get("materialization")
+    _require(
+        isinstance(materialization, Mapping)
+        and materialization.get("smoke_synthetic_buckets") is False,
+        "Data manifest must record real dataset materialization",
+    )
+    dataset = provenance.get("dataset")
+    dataset_artifact = dataset.get("dataset_artifact") if isinstance(dataset, Mapping) else None
+    _require(
+        isinstance(dataset_artifact, Mapping)
+        and dataset_artifact.get("synthetic_smoke") is not True,
+        "Data manifest dataset artifact must be real, not synthetic",
+    )
+    included = provenance.get("included")
+    included_count = (
+        int(included.get("count") or 0)
+        if isinstance(included, Mapping)
+        else 0
+    )
+    _require(included_count > 0, "Data manifest did not include real records")
+
+    wandb_identity = _read_json_object(
+        out_dir / "wandb_identity.json",
+        "W&B identity",
+    )
+    _require(wandb_identity.get("enabled") is True, "W&B identity is not enabled")
+    _require(
+        wandb_identity.get("mode") not in {"offline", "disabled"},
+        "W&B identity is not durable",
+    )
+    _require(bool(wandb_identity.get("run_id")), "W&B identity has no run id")
+
+    structured_logs = sorted((out_dir / "torchtitan" / "structured_logs").glob("*.jsonl"))
+    _require(bool(structured_logs), "Missing TorchTitan structured JSONL logs")
+    for log in structured_logs:
+        _require_nonempty_file(log, "TorchTitan structured JSONL log")
+
+    _require_nonempty_file(out_dir / "run_spec.sha256", "run spec checksum")
+    _require_nonempty_file(out_dir / "runtime_metadata.json", "runtime metadata")
+    _require_nonempty_file(out_dir / "launcher_plan.json", "launcher plan")
+    _require_nonempty_file(out_dir / "resume_contract.json", "resume contract")
+
+    return {
+        "run_spec": {
+            "production_mode": args.get("production_mode"),
+            "production_acceptance_smoke": args.get("production_acceptance_smoke"),
+            "num_examples": args.get("num_examples"),
+            "max_streamed_examples": args.get("max_streamed_examples"),
+        },
+        "data_manifest": {
+            "included_count": included_count,
+            "synthetic_smoke": dataset_artifact.get("synthetic_smoke", False),
+        },
+        "wandb": {
+            "project": wandb_identity.get("project"),
+            "entity": wandb_identity.get("entity"),
+            "run_name": wandb_identity.get("run_name"),
+            "run_id": wandb_identity.get("run_id"),
+            "mode": wandb_identity.get("mode"),
+        },
+        "structured_logs": {
+            "count": len(structured_logs),
+            "total_bytes": sum(path.stat().st_size for path in structured_logs),
+        },
+    }
+
+
+def validate_smoke_outputs(
+    out_dir: Path,
+    *,
+    max_steps: int,
+    require_production_acceptance: bool = False,
+) -> dict[str, Any]:
     first_step_report = _read_json_object(
         out_dir / "first_step_checkpoint_validation.json",
         "first-step checkpoint validation report",
@@ -353,7 +573,7 @@ def validate_smoke_outputs(out_dir: Path, *, max_steps: int) -> dict[str, Any]:
         f"Final artifact validation does not include checkpoint step {max_steps}",
     )
 
-    return {
+    summary = {
         "first_step_validation": {
             "path": str(out_dir / "first_step_checkpoint_validation.json"),
             "step": first_step_report.get("step"),
@@ -362,6 +582,11 @@ def validate_smoke_outputs(out_dir: Path, *, max_steps: int) -> dict[str, Any]:
         "final_export": _validate_final_export(out_dir, max_steps),
         "stage_status": _validate_stage_status(out_dir, max_steps),
     }
+    if require_production_acceptance:
+        summary["production_acceptance"] = _validate_production_acceptance_metadata(
+            out_dir
+        )
+    return summary
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -369,11 +594,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     _validate_args(args)
 
     _run(fresh_launch_command(args), timeout_seconds=args.timeout_seconds)
-    fresh_summary = validate_smoke_outputs(args.out_dir, max_steps=args.max_steps)
+    fresh_summary = validate_smoke_outputs(
+        args.out_dir,
+        max_steps=args.max_steps,
+        require_production_acceptance=args.production_acceptance_smoke,
+    )
     print(json.dumps({"fresh_smoke_validation": fresh_summary}, indent=2), flush=True)
 
     _run(resume_launch_command(args), timeout_seconds=args.timeout_seconds)
-    resume_summary = validate_smoke_outputs(args.out_dir, max_steps=args.max_steps)
+    resume_summary = validate_smoke_outputs(
+        args.out_dir,
+        max_steps=args.max_steps,
+        require_production_acceptance=args.production_acceptance_smoke,
+    )
     print(json.dumps({"resume_smoke_validation": resume_summary}, indent=2), flush=True)
 
 

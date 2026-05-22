@@ -58,6 +58,58 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
                 "6",
             )
 
+    def test_production_acceptance_commands_use_real_data_and_production_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = smoke.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--launcher",
+                    str(Path(tmp) / "launcher.sh"),
+                    "--nproc-per-node",
+                    "8",
+                    "--bucket",
+                    "8192",
+                    "--production-acceptance-smoke",
+                    "--num-examples",
+                    "8",
+                    "--max-streamed-examples",
+                    "64",
+                    "--wandb-mode",
+                    "online",
+                ]
+            )
+
+        smoke._validate_args(args)
+        fresh = smoke.fresh_launch_command(args)
+        resume = smoke.resume_launch_command(args)
+
+        for command in (fresh, resume):
+            self.assertIn("--production-mode", command)
+            self.assertIn("--production-acceptance-smoke", command)
+            self.assertIn("--enable-wandb", command)
+            self.assertNotIn("--smoke-synthetic-buckets", command)
+            self.assertEqual(
+                self._flag_value(command, "--dataset-path"),
+                str(Path(tmp) / "dataset"),
+            )
+            self.assertEqual(self._flag_value(command, "--num-examples"), "8")
+            self.assertEqual(
+                self._flag_value(command, "--max-streamed-examples"),
+                "64",
+            )
+            self.assertEqual(
+                self._flag_value(command, "--long-example-policy"),
+                "skip",
+            )
+            self.assertEqual(self._flag_value(command, "--shuffle-buffer"), "0")
+            self.assertEqual(self._flag_value(command, "--max-length"), "8192")
+            self.assertEqual(self._flag_value(command, "--wandb-mode"), "online")
+
     def _write_minimal_smoke_outputs(self, out_dir: Path, *, step: int) -> None:
         checkpoint = out_dir / "torchtitan" / "checkpoint" / f"step-{step}"
         checkpoint.mkdir(parents=True)
@@ -135,6 +187,77 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
         self.assertEqual(summary["dcp_checkpoint"]["payload_count"], 1)
         self.assertEqual(summary["final_export"]["shard_count"], 1)
         self.assertEqual(summary["stage_status"]["attempt_count"], 1)
+
+    def test_validate_smoke_outputs_accepts_production_acceptance_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            self._write_minimal_smoke_outputs(out_dir, step=1)
+            (out_dir / "run_spec.json").write_text(
+                json.dumps(
+                    {
+                        "args": {
+                            "production_mode": True,
+                            "production_acceptance_smoke": True,
+                            "smoke_synthetic_buckets": False,
+                            "num_examples": 8,
+                            "max_streamed_examples": 64,
+                        }
+                    }
+                )
+            )
+            (out_dir / "run_spec.sha256").write_text("abc123\n")
+            (out_dir / "runtime_metadata.json").write_text("{}")
+            (out_dir / "launcher_plan.json").write_text("{}")
+            (out_dir / "resume_contract.json").write_text("{}")
+            data_dir = out_dir / "data"
+            data_dir.mkdir()
+            (data_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "data_provenance": {
+                            "materialization": {
+                                "smoke_synthetic_buckets": False,
+                            },
+                            "dataset": {
+                                "dataset_artifact": {
+                                    "synthetic_smoke": False,
+                                }
+                            },
+                            "included": {"count": 8},
+                        }
+                    }
+                )
+            )
+            (out_dir / "wandb_identity.json").write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "mode": "online",
+                        "project": "proj",
+                        "entity": "team",
+                        "run_name": "run",
+                        "run_id": "abc123",
+                    }
+                )
+            )
+            structured = out_dir / "torchtitan" / "structured_logs"
+            structured.mkdir(parents=True)
+            (structured / "training.global_rank_0.jsonl").write_text("{}\n")
+
+            summary = smoke.validate_smoke_outputs(
+                out_dir,
+                max_steps=1,
+                require_production_acceptance=True,
+            )
+
+        self.assertEqual(
+            summary["production_acceptance"]["data_manifest"]["included_count"],
+            8,
+        )
+        self.assertEqual(
+            summary["production_acceptance"]["structured_logs"]["count"],
+            1,
+        )
 
     def test_validate_smoke_outputs_rejects_missing_first_step_report(self):
         with tempfile.TemporaryDirectory() as tmp:

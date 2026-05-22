@@ -158,9 +158,10 @@ manifest hash, and Parquet shard sizes/hashes. Use `--rebuild-source-dataset`
 when intentionally replacing the cached pod artifact.
 
 For quick real-data GPU smoke tests, pass `--num-examples 64` or another cap.
-Do not combine those smoke caps with `--production-mode`. The default
-`--num-examples 0` means materialize all usable examples from the cached
-one-rollout dataset.
+Do not combine those smoke caps with `--production-mode` unless you are running
+the explicit final acceptance path described below with
+`--production-acceptance-smoke`. The default `--num-examples 0` means
+materialize all usable examples from the cached one-rollout dataset.
 
 ## HF Logits Parity
 
@@ -242,6 +243,38 @@ This lifecycle smoke intentionally uses `--smoke-synthetic-buckets`,
 run quickly and repeatedly. It does not change the production recipe or the
 paper-aligned launch gate.
 
+For the final acceptance smoke, run the same wrapper with production mode and a
+bounded real SWE-HERO subset:
+
+The example below points at a one-row Parquet artifact under
+`/workspace/datasets/...-final-acceptance-subset`. That artifact must be built
+from the cached one-rollout dataset, not synthetic JSONL, and should include
+`metadata.json` and `selection_manifest.jsonl` identifying the source row.
+
+```bash
+cd /workspace/jaxels-work-trial
+$TORCHTITAN_POD_VENV/bin/python scripts/qwen_swehero_gpu_lifecycle_smoke.py \
+  --out-dir /workspace/qwen25-coder7b-swehero-final-acceptance-smoke \
+  --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
+  --dataset-path /workspace/datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout-final-acceptance-subset \
+  --production-acceptance-smoke \
+  --bucket 16384 \
+  --num-examples 1 \
+  --max-streamed-examples 1 \
+  --nproc-per-node 8
+```
+
+That path passes `--production-mode --production-acceptance-smoke` through to
+the launcher. It keeps the production Git provenance, canonical workspace,
+real dataset, first-step checkpoint validation, final checkpoint/export
+validation, resume contract, and durable W&B requirements enabled, while
+explicitly recording the subset, shortened bucket, and one-step cap as an
+acceptance-only deviation. The wrapper validates the fresh run, invokes
+`--resume`, then validates the completed run again and confirms `run_spec.json`,
+`run_spec.sha256`, `launcher_plan.json`, `resume_contract.json`,
+`stage_status.json`, `wandb_identity.json`, TorchTitan structured JSONL logs,
+the DCP checkpoint, and the Hugging Face export.
+
 The production run should use the same wrapper with `--production-mode` and
 without `--num-examples`, so the trainer tokenizes the full cached one-rollout
 dataset and uses the full bucket plan. The production gate rejects dry runs,
@@ -293,7 +326,8 @@ on the command line override earlier values from the file.
 Reviewed argument files for the actual direct-to-hero run should include
 `--production-mode` and `--enable-wandb`. Leave production mode out for smoke,
 profiler, and bounded soak commands because those intentionally use prototype
-settings.
+settings, except for the explicit final acceptance path that also includes
+`--production-acceptance-smoke`.
 
 ## Output Launch Lock
 
