@@ -1299,6 +1299,72 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "overwrite-output"):
                 train.validate_resume_request(args)
 
+    def test_launch_input_validation_rejects_overlapping_artifact_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp) / "shared"
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(shared),
+                    "--dataset-path",
+                    str(shared),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                ]
+            )
+            buckets = train.parse_bucket_list(args.buckets)
+            bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+
+            with self.assertRaisesRegex(ValueError, "overlaps"):
+                train.validate_launch_inputs(
+                    args,
+                    buckets=buckets,
+                    bucket_cp=bucket_cp,
+                )
+
+    def test_launch_input_validation_rejects_dangerous_output_overwrite_path(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        args = train.parse_args(
+            [
+                "--out-dir",
+                str(repo_root),
+                "--dataset-path",
+                str(repo_root / "datasets" / train.TRAINING_DATASET_NAME),
+                "--hf-assets-path",
+                str(repo_root / "assets" / "hf"),
+                "--overwrite-output",
+            ]
+        )
+        buckets = train.parse_bucket_list(args.buckets)
+        bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+
+        with self.assertRaisesRegex(ValueError, "dangerous.*--out-dir"):
+            train.validate_launch_inputs(args, buckets=buckets, bucket_cp=bucket_cp)
+
+    def test_launch_input_validation_rejects_dangerous_dataset_rebuild_path(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(repo_root),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--rebuild-source-dataset",
+                ]
+            )
+            buckets = train.parse_bucket_list(args.buckets)
+            bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+
+            with self.assertRaisesRegex(ValueError, "dangerous.*--dataset-path"):
+                train.validate_launch_inputs(
+                    args,
+                    buckets=buckets,
+                    bucket_cp=bucket_cp,
+                )
+
     def test_resume_ignores_final_model_export_when_deciding_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
@@ -2212,6 +2278,31 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("--batch-size", command)
         self.assertEqual(command[command.index("--batch-size") + 1], "17")
         self.assertNotIn("--overwrite", command)
+
+    def test_ensure_training_dataset_does_not_implicitly_overwrite_nonempty_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = Path(tmp) / "dataset"
+            dataset_path.mkdir()
+            (dataset_path / "notes.txt").write_text("not a parquet dataset")
+            args = train.parse_args(
+                [
+                    "--dataset-path",
+                    str(dataset_path),
+                    "--build-dataset-if-missing",
+                ]
+            )
+
+            with (
+                patch.object(train.subprocess, "run") as run,
+                self.assertRaisesRegex(FileExistsError, "rebuild-source-dataset"),
+            ):
+                train.ensure_training_dataset(args)
+
+            run.assert_not_called()
+            self.assertEqual(
+                (dataset_path / "notes.txt").read_text(),
+                "not a parquet dataset",
+            )
 
     def test_hf_asset_download_pins_model_revision(self):
         with tempfile.TemporaryDirectory() as tmp:

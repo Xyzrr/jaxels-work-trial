@@ -704,6 +704,94 @@ def _rdzv_endpoint_is_local_or_ephemeral(endpoint: str | None) -> bool:
     return host in {"localhost", "127.0.0.1", "::1"} or port in {"", "0"}
 
 
+def _resolve_for_safety(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left_resolved = _resolve_for_safety(left)
+    right_resolved = _resolve_for_safety(right)
+    return _path_is_relative_to(left_resolved, right_resolved) or _path_is_relative_to(
+        right_resolved,
+        left_resolved,
+    )
+
+
+def _destructive_path_safety_errors(name: str, path: Path) -> list[str]:
+    resolved = _resolve_for_safety(path)
+    repo_root = Path(__file__).resolve().parents[1].resolve()
+    protected_paths = [
+        Path("/").resolve(),
+        Path.home().resolve(),
+        repo_root,
+        repo_root / ".git",
+        repo_root / "scripts",
+        repo_root / "tests",
+        repo_root / "torchtitan",
+        repo_root / "requirements",
+        repo_root / "manifests",
+        repo_root / "tmp" / "pod-creds",
+        Path("/workspace"),
+        Path("/workspace/assets"),
+        DEFAULT_HF_ASSETS_PATH,
+    ]
+
+    errors = []
+    if (resolved / ".git").exists():
+        errors.append(
+            f"dangerous {name} overwrite target {resolved} contains a .git directory"
+        )
+    for protected in protected_paths:
+        protected_resolved = _resolve_for_safety(protected)
+        if resolved == protected_resolved or _path_is_relative_to(
+            protected_resolved,
+            resolved,
+        ):
+            errors.append(
+                f"dangerous {name} overwrite target {resolved} would remove "
+                f"protected path {protected_resolved}"
+            )
+            break
+    return errors
+
+
+def _ensure_safe_destructive_path(name: str, path: Path) -> None:
+    errors = _destructive_path_safety_errors(name, path)
+    if errors:
+        raise ValueError("\n".join(errors))
+
+
+def _artifact_path_safety_errors(args: argparse.Namespace) -> list[str]:
+    errors = []
+    path_pairs = (
+        ("--out-dir", args.out_dir, "--dataset-path", args.dataset_path),
+        ("--out-dir", args.out_dir, "--hf-assets-path", args.hf_assets_path),
+        ("--dataset-path", args.dataset_path, "--hf-assets-path", args.hf_assets_path),
+    )
+    for left_name, left_path, right_name, right_path in path_pairs:
+        if _paths_overlap(left_path, right_path):
+            errors.append(
+                f"{left_name}={_resolve_for_safety(left_path)} overlaps "
+                f"{right_name}={_resolve_for_safety(right_path)}"
+            )
+
+    if args.overwrite_output:
+        errors.extend(_destructive_path_safety_errors("--out-dir", args.out_dir))
+    if args.rebuild_source_dataset:
+        errors.extend(
+            _destructive_path_safety_errors("--dataset-path", args.dataset_path)
+        )
+    return errors
+
+
 def validate_launch_inputs(
     args: argparse.Namespace,
     *,
@@ -711,6 +799,7 @@ def validate_launch_inputs(
     bucket_cp: Mapping[int, int],
 ) -> None:
     errors: list[str] = []
+    errors.extend(_artifact_path_safety_errors(args))
     if args.model_id != MODEL_ID:
         errors.append(
             "--model-id must be "
@@ -2271,13 +2360,24 @@ def build_source_dataset_command(args: argparse.Namespace) -> list[str]:
 
 
 def ensure_training_dataset(args: argparse.Namespace) -> None:
+    if args.rebuild_source_dataset:
+        _ensure_safe_destructive_path("--dataset-path", args.dataset_path)
+
     if args.dataset_path.exists() and not args.rebuild_source_dataset:
         try:
             _training_dataset_files(args.dataset_path)
             return
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
             if not args.build_dataset_if_missing:
                 raise
+            if args.dataset_path.is_file() or (
+                args.dataset_path.is_dir() and any(args.dataset_path.iterdir())
+            ):
+                raise FileExistsError(
+                    f"{args.dataset_path} exists but is not a valid "
+                    "SWE-HERO Parquet dataset; pass --rebuild-source-dataset "
+                    "to replace it after verifying the path."
+                ) from exc
 
     if not (args.build_dataset_if_missing or args.rebuild_source_dataset):
         raise FileNotFoundError(
@@ -2286,12 +2386,6 @@ def ensure_training_dataset(args: argparse.Namespace) -> None:
         )
 
     command = build_source_dataset_command(args)
-    if (
-        args.dataset_path.exists()
-        and any(args.dataset_path.iterdir())
-        and "--overwrite" not in command
-    ):
-        command.append("--overwrite")
     print("Preparing SWE-Hero training dataset artifact:")
     print(" ".join(command))
     subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[1])
@@ -6132,6 +6226,7 @@ def main(argv: list[str] | None = None) -> None:
         args.skip_data_prep = True
 
     if args.overwrite_output and args.out_dir.exists():
+        _ensure_safe_destructive_path("--out-dir", args.out_dir)
         shutil.rmtree(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
