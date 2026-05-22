@@ -142,10 +142,58 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("RUN_TESTS", trainable_text)
         self.assertIn("execute_bash", trainable_text)
         self.assertIn("DONE", trainable_text)
+        self.assertIn("<tool_call>", trainable_text)
+        self.assertIn("<|im_end|>", trainable_text)
         self.assertNotIn("please fix it", trainable_text)
         self.assertNotIn("system prompt", trainable_text)
         self.assertNotIn("secret failing output", trainable_text)
         self.assertNotIn("<|assistant|>", trainable_text)
+        self.assertNotIn("<|im_start|>assistant", trainable_text)
+
+    def test_openhands_messages_render_as_qwen_chatml(self):
+        example = {
+            "trajectory": [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "reported issue"},
+                {
+                    "role": "assistant",
+                    "content": "assistant analysis",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "think",
+                                "arguments": '{"thought": "consider options"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "environment output"},
+            ],
+        }
+
+        rendered = "".join(
+            text for text, _ in train.qwen_openhands_segments(example)
+        )
+
+        self.assertIn(
+            "<|im_start|>system\nsystem prompt<|im_end|>\n", rendered
+        )
+        self.assertIn(
+            "<|im_start|>user\nreported issue<|im_end|>\n", rendered
+        )
+        self.assertIn(
+            '<|im_start|>assistant\nassistant analysis\n<tool_call>\n{"name": "think", "arguments": "{\\"thought\\": \\"consider options\\"}"}\n</tool_call><|im_end|>\n',
+            rendered,
+        )
+        self.assertIn(
+            "<|im_start|>user\n<tool_response>\nenvironment output\n</tool_response><|im_end|>\n",
+            rendered,
+        )
+        self.assertNotIn("<|system|>", rendered)
+        self.assertNotIn("<|assistant|>", rendered)
+        self.assertNotIn("<|tool_calls|>", rendered)
 
     def test_stage_environment_and_torchrun_command(self):
         with tempfile.TemporaryDirectory() as tmp:

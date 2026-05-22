@@ -63,6 +63,9 @@ DEFAULT_BUCKET_CP = {
     65_536: 4,
     PAPER_CONTEXT_LENGTH: 8,
 }
+QWEN_DEFAULT_SYSTEM_PROMPT = (
+    "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+)
 QWEN_ROPE_THETA = 1_000_000.0
 QWEN_YARN_BETA_FAST = 32.0
 QWEN_YARN_BETA_SLOW = 1.0
@@ -609,7 +612,7 @@ def _tokenizer_metadata(tokenizer: Any, hf_assets_path: Path) -> dict[str, Any]:
         "bos_id": getattr(tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None)),
         "eos_id": getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None)),
         "pad_id": infer_pad_token_id(tokenizer, hf_assets_path),
-        "trace_serializer": "OpenHands role markers; assistant content/tool_calls trainable; tool observations masked",
+        "trace_serializer": "Qwen2.5 ChatML over OpenHands messages; assistant content/tool_calls trainable; tool observations masked",
     }
 
 
@@ -637,7 +640,7 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
             "warmup_ratio": args.warmup_ratio,
             "context_length": PAPER_CONTEXT_LENGTH,
             "qwen_yarn_rope": expected_qwen_yarn_rope_config(),
-            "loss_masking": "assistant content and assistant tool calls only",
+            "loss_masking": "assistant content, assistant tool calls, and assistant turn terminators only",
             "swe_zero_stage": "skipped for direct-to-hero",
         },
         "paper_caveats": [
@@ -662,23 +665,89 @@ def _stringify(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def qwen_openhands_turn_segments(turn: object) -> list[tuple[str, bool]]:
-    if not isinstance(turn, dict):
+def _message_content_text(content: object) -> str:
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, Mapping):
+                if "text" in item:
+                    parts.append(_stringify(item["text"]))
+                elif item.get("type") == "text" and "content" in item:
+                    parts.append(_stringify(item["content"]))
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(_stringify(item))
+        return "".join(parts)
+    return _stringify(content)
+
+
+def _tool_call_function(tool_call: object) -> Mapping[str, object]:
+    if not isinstance(tool_call, Mapping):
+        return {}
+    function = tool_call.get("function")
+    if isinstance(function, Mapping):
+        return function
+    return tool_call
+
+
+def _qwen_tool_call_text(tool_call: object) -> str:
+    function = _tool_call_function(tool_call)
+    name = _stringify(function.get("name") or "unknown")
+    arguments = function.get("arguments")
+    if arguments is None:
+        arguments = {}
+    return (
+        '\n<tool_call>\n{"name": "'
+        + name
+        + '", "arguments": '
+        + json.dumps(arguments, ensure_ascii=False)
+        + "}\n</tool_call>"
+    )
+
+
+def qwen_openhands_turn_segments(
+    turn: object,
+    *,
+    previous_role: str | None = None,
+    next_role: str | None = None,
+) -> list[tuple[str, bool]]:
+    """Render one OpenHands message with Qwen2.5-Coder's ChatML convention."""
+
+    if not isinstance(turn, Mapping):
         return [(json.dumps(turn, ensure_ascii=False) + "\n", False)]
 
     role = _stringify(turn.get("role") or "unknown")
-    is_assistant = role == "assistant"
-    segments: list[tuple[str, bool]] = [(f"<|{role}|>\n", False)]
+    content = _message_content_text(turn.get("content"))
+    segments: list[tuple[str, bool]] = []
 
-    content = _stringify(turn.get("content"))
+    if role == "assistant":
+        segments.append(("<|im_start|>assistant", False))
+        if content:
+            segments.append(("\n" + content, True))
+        tool_calls = turn.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                segments.append((_qwen_tool_call_text(tool_call), True))
+        elif tool_calls:
+            segments.append(("\n" + json.dumps(tool_calls, ensure_ascii=False), True))
+        segments.append(("<|im_end|>\n", True))
+        return segments
+
+    if role == "tool":
+        if previous_role != "tool":
+            segments.append(("<|im_start|>user", False))
+        segments.append(("\n<tool_response>\n", False))
+        segments.append((content, False))
+        segments.append(("\n</tool_response>", False))
+        if next_role != "tool":
+            segments.append(("<|im_end|>\n", False))
+        return segments
+
+    segments.append((f"<|im_start|>{role}\n", False))
     if content:
-        segments.append((content.rstrip("\n") + "\n", is_assistant))
-
-    tool_calls = turn.get("tool_calls")
-    if tool_calls:
-        segments.append(("<|tool_calls|>\n", False))
-        segments.append((json.dumps(tool_calls, ensure_ascii=False) + "\n", is_assistant))
-
+        segments.append((content, False))
+    segments.append(("<|im_end|>\n", False))
     return segments
 
 
@@ -690,15 +759,44 @@ def qwen_openhands_segments(
     segments: list[tuple[str, bool]] = []
     trajectory = example.get("trajectory") or example.get("messages") or []
     if isinstance(trajectory, list):
-        for turn in trajectory:
-            segments.extend(qwen_openhands_turn_segments(turn))
+        start_index = 0
+        if trajectory and isinstance(trajectory[0], Mapping):
+            first_role = _stringify(trajectory[0].get("role") or "unknown")
+            if first_role == "system":
+                segments.extend(qwen_openhands_turn_segments(trajectory[0]))
+                start_index = 1
+            else:
+                segments.append(("<|im_start|>system\n", False))
+                segments.append((QWEN_DEFAULT_SYSTEM_PROMPT, False))
+                segments.append(("<|im_end|>\n", False))
+
+        for index in range(start_index, len(trajectory)):
+            previous_role = (
+                _stringify(trajectory[index - 1].get("role"))
+                if index > 0 and isinstance(trajectory[index - 1], Mapping)
+                else None
+            )
+            next_role = (
+                _stringify(trajectory[index + 1].get("role"))
+                if index + 1 < len(trajectory)
+                and isinstance(trajectory[index + 1], Mapping)
+                else None
+            )
+            segments.extend(
+                qwen_openhands_turn_segments(
+                    trajectory[index],
+                    previous_role=previous_role,
+                    next_role=next_role,
+                )
+            )
     else:
         segments.append((_stringify(trajectory) + "\n", False))
 
     patch = example.get("model_patch")
     if include_model_patch and patch:
-        segments.append(("<|assistant_final_patch|>\n", False))
+        segments.append(("<|im_start|>assistant\n", False))
         segments.append((_stringify(patch) + "\n", True))
+        segments.append(("<|im_end|>\n", True))
 
     return segments
 
