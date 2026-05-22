@@ -210,6 +210,16 @@ RUN_SPEC_ARG_FIELDS = (
     "checkpoint_interval",
     "checkpoint_async_mode",
     "metrics_log_freq",
+    "enable_profiler",
+    "profiler_trace_folder",
+    "profiler_freq",
+    "profiler_active",
+    "profiler_warmup",
+    "profiler_repeat",
+    "profiler_skip_first",
+    "profiler_skip_first_wait",
+    "enable_memory_snapshot",
+    "memory_snapshot_folder",
     "enable_wandb",
     "wandb_project",
     "wandb_entity",
@@ -262,6 +272,16 @@ LAUNCH_STAGE_ENV_KEYS = (
     "SWEHERO_CHECKPOINT_INTERVAL",
     "SWEHERO_CHECKPOINT_ASYNC_MODE",
     "SWEHERO_METRICS_LOG_FREQ",
+    "SWEHERO_ENABLE_PROFILER",
+    "SWEHERO_PROFILER_TRACE_FOLDER",
+    "SWEHERO_PROFILER_FREQ",
+    "SWEHERO_PROFILER_ACTIVE",
+    "SWEHERO_PROFILER_WARMUP",
+    "SWEHERO_PROFILER_REPEAT",
+    "SWEHERO_PROFILER_SKIP_FIRST",
+    "SWEHERO_PROFILER_SKIP_FIRST_WAIT",
+    "SWEHERO_ENABLE_MEMORY_SNAPSHOT",
+    "SWEHERO_MEMORY_SNAPSHOT_FOLDER",
     "SWEHERO_LOAD_DATALOADER_STATE",
     "SWEHERO_ENABLE_WANDB",
     "LOG_RANK",
@@ -342,6 +362,16 @@ def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
         return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer; got {raw!r}") from exc
+
+
+def _env_optional_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
     try:
         return int(raw)
     except ValueError as exc:
@@ -592,10 +622,22 @@ def validate_launch_inputs(
         ("--chunked-ce-chunks", args.chunked_ce_chunks, 1),
         ("--checkpoint-interval", args.checkpoint_interval, 1),
         ("--metrics-log-freq", args.metrics_log_freq, 1),
+        ("--profiler-freq", args.profiler_freq, 1),
+        ("--profiler-active", args.profiler_active, 1),
+        ("--profiler-warmup", args.profiler_warmup, 0),
         ("--nproc-per-node", args.nproc_per_node, 1),
     )
     for name, value, minimum in int_minima:
         _add_min_error(errors, name=name, value=value, minimum=minimum)
+
+    optional_int_minima = (
+        ("--profiler-repeat", args.profiler_repeat, 1),
+        ("--profiler-skip-first", args.profiler_skip_first, 0),
+        ("--profiler-skip-first-wait", args.profiler_skip_first_wait, 0),
+    )
+    for name, value, minimum in optional_int_minima:
+        if value is not None:
+            _add_min_error(errors, name=name, value=value, minimum=minimum)
 
     _add_max_error(
         errors,
@@ -714,6 +756,12 @@ def validate_launch_inputs(
         errors.append(
             "--smoke-synthetic-examples-per-bucket only applies when "
             "--smoke-synthetic-buckets is set"
+        )
+
+    if args.profiler_freq < args.profiler_active + args.profiler_warmup:
+        errors.append(
+            "--profiler-freq must be greater than or equal to "
+            "--profiler-active + --profiler-warmup"
         )
 
     if args.nproc_per_node > 0 and args.local_batch_size > 0:
@@ -1573,6 +1621,67 @@ def parse_args(
         "--metrics-log-freq",
         type=int,
         default=_env_int("METRICS_LOG_FREQ", 1),
+    )
+    parser.add_argument(
+        "--enable-profiler",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("ENABLE_PROFILER", False),
+        help="Enable TorchTitan torch.profiler traces. Default is disabled.",
+    )
+    parser.add_argument(
+        "--profiler-trace-folder",
+        default=os.environ.get("PROFILER_TRACE_FOLDER", "profiling/traces"),
+        help="Profiler trace folder relative to the TorchTitan dump folder.",
+    )
+    parser.add_argument(
+        "--profiler-freq",
+        type=int,
+        default=_env_int("PROFILER_FREQ", 10),
+        help="Torch profiler schedule period in training steps.",
+    )
+    parser.add_argument(
+        "--profiler-active",
+        type=int,
+        default=_env_int("PROFILER_ACTIVE", 1),
+        help="Active profiler steps per profiling period.",
+    )
+    parser.add_argument(
+        "--profiler-warmup",
+        type=int,
+        default=_env_int("PROFILER_WARMUP", 3),
+        help="Warmup profiler steps per profiling period.",
+    )
+    parser.add_argument(
+        "--profiler-repeat",
+        type=int,
+        default=_env_optional_int("PROFILER_REPEAT"),
+        help="Optional torch.profiler schedule repeat count.",
+    )
+    parser.add_argument(
+        "--profiler-skip-first",
+        type=int,
+        default=_env_optional_int("PROFILER_SKIP_FIRST"),
+        help="Optional initial profiler cycles to skip.",
+    )
+    parser.add_argument(
+        "--profiler-skip-first-wait",
+        type=int,
+        default=_env_optional_int("PROFILER_SKIP_FIRST_WAIT"),
+        help="Optional initial profiler wait cycles to skip.",
+    )
+    parser.add_argument(
+        "--enable-memory-snapshot",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("ENABLE_MEMORY_SNAPSHOT", False),
+        help="Enable TorchTitan CUDA memory snapshots. Default is disabled.",
+    )
+    parser.add_argument(
+        "--memory-snapshot-folder",
+        default=os.environ.get(
+            "MEMORY_SNAPSHOT_FOLDER",
+            "profiling/memory_snapshot",
+        ),
+        help="Memory snapshot folder relative to the TorchTitan dump folder.",
     )
     parser.add_argument(
         "--enable-wandb",
@@ -4220,12 +4329,29 @@ def build_stage_env(
             "SWEHERO_CHECKPOINT_INTERVAL": str(args.checkpoint_interval),
             "SWEHERO_CHECKPOINT_ASYNC_MODE": args.checkpoint_async_mode,
             "SWEHERO_METRICS_LOG_FREQ": str(args.metrics_log_freq),
+            "SWEHERO_ENABLE_PROFILER": "1" if args.enable_profiler else "0",
+            "SWEHERO_PROFILER_TRACE_FOLDER": args.profiler_trace_folder,
+            "SWEHERO_PROFILER_FREQ": str(args.profiler_freq),
+            "SWEHERO_PROFILER_ACTIVE": str(args.profiler_active),
+            "SWEHERO_PROFILER_WARMUP": str(args.profiler_warmup),
+            "SWEHERO_ENABLE_MEMORY_SNAPSHOT": "1"
+            if args.enable_memory_snapshot
+            else "0",
+            "SWEHERO_MEMORY_SNAPSHOT_FOLDER": args.memory_snapshot_folder,
             "SWEHERO_LOAD_DATALOADER_STATE": "1"
             if load_dataloader_state
             else "0",
             "SWEHERO_ENABLE_WANDB": "1" if args.enable_wandb else "0",
         }
     )
+    if args.profiler_repeat is not None:
+        env["SWEHERO_PROFILER_REPEAT"] = str(args.profiler_repeat)
+    if args.profiler_skip_first is not None:
+        env["SWEHERO_PROFILER_SKIP_FIRST"] = str(args.profiler_skip_first)
+    if args.profiler_skip_first_wait is not None:
+        env["SWEHERO_PROFILER_SKIP_FIRST_WAIT"] = str(
+            args.profiler_skip_first_wait
+        )
     env.update(_wandb_env_overrides(args))
     return env
 

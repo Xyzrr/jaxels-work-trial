@@ -182,3 +182,48 @@ configured bucket and `--bucket-curriculum single-bucket`, for example
 `--buckets 131072 --bucket-cp 131072:8`. The launcher rejects
 `single-bucket` when multiple buckets are configured, so the run spec cannot
 silently claim a no-curriculum setup while using staged bucket training.
+
+## Profiler And Soak Runs
+
+Profiler and memory snapshot capture are disabled by default, so the
+paper-aligned direct-to-hero run does not collect traces or change the training
+schedule unless these flags are explicitly provided.
+
+Use `--max-steps` to run a bounded soak without changing the dataset,
+tokenization, loss mask, optimizer, or bucket plan. The cap applies to total
+optimizer steps across all launcher stages and is recorded in the immutable
+run spec.
+
+To collect TorchTitan profiler traces during a short soak, add flags such as:
+
+```bash
+cd /workspace/jaxels-work-trial
+scripts/run_qwen_swehero_torchtitan_pod.sh \
+  --out-dir /workspace/qwen25-coder7b-swehero-profiler-soak \
+  --overwrite-output \
+  --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
+  --num-examples 64 \
+  --max-length 2048 \
+  --buckets 1024,2048 \
+  --bucket-cp 1024:1,2048:2 \
+  --nproc-per-node 8 \
+  --global-batch-size 8 \
+  --num-train-epochs 8 \
+  --max-steps 20 \
+  --enable-profiler \
+  --profiler-freq 4 \
+  --profiler-warmup 1 \
+  --profiler-active 1 \
+  --profiler-repeat 1 \
+  --checkpoint-interval 1000 \
+  --checkpoint-async-mode disabled \
+  --metrics-log-freq 1 \
+  --log-rank 0 \
+  --no-compile \
+  --no-enable-fp8
+```
+
+Profiler traces are written under the TorchTitan dump folder, normally
+`$OUT_DIR/torchtitan/profiling/traces`. CUDA memory snapshots can be captured
+with `--enable-memory-snapshot`; by default those files are written under
+`$OUT_DIR/torchtitan/profiling/memory_snapshot`.

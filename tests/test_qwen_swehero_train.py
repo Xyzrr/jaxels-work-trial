@@ -374,6 +374,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertTrue(args.enable_fp8)
         self.assertEqual(args.attention_backend, "sdpa")
         self.assertEqual(args.bucket_curriculum, train.DEFAULT_BUCKET_CURRICULUM)
+        self.assertFalse(args.enable_profiler)
+        self.assertEqual(args.profiler_freq, 10)
+        self.assertEqual(args.profiler_active, 1)
+        self.assertEqual(args.profiler_warmup, 3)
+        self.assertFalse(args.enable_memory_snapshot)
         self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
 
     def test_launch_env_file_sets_defaults_before_full_parse(self):
@@ -440,6 +445,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         cases = [
             ({"ENABLE_FP8": "maybe"}, "ENABLE_FP8 must be a boolean"),
             ({"NUM_EXAMPLES": "abc"}, "NUM_EXAMPLES must be an integer"),
+            ({"PROFILER_REPEAT": "abc"}, "PROFILER_REPEAT must be an integer"),
             ({"LEARNING_RATE": "nan"}, "LEARNING_RATE must be finite"),
         ]
         for env, message in cases:
@@ -471,6 +477,26 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             (["--chunked-ce-chunks", "0"], "--chunked-ce-chunks"),
             (["--checkpoint-interval", "0"], "--checkpoint-interval"),
             (["--metrics-log-freq", "0"], "--metrics-log-freq"),
+            (["--profiler-freq", "0"], "--profiler-freq"),
+            (["--profiler-active", "0"], "--profiler-active"),
+            (["--profiler-warmup", "-1"], "--profiler-warmup"),
+            (["--profiler-repeat", "0"], "--profiler-repeat"),
+            (["--profiler-skip-first", "-1"], "--profiler-skip-first"),
+            (
+                ["--profiler-skip-first-wait", "-1"],
+                "--profiler-skip-first-wait",
+            ),
+            (
+                [
+                    "--profiler-freq",
+                    "3",
+                    "--profiler-active",
+                    "1",
+                    "--profiler-warmup",
+                    "3",
+                ],
+                "--profiler-freq must be greater",
+            ),
             (["--nproc-per-node", "0"], "--nproc-per-node"),
             (
                 ["--smoke-synthetic-examples-per-bucket", "0"],
@@ -1460,7 +1486,43 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             first_env["SWEHERO_FINAL_EXPORT_FOLDER"],
             train.FINAL_MODEL_EXPORT_FOLDER,
         )
+        self.assertEqual(first_env["SWEHERO_ENABLE_PROFILER"], "0")
+        self.assertEqual(first_env["SWEHERO_PROFILER_FREQ"], "10")
+        self.assertEqual(first_env["SWEHERO_ENABLE_MEMORY_SNAPSHOT"], "0")
         self.assertNotIn("SWEHERO_SECRET", first_env)
+
+    def test_stage_env_exposes_profiler_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            args.enable_profiler = True
+            args.profiler_trace_folder = "profiles/traces"
+            args.profiler_freq = 4
+            args.profiler_active = 1
+            args.profiler_warmup = 1
+            args.profiler_repeat = 2
+            args.profiler_skip_first = 1
+            args.profiler_skip_first_wait = 1
+            args.enable_memory_snapshot = True
+            args.memory_snapshot_folder = "profiles/memory"
+
+            env = train.build_stage_env(
+                args,
+                stage=plan.stages[0],
+                total_steps=plan.total_steps,
+                warmup_steps=plan.warmup_steps,
+                pad_token_id=0,
+            )
+
+        self.assertEqual(env["SWEHERO_ENABLE_PROFILER"], "1")
+        self.assertEqual(env["SWEHERO_PROFILER_TRACE_FOLDER"], "profiles/traces")
+        self.assertEqual(env["SWEHERO_PROFILER_FREQ"], "4")
+        self.assertEqual(env["SWEHERO_PROFILER_ACTIVE"], "1")
+        self.assertEqual(env["SWEHERO_PROFILER_WARMUP"], "1")
+        self.assertEqual(env["SWEHERO_PROFILER_REPEAT"], "2")
+        self.assertEqual(env["SWEHERO_PROFILER_SKIP_FIRST"], "1")
+        self.assertEqual(env["SWEHERO_PROFILER_SKIP_FIRST_WAIT"], "1")
+        self.assertEqual(env["SWEHERO_ENABLE_MEMORY_SNAPSHOT"], "1")
+        self.assertEqual(env["SWEHERO_MEMORY_SNAPSHOT_FOLDER"], "profiles/memory")
 
     def test_run_spec_rejects_changed_launch_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1582,6 +1644,18 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("SWEHERO_LOAD_DATALOADER_STATE", source)
         self.assertIn("_checkpoint_exclude_from_loading()", source)
         self.assertNotIn("exclude_from_loading=[\"dataloader\"]", source)
+
+    def test_swehero_config_wires_profiler_env_controls(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (
+            repo_root / "torchtitan/torchtitan/experiments/swehero/config_registry.py"
+        ).read_text()
+
+        self.assertIn("Profiler.Config", source)
+        self.assertIn("SWEHERO_ENABLE_PROFILER", source)
+        self.assertIn("SWEHERO_PROFILER_FREQ", source)
+        self.assertIn("SWEHERO_ENABLE_MEMORY_SNAPSHOT", source)
+        self.assertIn("SWEHERO_MEMORY_SNAPSHOT_FOLDER", source)
 
     def test_swehero_config_routes_final_export_outside_checkpoint_dir(self):
         repo_root = Path(__file__).resolve().parents[1]

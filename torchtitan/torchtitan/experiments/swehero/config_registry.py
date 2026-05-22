@@ -22,6 +22,7 @@ from torchtitan.config import (
 )
 from torchtitan.models.qwen2_5 import model_registry
 from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.tools.profiler import Profiler
 from torchtitan.trainer import Trainer
 
 from .dataloader import SweHeroDataLoader
@@ -33,6 +34,13 @@ def _env(name: str, default: str) -> str:
 
 def _env_int(name: str, default: int) -> int:
     return int(_env(name, str(default)))
+
+
+def _env_optional_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    return int(raw)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -179,6 +187,29 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
         compile=CompileConfig(
             enable=compile_enabled,
             components=["model", "loss"],
+        ),
+        profiler=Profiler.Config(
+            enable_profiling=_env_bool("SWEHERO_ENABLE_PROFILER", False),
+            save_traces_folder=_env(
+                "SWEHERO_PROFILER_TRACE_FOLDER",
+                "profiling/traces",
+            ),
+            profile_freq=_env_int("SWEHERO_PROFILER_FREQ", 10),
+            profiler_repeat=_env_optional_int("SWEHERO_PROFILER_REPEAT"),
+            profiler_skip_first=_env_optional_int("SWEHERO_PROFILER_SKIP_FIRST"),
+            profiler_skip_first_wait=_env_optional_int(
+                "SWEHERO_PROFILER_SKIP_FIRST_WAIT"
+            ),
+            profiler_active=_env_int("SWEHERO_PROFILER_ACTIVE", 1),
+            profiler_warmup=_env_int("SWEHERO_PROFILER_WARMUP", 3),
+            enable_memory_snapshot=_env_bool(
+                "SWEHERO_ENABLE_MEMORY_SNAPSHOT",
+                False,
+            ),
+            save_memory_snapshot_folder=_env(
+                "SWEHERO_MEMORY_SNAPSHOT_FOLDER",
+                "profiling/memory_snapshot",
+            ),
         ),
         metrics=MetricsProcessor.Config(
             log_freq=_env_int("SWEHERO_METRICS_LOG_FREQ", 1),
