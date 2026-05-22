@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
@@ -89,6 +90,30 @@ FINAL_ARTIFACT_VALIDATION_SCHEMA_VERSION = 1
 FINAL_ARTIFACT_VALIDATION_FILENAME = "final_artifact_validation.json"
 STAGE_STATUS_SCHEMA_VERSION = 1
 STAGE_STATUS_FILENAME = "stage_status.json"
+WANDB_IDENTITY_SCHEMA_VERSION = 1
+WANDB_IDENTITY_FILENAME = "wandb_identity.json"
+WANDB_RESUME_CHOICES = ("allow", "never", "must", "auto")
+WANDB_MODE_CHOICES = ("online", "offline", "disabled", "shared")
+WANDB_RUN_ID_FORBIDDEN_CHARS = frozenset("/\\#?%:")
+CONTROLLED_WANDB_ENV_KEYS = (
+    "WANDB_PROJECT",
+    "WANDB_TEAM",
+    "WANDB_ENTITY",
+    "WANDB_RUN_NAME",
+    "WANDB_NAME",
+    "WANDB_RUN_ID",
+    "WANDB_RESUME",
+    "WANDB_RESUME_FROM",
+    "WANDB_FORK_FROM",
+    "WANDB_RUN_GROUP",
+    "WANDB_RUN_JOB_TYPE",
+    "WANDB_JOB_TYPE",
+    "WANDB_RUN_TAGS",
+    "WANDB_TAGS",
+    "WANDB_RUN_NOTES",
+    "WANDB_NOTES",
+    "WANDB_MODE",
+)
 RESUME_ARG_FIELDS = (
     "model_id",
     "dataset_id",
@@ -121,6 +146,19 @@ RESUME_ARG_FIELDS = (
     "compile",
     "activation_checkpoint_mode",
     "chunked_ce_chunks",
+    "enable_wandb",
+    "wandb_project",
+    "wandb_entity",
+    "wandb_run_name",
+    "wandb_run_id",
+    "wandb_resume",
+    "wandb_resume_from",
+    "wandb_fork_from",
+    "wandb_run_group",
+    "wandb_run_job_type",
+    "wandb_run_tags",
+    "wandb_run_notes",
+    "wandb_mode",
     "nproc_per_node",
 )
 RUN_SPEC_ARG_FIELDS = (
@@ -163,7 +201,17 @@ RUN_SPEC_ARG_FIELDS = (
     "metrics_log_freq",
     "enable_wandb",
     "wandb_project",
+    "wandb_entity",
     "wandb_run_name",
+    "wandb_run_id",
+    "wandb_resume",
+    "wandb_resume_from",
+    "wandb_fork_from",
+    "wandb_run_group",
+    "wandb_run_job_type",
+    "wandb_run_tags",
+    "wandb_run_notes",
+    "wandb_mode",
     "nproc_per_node",
     "torchrun_bin",
     "log_rank",
@@ -206,7 +254,22 @@ LAUNCH_STAGE_ENV_KEYS = (
     "SWEHERO_ENABLE_WANDB",
     "LOG_RANK",
     "WANDB_PROJECT",
+    "WANDB_TEAM",
+    "WANDB_ENTITY",
     "WANDB_RUN_NAME",
+    "WANDB_NAME",
+    "WANDB_RUN_ID",
+    "WANDB_RESUME",
+    "WANDB_RESUME_FROM",
+    "WANDB_FORK_FROM",
+    "WANDB_RUN_GROUP",
+    "WANDB_RUN_JOB_TYPE",
+    "WANDB_JOB_TYPE",
+    "WANDB_RUN_TAGS",
+    "WANDB_TAGS",
+    "WANDB_RUN_NOTES",
+    "WANDB_NOTES",
+    "WANDB_MODE",
 )
 
 
@@ -268,6 +331,14 @@ def _env_float(name: str, default: float) -> float:
 def _env_path(name: str, default: Path) -> Path:
     raw = os.environ.get(name)
     return default if raw is None else Path(raw)
+
+
+def _env_first(*names: str, default: str | None = None) -> str | None:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is not None:
+            return raw
+    return default
 
 
 def _default_torchrun_bin() -> str:
@@ -477,6 +548,10 @@ def _final_artifact_validation_path(out_dir: Path) -> Path:
 
 def _stage_status_path(out_dir: Path) -> Path:
     return out_dir / STAGE_STATUS_FILENAME
+
+
+def _wandb_identity_path(out_dir: Path) -> Path:
+    return out_dir / WANDB_IDENTITY_FILENAME
 
 
 def _torchtitan_dump_dir(out_dir: Path) -> Path:
@@ -1140,8 +1215,74 @@ def parse_args(
         default=os.environ.get("WANDB_PROJECT", smoke.WANDB_PROJECT),
     )
     parser.add_argument(
+        "--wandb-entity",
+        "--wandb-team",
+        dest="wandb_entity",
+        default=_env_first("WANDB_TEAM", "WANDB_ENTITY"),
+        help=(
+            "Optional W&B entity/team. Passed to TorchTitan through WANDB_TEAM "
+            "and also exported as WANDB_ENTITY for SDK compatibility."
+        ),
+    )
+    parser.add_argument(
         "--wandb-run-name",
-        default=os.environ.get("WANDB_RUN_NAME", "qwen25-coder7b-swehero-tt"),
+        default=_env_first(
+            "WANDB_RUN_NAME",
+            "WANDB_NAME",
+            default="qwen25-coder7b-swehero-tt",
+        ),
+    )
+    parser.add_argument(
+        "--wandb-run-id",
+        default=os.environ.get("WANDB_RUN_ID"),
+        help=(
+            "Stable W&B run id. If W&B is enabled and omitted for a fresh "
+            "launch, the launcher generates one and persists it in "
+            f"{WANDB_IDENTITY_FILENAME}."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-resume",
+        choices=WANDB_RESUME_CHOICES,
+        default=os.environ.get("WANDB_RESUME"),
+        help=(
+            "W&B resume policy for runs with --wandb-run-id. Defaults to "
+            "'allow' when W&B is enabled, matching W&B's recommended explicit "
+            "run-id resume pattern."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-resume-from",
+        default=os.environ.get("WANDB_RESUME_FROM"),
+        help="Optional W&B resume_from value, for example '<run_id>?_step=<step>'.",
+    )
+    parser.add_argument(
+        "--wandb-fork-from",
+        default=os.environ.get("WANDB_FORK_FROM"),
+        help="Optional W&B fork_from value, for example '<run_id>?_step=<step>'.",
+    )
+    parser.add_argument(
+        "--wandb-run-group",
+        default=os.environ.get("WANDB_RUN_GROUP"),
+    )
+    parser.add_argument(
+        "--wandb-run-job-type",
+        default=_env_first("WANDB_RUN_JOB_TYPE", "WANDB_JOB_TYPE"),
+    )
+    parser.add_argument(
+        "--wandb-run-tags",
+        default=_env_first("WANDB_RUN_TAGS", "WANDB_TAGS"),
+        help="Comma-separated W&B run tags.",
+    )
+    parser.add_argument(
+        "--wandb-run-notes",
+        default=_env_first("WANDB_RUN_NOTES", "WANDB_NOTES"),
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=WANDB_MODE_CHOICES,
+        default=os.environ.get("WANDB_MODE"),
+        help="Optional W&B mode such as 'online', 'offline', or 'disabled'.",
     )
     parser.add_argument(
         "--nproc-per-node",
@@ -3214,6 +3355,224 @@ def verify_hf_logits_parity_if_requested(args: argparse.Namespace) -> None:
     subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[1])
 
 
+def _clean_optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _normalize_wandb_args(args: argparse.Namespace) -> None:
+    for field in (
+        "wandb_project",
+        "wandb_entity",
+        "wandb_run_name",
+        "wandb_run_id",
+        "wandb_resume",
+        "wandb_resume_from",
+        "wandb_fork_from",
+        "wandb_run_group",
+        "wandb_run_job_type",
+        "wandb_run_tags",
+        "wandb_run_notes",
+        "wandb_mode",
+    ):
+        setattr(args, field, _clean_optional_string(getattr(args, field)))
+
+
+def _validate_wandb_run_id(run_id: str) -> None:
+    if len(run_id) > 64:
+        raise ValueError("--wandb-run-id must be no longer than 64 characters")
+    forbidden = sorted(WANDB_RUN_ID_FORBIDDEN_CHARS & set(run_id))
+    if forbidden:
+        raise ValueError(
+            "--wandb-run-id contains characters W&B forbids: "
+            + ", ".join(repr(char) for char in forbidden)
+        )
+
+
+def _generate_wandb_run_id() -> str:
+    return f"swehero-{uuid.uuid4().hex}"
+
+
+def _wandb_env_overrides(args: argparse.Namespace) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if args.wandb_project:
+        env["WANDB_PROJECT"] = args.wandb_project
+    if args.wandb_run_name:
+        env["WANDB_RUN_NAME"] = args.wandb_run_name
+        env["WANDB_NAME"] = args.wandb_run_name
+    if not args.enable_wandb:
+        return env
+    if args.wandb_entity:
+        env["WANDB_TEAM"] = args.wandb_entity
+        env["WANDB_ENTITY"] = args.wandb_entity
+    if args.wandb_run_id:
+        env["WANDB_RUN_ID"] = args.wandb_run_id
+    if args.wandb_resume:
+        env["WANDB_RESUME"] = args.wandb_resume
+    if args.wandb_resume_from:
+        env["WANDB_RESUME_FROM"] = args.wandb_resume_from
+    if args.wandb_fork_from:
+        env["WANDB_FORK_FROM"] = args.wandb_fork_from
+    if args.wandb_run_group:
+        env["WANDB_RUN_GROUP"] = args.wandb_run_group
+    if args.wandb_run_job_type:
+        env["WANDB_RUN_JOB_TYPE"] = args.wandb_run_job_type
+        env["WANDB_JOB_TYPE"] = args.wandb_run_job_type
+    if args.wandb_run_tags:
+        env["WANDB_RUN_TAGS"] = args.wandb_run_tags
+        env["WANDB_TAGS"] = args.wandb_run_tags
+    if args.wandb_run_notes:
+        env["WANDB_RUN_NOTES"] = args.wandb_run_notes
+        env["WANDB_NOTES"] = args.wandb_run_notes
+    if args.wandb_mode:
+        env["WANDB_MODE"] = args.wandb_mode
+    return env
+
+
+def _wandb_identity_contract(identity: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": identity.get("enabled"),
+        "project": identity.get("project"),
+        "entity": identity.get("entity"),
+        "run_name": identity.get("run_name"),
+        "run_id": identity.get("run_id"),
+        "resume": identity.get("resume"),
+        "resume_from": identity.get("resume_from"),
+        "fork_from": identity.get("fork_from"),
+        "run_group": identity.get("run_group"),
+        "run_job_type": identity.get("run_job_type"),
+        "run_tags": identity.get("run_tags"),
+        "run_notes": identity.get("run_notes"),
+        "mode": identity.get("mode"),
+    }
+
+
+def _build_wandb_identity(
+    args: argparse.Namespace,
+    *,
+    generated_run_id: bool,
+    created_at_unix: float | None = None,
+) -> dict[str, Any]:
+    created_at = time.time() if created_at_unix is None else created_at_unix
+    identity = {
+        "schema_version": WANDB_IDENTITY_SCHEMA_VERSION,
+        "created_at_unix": created_at,
+        "updated_at_unix": time.time(),
+        "enabled": bool(args.enable_wandb),
+        "generated_run_id": generated_run_id,
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "run_name": args.wandb_run_name,
+        "run_id": args.wandb_run_id,
+        "resume": args.wandb_resume,
+        "resume_from": args.wandb_resume_from,
+        "fork_from": args.wandb_fork_from,
+        "run_group": args.wandb_run_group,
+        "run_job_type": args.wandb_run_job_type,
+        "run_tags": args.wandb_run_tags,
+        "run_notes": args.wandb_run_notes,
+        "mode": args.wandb_mode,
+        "env": _wandb_env_overrides(args),
+    }
+    return identity
+
+
+def _load_wandb_identity(path: Path) -> dict[str, Any]:
+    identity = _read_json_object_required(path, "W&B identity")
+    if identity.get("schema_version") != WANDB_IDENTITY_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported W&B identity schema version in "
+            f"{path}: {identity.get('schema_version')!r}"
+        )
+    return identity
+
+
+def _run_spec_wandb_args(out_dir: Path) -> dict[str, Any] | None:
+    spec_path = _run_spec_path(out_dir)
+    if not spec_path.is_file():
+        return None
+    spec = _read_json_object_required(spec_path, "immutable run spec")
+    args = spec.get("args")
+    return dict(args) if isinstance(args, Mapping) else None
+
+
+def _apply_wandb_run_id_from_existing_record(
+    args: argparse.Namespace,
+    existing_identity: Mapping[str, Any] | None,
+) -> None:
+    if args.wandb_run_id:
+        return
+    if existing_identity and existing_identity.get("run_id"):
+        args.wandb_run_id = str(existing_identity["run_id"])
+        return
+    run_spec_args = _run_spec_wandb_args(args.out_dir)
+    if run_spec_args and run_spec_args.get("wandb_run_id"):
+        args.wandb_run_id = str(run_spec_args["wandb_run_id"])
+
+
+def resolve_wandb_identity(
+    args: argparse.Namespace,
+    *,
+    resume_state: ResumeCheckpointState | None,
+) -> dict[str, Any] | None:
+    _normalize_wandb_args(args)
+    if not args.enable_wandb:
+        return None
+
+    if args.wandb_resume_from and args.wandb_fork_from:
+        raise ValueError(
+            "--wandb-resume-from and --wandb-fork-from are mutually exclusive"
+        )
+    if args.wandb_resume and (args.wandb_resume_from or args.wandb_fork_from):
+        raise ValueError(
+            "--wandb-resume cannot be combined with --wandb-resume-from or "
+            "--wandb-fork-from"
+        )
+    if args.wandb_resume is None and not (
+        args.wandb_resume_from or args.wandb_fork_from
+    ):
+        args.wandb_resume = "allow"
+
+    path = _wandb_identity_path(args.out_dir)
+    existing_identity = _load_wandb_identity(path) if path.exists() else None
+    _apply_wandb_run_id_from_existing_record(args, existing_identity)
+    generated_run_id = False
+    if not args.wandb_run_id:
+        if resume_state is not None:
+            raise RuntimeError(
+                "--resume with --enable-wandb requires a persisted W&B run id "
+                f"in {path} or {RUN_SPEC_FILENAME}, or an explicit --wandb-run-id."
+            )
+        args.wandb_run_id = _generate_wandb_run_id()
+        generated_run_id = True
+
+    _validate_wandb_run_id(args.wandb_run_id)
+    identity = _build_wandb_identity(
+        args,
+        generated_run_id=generated_run_id,
+        created_at_unix=existing_identity.get("created_at_unix")
+        if isinstance(existing_identity, Mapping)
+        else None,
+    )
+    if existing_identity is not None:
+        existing_contract = _wandb_identity_contract(existing_identity)
+        actual_contract = _wandb_identity_contract(identity)
+        diffs = _contract_diffs(existing_contract, actual_contract)
+        if diffs:
+            preview = "\n".join(f"- {diff}" for diff in diffs[:20])
+            extra = "" if len(diffs) <= 20 else f"\n... and {len(diffs) - 20} more"
+            raise RuntimeError(
+                "Current W&B identity does not match the existing run identity:\n"
+                f"{preview}{extra}"
+            )
+        identity["generated_run_id"] = bool(existing_identity.get("generated_run_id"))
+
+    _write_json_atomic(path, identity)
+    return identity
+
+
 def build_stage_env(
     args: argparse.Namespace,
     *,
@@ -3224,6 +3583,8 @@ def build_stage_env(
     load_dataloader_state: bool = False,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    for key in CONTROLLED_WANDB_ENV_KEYS:
+        env.pop(key, None)
     repo_root = Path(__file__).resolve().parents[1]
     pythonpath_entries = [str(repo_root / "torchtitan"), str(repo_root)]
     if env.get("PYTHONPATH"):
@@ -3270,10 +3631,9 @@ def build_stage_env(
             if load_dataloader_state
             else "0",
             "SWEHERO_ENABLE_WANDB": "1" if args.enable_wandb else "0",
-            "WANDB_PROJECT": args.wandb_project,
-            "WANDB_RUN_NAME": args.wandb_run_name,
         }
     )
+    env.update(_wandb_env_overrides(args))
     return env
 
 
@@ -3370,6 +3730,7 @@ def build_run_spec(
             "data_manifest": str(args.out_dir / "data" / "manifest.json"),
             "launcher_plan": str(args.out_dir / "launcher_plan.json"),
             "resume_contract": str(_resume_contract_path(args.out_dir)),
+            "wandb_identity": str(_wandb_identity_path(args.out_dir)),
             "torchtitan_dump": str(_torchtitan_dump_dir(args.out_dir)),
             "resumable_checkpoints": str(_checkpoint_dir(args.out_dir)),
             "final_model_exports": str(_final_model_export_dir(args.out_dir)),
@@ -3617,9 +3978,21 @@ def _build_stage_status_document(
             "out_dir": str(args.out_dir),
             "run_spec": str(_run_spec_path(args.out_dir)),
             "launcher_plan": str(args.out_dir / "launcher_plan.json"),
+            "wandb_identity": str(_wandb_identity_path(args.out_dir)),
             "final_artifact_validation": str(
                 _final_artifact_validation_path(args.out_dir)
             ),
+        },
+        "wandb": {
+            "enabled": bool(args.enable_wandb),
+            "project": args.wandb_project,
+            "entity": args.wandb_entity,
+            "run_name": args.wandb_run_name,
+            "run_id": args.wandb_run_id,
+            "resume": args.wandb_resume,
+            "resume_from": args.wandb_resume_from,
+            "fork_from": args.wandb_fork_from,
+            "mode": args.wandb_mode,
         },
         "launch": {
             "resume": bool(args.resume),
@@ -4036,6 +4409,7 @@ def _write_launcher_plan(
         "manifest": str(args.out_dir / "data" / "manifest.json"),
         "run_spec": str(_run_spec_path(args.out_dir)),
         "stage_status": str(_stage_status_path(args.out_dir)),
+        "wandb_identity": str(_wandb_identity_path(args.out_dir)),
     }
     (args.out_dir / "launcher_plan.json").write_text(
         json.dumps(launcher_plan, indent=2)
@@ -4084,6 +4458,8 @@ def main(argv: list[str] | None = None) -> None:
             f"{final_export_dir} already exists. Pass --resume to inspect the "
             "completed export or --overwrite-output to start fresh."
         )
+
+    resolve_wandb_identity(args, resume_state=resume_state)
 
     download_hf_assets_if_requested(args)
 

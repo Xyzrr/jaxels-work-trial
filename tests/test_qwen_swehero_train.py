@@ -398,6 +398,162 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual(args.num_examples, 13)
 
+    def test_wandb_identity_generates_run_id_and_env_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--enable-wandb",
+                    "--wandb-project",
+                    "proj",
+                    "--wandb-entity",
+                    "team",
+                    "--wandb-run-name",
+                    "run-name",
+                    "--wandb-run-group",
+                    "group-a",
+                    "--wandb-run-job-type",
+                    "train",
+                    "--wandb-run-tags",
+                    "direct-to-hero,smoke",
+                    "--wandb-run-notes",
+                    "notes",
+                    "--wandb-mode",
+                    "offline",
+                ]
+            )
+            out_dir.mkdir(parents=True)
+            identity = train.resolve_wandb_identity(args, resume_state=None)
+            stage = train.BucketStage(
+                bucket=256,
+                cp_degree=1,
+                example_count=1,
+                steps=1,
+                cumulative_steps=1,
+                bucket_file=out_dir / "data" / "bucket_256.jsonl",
+            )
+            env = train.build_stage_env(
+                args,
+                stage=stage,
+                total_steps=1,
+                warmup_steps=0,
+                pad_token_id=0,
+            )
+            persisted = json.loads(
+                (out_dir / train.WANDB_IDENTITY_FILENAME).read_text()
+            )
+
+        self.assertIsNotNone(identity)
+        self.assertTrue(identity["run_id"].startswith("swehero-"))
+        self.assertLessEqual(len(identity["run_id"]), 64)
+        self.assertEqual(identity, persisted)
+        self.assertEqual(identity["resume"], "allow")
+        self.assertEqual(env["SWEHERO_ENABLE_WANDB"], "1")
+        self.assertEqual(env["WANDB_PROJECT"], "proj")
+        self.assertEqual(env["WANDB_TEAM"], "team")
+        self.assertEqual(env["WANDB_ENTITY"], "team")
+        self.assertEqual(env["WANDB_RUN_NAME"], "run-name")
+        self.assertEqual(env["WANDB_NAME"], "run-name")
+        self.assertEqual(env["WANDB_RUN_ID"], identity["run_id"])
+        self.assertEqual(env["WANDB_RESUME"], "allow")
+        self.assertEqual(env["WANDB_RUN_GROUP"], "group-a")
+        self.assertEqual(env["WANDB_RUN_JOB_TYPE"], "train")
+        self.assertEqual(env["WANDB_JOB_TYPE"], "train")
+        self.assertEqual(env["WANDB_RUN_TAGS"], "direct-to-hero,smoke")
+        self.assertEqual(env["WANDB_TAGS"], "direct-to-hero,smoke")
+        self.assertEqual(env["WANDB_RUN_NOTES"], "notes")
+        self.assertEqual(env["WANDB_NOTES"], "notes")
+        self.assertEqual(env["WANDB_MODE"], "offline")
+        self.assertNotIn("WANDB_API_KEY", identity["env"])
+
+    def test_wandb_identity_reuses_run_id_on_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            args = train.parse_args(
+                ["--out-dir", str(out_dir), "--enable-wandb"]
+            )
+            out_dir.mkdir(parents=True)
+            train.resolve_wandb_identity(args, resume_state=None)
+            run_id = args.wandb_run_id
+
+            resume_args = train.parse_args(
+                ["--out-dir", str(out_dir), "--enable-wandb", "--resume"]
+            )
+            resume_state = train.ResumeCheckpointState(
+                checkpoint_dir=train._checkpoint_dir(out_dir),
+                final_export_dir=train._final_model_export_dir(out_dir),
+                latest_resumable_step=1,
+                latest_model_export_step=None,
+                latest_any_step=1,
+            )
+            identity = train.resolve_wandb_identity(
+                resume_args,
+                resume_state=resume_state,
+            )
+
+        self.assertEqual(resume_args.wandb_run_id, run_id)
+        self.assertEqual(identity["run_id"], run_id)
+        self.assertEqual(identity["resume"], "allow")
+
+    def test_wandb_identity_rejects_changed_existing_run_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--enable-wandb",
+                    "--wandb-run-id",
+                    "original-run",
+                ]
+            )
+            out_dir.mkdir(parents=True)
+            train.resolve_wandb_identity(args, resume_state=None)
+            changed = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--enable-wandb",
+                    "--wandb-run-id",
+                    "different-run",
+                ]
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "W&B identity"):
+                train.resolve_wandb_identity(changed, resume_state=None)
+
+    def test_wandb_resume_controls_reject_conflicts_and_bad_run_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            out_dir.mkdir(parents=True)
+            conflicting = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--enable-wandb",
+                    "--wandb-resume",
+                    "allow",
+                    "--wandb-resume-from",
+                    "abc123?_step=10",
+                ]
+            )
+            bad_run_id = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--enable-wandb",
+                    "--wandb-run-id",
+                    "bad/id",
+                ]
+            )
+
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                train.resolve_wandb_identity(conflicting, resume_state=None)
+            with self.assertRaisesRegex(ValueError, "forbids"):
+                train.resolve_wandb_identity(bad_run_id, resume_state=None)
+
     def test_explicit_launch_env_file_must_exist(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "missing.env"
@@ -1623,6 +1779,92 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(
             launcher_plan["run_spec"],
             str(out_dir / train.RUN_SPEC_FILENAME),
+        )
+        self.assertEqual(
+            launcher_plan["wandb_identity"],
+            str(out_dir / train.WANDB_IDENTITY_FILENAME),
+        )
+
+    def test_main_writes_wandb_identity_for_dry_run_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            dataset_path = Path(tmp) / "dataset"
+            hf_assets_path = Path(tmp) / "hf"
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--dataset-path",
+                    str(dataset_path),
+                    "--hf-assets-path",
+                    str(hf_assets_path),
+                    "--buckets",
+                    "256",
+                    "--bucket-cp",
+                    "256:1",
+                    "--max-length",
+                    "256",
+                    "--num-examples",
+                    "1",
+                ]
+            )
+            example = {
+                "instance_id": "short",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+            self._materialize_with_fake_runtime(args, [example])
+
+            with patch.dict(os.environ, {}, clear=True):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    train.main(
+                        [
+                            "--out-dir",
+                            str(out_dir),
+                            "--dataset-path",
+                            str(dataset_path),
+                            "--hf-assets-path",
+                            str(hf_assets_path),
+                            "--buckets",
+                            "256",
+                            "--bucket-cp",
+                            "256:1",
+                            "--max-length",
+                            "256",
+                            "--num-examples",
+                            "1",
+                            "--skip-data-prep",
+                            "--dry-run",
+                            "--enable-wandb",
+                            "--wandb-mode",
+                            "offline",
+                            "--wandb-run-name",
+                            "dry-run-wandb",
+                        ]
+                    )
+
+            identity = json.loads(
+                (args.out_dir / train.WANDB_IDENTITY_FILENAME).read_text()
+            )
+            run_spec = json.loads(
+                (args.out_dir / train.RUN_SPEC_FILENAME).read_text()
+            )
+            launcher_plan = json.loads((args.out_dir / "launcher_plan.json").read_text())
+
+        self.assertEqual(identity["run_name"], "dry-run-wandb")
+        self.assertTrue(identity["generated_run_id"])
+        self.assertEqual(identity["resume"], "allow")
+        self.assertEqual(run_spec["args"]["wandb_run_id"], identity["run_id"])
+        self.assertEqual(run_spec["args"]["wandb_resume"], "allow")
+        self.assertEqual(
+            run_spec["paths"]["wandb_identity"],
+            str(args.out_dir / train.WANDB_IDENTITY_FILENAME),
+        )
+        self.assertEqual(
+            launcher_plan["wandb_identity"],
+            str(args.out_dir / train.WANDB_IDENTITY_FILENAME),
         )
 
     def test_load_manifest_rejects_corrupt_bucket_file(self):
