@@ -64,6 +64,7 @@ QWEN_NATIVE_CONTEXT_LENGTH = 32_768
 DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-torchtitan")
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
 DEFAULT_DATASET_PATH = Path("/workspace/datasets") / TRAINING_DATASET_NAME
+CANONICAL_WORKSPACE_ROOT = Path("/workspace/jaxels-work-trial")
 DEFAULT_NUM_EXAMPLES = 0
 DEFAULT_MAX_STREAMED_EXAMPLES = 0
 DEFAULT_BUCKETS = (8_192, 16_384, 32_768, 65_536, PAPER_CONTEXT_LENGTH)
@@ -155,6 +156,7 @@ CONTROLLED_WANDB_ENV_KEYS = (
     "WANDB_MODE",
 )
 RESUME_ARG_FIELDS = (
+    "workspace_root",
     "model_id",
     "model_revision",
     "dataset_id",
@@ -218,6 +220,7 @@ RESUME_ARG_FIELDS = (
     "torch_nccl_async_error_handling",
 )
 RUN_SPEC_ARG_FIELDS = (
+    "workspace_root",
     "model_id",
     "model_revision",
     "dataset_id",
@@ -308,6 +311,7 @@ RESUME_STAGE_ENV_KEYS = (
     "TOKENIZERS_PARALLELISM",
     "CUDA_DEVICE_MAX_CONNECTIONS",
     "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+    "SWEHERO_WORKSPACE_ROOT",
     "SWEHERO_MODEL_ID",
     "SWEHERO_MODEL_REVISION",
     "SWEHERO_DATASET_ID",
@@ -728,6 +732,77 @@ def _resolve_for_safety(path: Path) -> Path:
     return path.expanduser().resolve(strict=False)
 
 
+def _absolute_without_symlink_resolution(path: Path) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = Path(os.environ.get("PWD") or Path.cwd()) / expanded
+    return Path(os.path.normpath(os.fspath(expanded)))
+
+
+def _detected_workspace_root() -> Path:
+    script_path = Path(__file__)
+    script_resolved = script_path.resolve(strict=False)
+    canonical_root = _absolute_without_symlink_resolution(CANONICAL_WORKSPACE_ROOT)
+    canonical_script = canonical_root / "scripts" / script_path.name
+    if canonical_script.resolve(strict=False) == script_resolved:
+        return canonical_root
+    logical_pwd = os.environ.get("PWD")
+    if logical_pwd:
+        logical_root = _absolute_without_symlink_resolution(Path(logical_pwd))
+        logical_script = logical_root / "scripts" / script_path.name
+        if logical_script.resolve(strict=False) == script_resolved:
+            return logical_root
+    if not script_path.is_absolute():
+        script_path = Path(os.environ.get("PWD") or Path.cwd()) / script_path
+    return _absolute_without_symlink_resolution(script_path.parent.parent)
+
+
+def _default_workspace_root() -> Path:
+    configured = os.environ.get("WORKSPACE_ROOT") or os.environ.get(
+        "SWEHERO_WORKSPACE_ROOT"
+    )
+    if configured:
+        return _absolute_without_symlink_resolution(Path(configured))
+    return _detected_workspace_root()
+
+
+def _configured_workspace_root(args: argparse.Namespace) -> Path:
+    return _absolute_without_symlink_resolution(args.workspace_root)
+
+
+def workspace_root_metadata(
+    args: argparse.Namespace,
+    *,
+    include_cwd: bool = False,
+) -> dict[str, Any]:
+    configured_root = _configured_workspace_root(args)
+    script_root = _detected_workspace_root()
+    canonical_root = _absolute_without_symlink_resolution(CANONICAL_WORKSPACE_ROOT)
+    metadata = {
+        "canonical_root": str(canonical_root),
+        "configured_root": str(configured_root),
+        "script_root": str(script_root),
+        "configured_root_resolved": str(_resolve_for_safety(configured_root)),
+        "script_root_resolved": str(_resolve_for_safety(script_root)),
+        "matches_canonical": (
+            configured_root == canonical_root and script_root == canonical_root
+        ),
+    }
+    if include_cwd:
+        cwd = _absolute_without_symlink_resolution(Path.cwd())
+        logical_cwd = _absolute_without_symlink_resolution(
+            Path(os.environ.get("PWD") or cwd)
+        )
+        metadata.update(
+            {
+                "cwd": str(cwd),
+                "logical_cwd": str(logical_cwd),
+                "cwd_resolved": str(_resolve_for_safety(cwd)),
+            }
+        )
+    return metadata
+
+
 def _path_is_relative_to(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -851,6 +926,24 @@ def _production_mode_errors(
             "--production-mode rejects --skip-data-prep for fresh launches; "
             "materialize and validate data in the launch or use --resume for "
             "checkpoint continuation"
+        )
+
+    configured_workspace_root = _configured_workspace_root(args)
+    detected_workspace_root = _detected_workspace_root()
+    canonical_workspace_root = _absolute_without_symlink_resolution(
+        CANONICAL_WORKSPACE_ROOT
+    )
+    if configured_workspace_root != canonical_workspace_root:
+        errors.append(
+            "--production-mode requires canonical workspace root "
+            f"--workspace-root={canonical_workspace_root}; got "
+            f"{configured_workspace_root}"
+        )
+    if detected_workspace_root != canonical_workspace_root:
+        errors.append(
+            "--production-mode requires the launcher script to run from the "
+            f"canonical workspace root {canonical_workspace_root}; detected "
+            f"{detected_workspace_root}"
         )
 
     required_values = (
@@ -1585,6 +1678,7 @@ def build_resume_contract(
             field: _jsonable(getattr(args, field))
             for field in RESUME_ARG_FIELDS
         },
+        "workspace": workspace_root_metadata(args),
         "manifest": _resume_manifest_contract(manifest),
         "plan": {
             "total_steps": plan.total_steps,
@@ -1844,6 +1938,15 @@ def parse_args(
         type=Path,
         default=_env_path("OUT_DIR", DEFAULT_OUT_DIR),
         help="Run folder on the pod. Bucket JSONL, manifests, and checkpoints live here.",
+    )
+    parser.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=_default_workspace_root(),
+        help=(
+            "Repository workspace root used for launcher subprocesses and "
+            "provenance. Production mode requires /workspace/jaxels-work-trial."
+        ),
     )
     parser.add_argument(
         "--hf-assets-path",
@@ -2397,6 +2500,7 @@ def parse_args(
     args = parser.parse_args(argv)
     if args.dataset_revision:
         args.source_dataset_revision = args.dataset_revision
+    args.workspace_root = _configured_workspace_root(args)
     return args
 
 
@@ -2504,7 +2608,7 @@ def _dataset_artifact_metadata(dataset_path: Path) -> dict[str, Any]:
 
 
 def build_source_dataset_command(args: argparse.Namespace) -> list[str]:
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = _configured_workspace_root(args)
     command = [
         sys.executable,
         str(repo_root / "scripts" / "prepare_swehero_historical_one_rollout.py"),
@@ -2553,7 +2657,7 @@ def ensure_training_dataset(args: argparse.Namespace) -> None:
     command = build_source_dataset_command(args)
     print("Preparing SWE-Hero training dataset artifact:")
     print(" ".join(command))
-    subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[1])
+    subprocess.run(command, check=True, cwd=_configured_workspace_root(args))
 
 
 def load_training_dataset(args: argparse.Namespace):
@@ -4146,7 +4250,7 @@ def _bucket_counts_from_manifest(manifest: Mapping[str, Any]) -> dict[int, int]:
 def download_hf_assets_if_requested(args: argparse.Namespace) -> None:
     if not args.download_hf_assets:
         return
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = _configured_workspace_root(args)
     local_dir = args.hf_assets_path.parent
     command = [
         sys.executable,
@@ -4602,7 +4706,10 @@ def write_runtime_metadata(
             "nvidia_smi": _nvidia_smi_metadata(),
         },
         "environment": _runtime_environment_metadata(),
-        "lockfiles": _runtime_lockfile_metadata(),
+        "workspace": workspace_root_metadata(args, include_cwd=True),
+        "lockfiles": _runtime_lockfile_metadata(
+            repo_root=_configured_workspace_root(args)
+        ),
     }
     _write_json_atomic(_runtime_metadata_path(args.out_dir), metadata)
     return metadata
@@ -4989,7 +5096,7 @@ def validate_final_artifacts(
 
 
 def build_hf_logits_parity_command(args: argparse.Namespace) -> list[str]:
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = _configured_workspace_root(args)
     return [
         sys.executable,
         str(repo_root / "scripts" / "qwen_swehero_logits_parity.py"),
@@ -5015,7 +5122,7 @@ def verify_hf_logits_parity_if_requested(args: argparse.Namespace) -> None:
     command = build_hf_logits_parity_command(args)
     print("Running HF logits parity check:")
     print(" ".join(command))
-    subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[1])
+    subprocess.run(command, check=True, cwd=_configured_workspace_root(args))
 
 
 def _clean_optional_string(value: object) -> str | None:
@@ -5248,7 +5355,7 @@ def build_stage_env(
     env = os.environ.copy()
     for key in CONTROLLED_WANDB_ENV_KEYS:
         env.pop(key, None)
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = _configured_workspace_root(args)
     pythonpath_entries = [str(repo_root / "torchtitan"), str(repo_root)]
     if env.get("PYTHONPATH"):
         pythonpath_entries.append(env["PYTHONPATH"])
@@ -5261,6 +5368,7 @@ def build_stage_env(
                 args.torch_nccl_async_error_handling
             ),
             "LOG_RANK": args.log_rank,
+            "SWEHERO_WORKSPACE_ROOT": str(repo_root),
             "SWEHERO_MODEL_ID": args.model_id,
             "SWEHERO_MODEL_REVISION": args.model_revision,
             "SWEHERO_DATASET_ID": args.dataset_id,
@@ -5436,7 +5544,9 @@ def build_run_spec(
             field: _jsonable(getattr(args, field))
             for field in RUN_SPEC_ARG_FIELDS
         },
+        "workspace": workspace_root_metadata(args),
         "paths": {
+            "workspace_root": str(_configured_workspace_root(args)),
             "out_dir": str(args.out_dir),
             "data_manifest": str(args.out_dir / "data" / "manifest.json"),
             "launcher_plan": str(args.out_dir / "launcher_plan.json"),
@@ -5610,7 +5720,7 @@ def run_stage(
     _run_command_with_signal_forwarding(
         command,
         env=env,
-        cwd=Path(__file__).resolve().parents[1],
+        cwd=_configured_workspace_root(args),
     )
 
 
@@ -6386,6 +6496,7 @@ def _post_training_eval_env(
         final_export_path = str(final_export.get("path") or "")
         final_export_step = str(final_export.get("step") or "")
     return {
+        "SWEHERO_WORKSPACE_ROOT": str(_configured_workspace_root(args)),
         "SWEHERO_OUT_DIR": str(args.out_dir),
         "SWEHERO_RUN_SPEC": str(_run_spec_path(args.out_dir)),
         "SWEHERO_DATA_MANIFEST": str(args.out_dir / "data" / "manifest.json"),
@@ -6431,7 +6542,7 @@ def _post_training_eval_status_record(
         "finished_at_unix": finished_at_unix,
         "duration_seconds": duration,
         "command": args.post_training_eval_command,
-        "cwd": str(Path(__file__).resolve().parents[1]),
+        "cwd": str(_configured_workspace_root(args)),
         "env_overrides": env_overrides,
         "returncode": returncode,
         "stdout_tail": _text_tail(stdout),
@@ -6523,7 +6634,7 @@ def run_post_training_eval(
     completed = subprocess.run(
         args.post_training_eval_command,
         shell=True,
-        cwd=Path(__file__).resolve().parents[1],
+        cwd=_configured_workspace_root(args),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -6592,6 +6703,7 @@ def _write_launcher_plan(
         ],
         "bucket_curriculum": args.bucket_curriculum,
         "distributed": _distributed_launch_summary(args),
+        "workspace": workspace_root_metadata(args, include_cwd=True),
         "total_steps": plan.total_steps,
         "warmup_steps": plan.warmup_steps,
         "manifest": str(args.out_dir / "data" / "manifest.json"),

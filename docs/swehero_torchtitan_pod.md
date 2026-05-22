@@ -19,6 +19,15 @@ The launcher pins the base checkpoint to
 That revision is passed to Hugging Face asset downloads, recorded in the data
 manifest and run spec, and checked during preflight before launch.
 
+Production launches require the canonical workspace root
+`/workspace/jaxels-work-trial`. The launcher records the configured root, the
+script root, and their resolved physical paths in `run_spec.json`,
+`resume_contract.json`, `launcher_plan.json`, and `runtime_metadata.json`.
+`launcher_plan.json` and `runtime_metadata.json` also record the current working
+directory for debugging. Override `--workspace-root` or `WORKSPACE_ROOT` only
+for non-production local tests; `--production-mode` rejects any root other than
+the canonical pod path.
+
 Do not launch this job with bare `python`, bare `torchrun`, or
 `/workspace/venv`. The run wrapper verifies the canonical venv first, prepends
 that venv to `PATH`, and points `TORCHRUN_BIN` at the venv's `torchrun`.

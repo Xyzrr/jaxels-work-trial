@@ -368,7 +368,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self,
         extra_args: list[str] | None = None,
     ):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            train,
+            "_detected_workspace_root",
+            return_value=train.CANONICAL_WORKSPACE_ROOT,
+        ):
             args = train.parse_args(
                 [
                     "--out-dir",
@@ -448,6 +452,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertFalse(args.enable_memory_snapshot)
         self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
         self.assertTrue(args.validate_first_step_checkpoint)
+        self.assertEqual(args.workspace_root, train._detected_workspace_root())
 
     def test_production_mode_accepts_full_default_training_recipe(self):
         args = self._validate_default_production_launch_args()
@@ -458,6 +463,48 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.max_steps, 0)
         self.assertEqual(args.max_length, train.PAPER_CONTEXT_LENGTH)
         self.assertTrue(args.validate_first_step_checkpoint)
+        self.assertEqual(args.workspace_root, train.CANONICAL_WORKSPACE_ROOT)
+
+    def test_production_mode_requires_canonical_workspace_root(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            train,
+            "_detected_workspace_root",
+            return_value=Path(tmp) / "repo",
+        ):
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
+                    "--production-mode",
+                ]
+            )
+            buckets = train.parse_bucket_list(args.buckets)
+            bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
+            with self.assertRaisesRegex(ValueError, "canonical workspace root"):
+                train.validate_launch_inputs(args, buckets=buckets, bucket_cp=bucket_cp)
+
+    def test_detected_workspace_root_prefers_canonical_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            physical_root = Path(tmp) / "home" / "jaxels-work-trial"
+            script_path = physical_root / "scripts" / "qwen_swehero_train.py"
+            script_path.parent.mkdir(parents=True)
+            script_path.write_text("# launcher\n")
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            canonical_root = workspace_dir / "jaxels-work-trial"
+            canonical_root.symlink_to(physical_root, target_is_directory=True)
+
+            with (
+                patch.object(train, "__file__", str(script_path)),
+                patch.object(train, "CANONICAL_WORKSPACE_ROOT", canonical_root),
+            ):
+                detected = train._detected_workspace_root()
+
+        self.assertEqual(detected, canonical_root)
 
     def test_production_mode_rejects_smoke_and_subset_controls(self):
         cases = [
@@ -1232,6 +1279,15 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
             },
         )
+        self.assertEqual(
+            metadata["workspace"]["configured_root"],
+            str(train._configured_workspace_root(args)),
+        )
+        self.assertEqual(
+            metadata["workspace"]["canonical_root"],
+            str(train.CANONICAL_WORKSPACE_ROOT),
+        )
+        self.assertIn("cwd", metadata["workspace"])
 
     def test_runtime_lockfile_metadata_uses_invoked_venv_root(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2079,8 +2135,24 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             spec["paths"]["first_step_checkpoint_validation"],
             str(train._first_step_checkpoint_validation_path(args.out_dir)),
         )
+        self.assertEqual(
+            spec["paths"]["workspace_root"],
+            str(train._configured_workspace_root(args)),
+        )
+        self.assertEqual(
+            spec["workspace"]["configured_root"],
+            str(train._configured_workspace_root(args)),
+        )
+        self.assertEqual(
+            spec["workspace"]["script_root"],
+            str(train._detected_workspace_root()),
+        )
         self.assertEqual(spec["plan"]["total_steps"], plan.total_steps)
         first_env = spec["plan"]["stages"][0]["env_overrides"]
+        self.assertEqual(
+            first_env["SWEHERO_WORKSPACE_ROOT"],
+            str(train._configured_workspace_root(args)),
+        )
         self.assertEqual(first_env["SWEHERO_BUCKET_SEQ_LEN"], "8192")
         self.assertEqual(
             first_env["SWEHERO_FINAL_EXPORT_FOLDER"],
@@ -2107,6 +2179,8 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertTrue(spec["args"]["production_mode"])
         self.assertTrue(contract["args"]["production_mode"])
         self.assertTrue(spec["paper_alignment"]["run_safety"]["production_mode"])
+        self.assertEqual(spec["workspace"]["configured_root"], str(args.workspace_root))
+        self.assertEqual(contract["workspace"]["configured_root"], str(args.workspace_root))
 
     def test_hidden_torchtitan_env_inputs_are_recorded_as_launch_args(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -3084,6 +3158,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(
             run_spec["paths"]["runtime_metadata"],
             str(out_dir / train.RUNTIME_METADATA_FILENAME),
+        )
+        self.assertEqual(
+            run_spec["paths"]["workspace_root"],
+            str(train._configured_workspace_root(train.parse_args([]))),
         )
         self.assertEqual(
             launcher_plan["runtime_metadata"],
