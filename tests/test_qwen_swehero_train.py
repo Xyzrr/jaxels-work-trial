@@ -971,6 +971,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "model_assets.model_revision"):
                 train.validate_hf_asset_preflight(args, mismatched_manifest)
 
+            (hf_assets / "model-00001-of-00001.safetensors").write_bytes(b"drift")
+            with self.assertRaisesRegex(RuntimeError, "sha256"):
+                train.validate_hf_asset_preflight(args, manifest)
+
             (hf_assets / "model-00001-of-00001.safetensors").write_bytes(
                 b"changed-length"
             )
@@ -978,6 +982,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 train.validate_hf_asset_preflight(args, manifest)
 
         self.assertEqual(summary["manifest_model_assets"]["file_count"], 5)
+        self.assertEqual(summary["manifest_model_assets"]["sha256_verified_files"], 5)
 
     def test_cuda_launch_summary_requires_visible_device_per_rank(self):
         class FakeCuda:

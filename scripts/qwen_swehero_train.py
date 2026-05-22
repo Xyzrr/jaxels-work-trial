@@ -4020,6 +4020,7 @@ def _validate_manifest_model_asset_preflight(
 
     checked_files = 0
     checked_bytes = 0
+    checked_hashes = 0
     for record in files:
         if not isinstance(record, Mapping):
             raise RuntimeError("model_assets.files entries must be objects")
@@ -4036,8 +4037,24 @@ def _validate_manifest_model_asset_preflight(
                 "Model asset byte size does not match model_assets provenance: "
                 f"{asset_path} has {actual_bytes} byte(s), expected {expected_bytes}"
             )
+        expected_sha256 = record.get("sha256")
+        if not isinstance(expected_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            expected_sha256,
+        ):
+            raise RuntimeError(
+                "model_assets.files entry has invalid sha256 during preflight: "
+                f"{record!r}"
+            )
+        actual_sha256 = _hash_file(asset_path)
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                "Model asset sha256 does not match model_assets provenance: "
+                f"{asset_path} has {actual_sha256}, expected {expected_sha256}"
+            )
         checked_files += 1
         checked_bytes += actual_bytes
+        checked_hashes += 1
 
     if int(model_assets.get("file_count", -1)) != checked_files:
         raise RuntimeError(
@@ -4074,6 +4091,7 @@ def _validate_manifest_model_asset_preflight(
         "model_revision": model_assets.get("model_revision"),
         "file_count": checked_files,
         "total_bytes": checked_bytes,
+        "sha256_verified_files": checked_hashes,
     }
 
 
