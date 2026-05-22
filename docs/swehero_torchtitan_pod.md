@@ -210,6 +210,7 @@ The currently explicit controls are:
 --mixed-precision-reduce-dtype bfloat16 \
 --fsdp-reshard-after-forward never \
 --no-detect-anomaly \
+--validate-first-step-checkpoint \
 --cuda-device-max-connections 1 \
 --torch-nccl-async-error-handling 1
 ```
@@ -217,6 +218,13 @@ The currently explicit controls are:
 These defaults match the existing direct-to-hero TorchTitan config path. Change
 them only for an intentional experiment or debugging run, and keep the reviewed
 argument file as the source of truth.
+
+With `--validate-first-step-checkpoint` enabled, TorchTitan writes a full DCP
+checkpoint at optimizer step 1, validates its metadata and payload files before
+retention cleanup can remove it, and writes
+`first_step_checkpoint_validation.json` under the run directory. The launcher
+requires that report after the first stage, so broken checkpoint storage fails
+early instead of only being discovered at the final export.
 
 ## Bucket Curriculum
 

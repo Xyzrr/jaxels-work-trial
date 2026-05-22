@@ -293,6 +293,21 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         (step_dir / "__0_0.distcp").write_bytes(b"dcp-payload")
         return step_dir
 
+    def _write_first_step_checkpoint_validation_report(self, out_dir: Path) -> dict:
+        checkpoint = train._validate_dcp_checkpoint_step(
+            self._write_dcp_checkpoint(out_dir, step=1)
+        )
+        report = {
+            "schema_version": train.FIRST_STEP_CHECKPOINT_VALIDATION_SCHEMA_VERSION,
+            "created_at_unix": 1.0,
+            "step": 1,
+            "checkpoint": checkpoint,
+        }
+        train._first_step_checkpoint_validation_path(out_dir).write_text(
+            json.dumps(report, indent=2)
+        )
+        return report
+
     def _write_final_export(
         self,
         out_dir: Path,
@@ -432,6 +447,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.profiler_warmup, 3)
         self.assertFalse(args.enable_memory_snapshot)
         self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
+        self.assertTrue(args.validate_first_step_checkpoint)
 
     def test_production_mode_accepts_full_default_training_recipe(self):
         args = self._validate_default_production_launch_args()
@@ -441,6 +457,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.max_streamed_examples, 0)
         self.assertEqual(args.max_steps, 0)
         self.assertEqual(args.max_length, train.PAPER_CONTEXT_LENGTH)
+        self.assertTrue(args.validate_first_step_checkpoint)
 
     def test_production_mode_rejects_smoke_and_subset_controls(self):
         cases = [
@@ -451,6 +468,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             (["--num-examples", "1"], "--num-examples=0"),
             (["--max-streamed-examples", "10"], "--max-streamed-examples=0"),
             (["--max-steps", "1"], "--max-steps=0"),
+            (
+                ["--no-validate-first-step-checkpoint"],
+                "--validate-first-step-checkpoint=True",
+            ),
         ]
         for extra_args, message in cases:
             with self.subTest(extra_args=extra_args):
@@ -577,6 +598,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         cases = [
             ({"ENABLE_FP8": "maybe"}, "ENABLE_FP8 must be a boolean"),
             ({"PRODUCTION_MODE": "maybe"}, "PRODUCTION_MODE must be a boolean"),
+            (
+                {"VALIDATE_FIRST_STEP_CHECKPOINT": "maybe"},
+                "VALIDATE_FIRST_STEP_CHECKPOINT must be a boolean",
+            ),
             ({"NUM_EXAMPLES": "abc"}, "NUM_EXAMPLES must be an integer"),
             ({"PROFILER_REPEAT": "abc"}, "PROFILER_REPEAT must be an integer"),
             ({"LEARNING_RATE": "nan"}, "LEARNING_RATE must be finite"),
@@ -1625,6 +1650,44 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "payload file name"):
                 train.validate_final_artifacts(args, plan, write_report=False)
 
+    def test_first_step_checkpoint_validation_accepts_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, _plan = self._resume_test_setup(tmp)
+            written = self._write_first_step_checkpoint_validation_report(args.out_dir)
+
+            report = train.validate_first_step_checkpoint_report(args)
+
+        self.assertEqual(report, written)
+        self.assertEqual(report["step"], 1)
+        self.assertEqual(report["checkpoint"]["payload_file_count"], 1)
+        self.assertEqual(report["checkpoint"]["payload_rank_count"], 1)
+
+    def test_first_step_checkpoint_validation_rejects_missing_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, _plan = self._resume_test_setup(tmp)
+
+            with self.assertRaisesRegex(RuntimeError, "First-step checkpoint"):
+                train.validate_first_step_checkpoint_report(args)
+
+    def test_first_step_checkpoint_validation_rejects_wrong_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, _plan = self._resume_test_setup(tmp)
+            checkpoint = train._validate_dcp_checkpoint_step(
+                self._write_dcp_checkpoint(args.out_dir, step=2)
+            )
+            report = {
+                "schema_version": train.FIRST_STEP_CHECKPOINT_VALIDATION_SCHEMA_VERSION,
+                "created_at_unix": 1.0,
+                "step": 2,
+                "checkpoint": checkpoint,
+            }
+            train._first_step_checkpoint_validation_path(args.out_dir).write_text(
+                json.dumps(report, indent=2)
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "step 1"):
+                train.validate_first_step_checkpoint_report(args)
+
     def test_final_artifact_validation_rejects_duplicate_legacy_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, _manifest, plan = self._resume_test_setup(tmp)
@@ -1732,6 +1795,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_stage_status_records_successful_stage_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, manifest, plan = self._resume_test_setup(tmp)
+            args.validate_first_step_checkpoint = False
             train.initialize_stage_status(
                 args,
                 plan,
@@ -2011,6 +2075,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             spec["paths"]["final_model_exports"],
             str(train._final_model_export_dir(args.out_dir)),
         )
+        self.assertEqual(
+            spec["paths"]["first_step_checkpoint_validation"],
+            str(train._first_step_checkpoint_validation_path(args.out_dir)),
+        )
         self.assertEqual(spec["plan"]["total_steps"], plan.total_steps)
         first_env = spec["plan"]["stages"][0]["env_overrides"]
         self.assertEqual(first_env["SWEHERO_BUCKET_SEQ_LEN"], "8192")
@@ -2019,6 +2087,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             train.FINAL_MODEL_EXPORT_FOLDER,
         )
         self.assertEqual(first_env["SWEHERO_SAVE_FINAL_FULL_CHECKPOINT"], "1")
+        self.assertEqual(first_env["SWEHERO_ENABLE_FIRST_STEP_CHECKPOINT"], "1")
+        self.assertEqual(
+            first_env["SWEHERO_FIRST_STEP_CHECKPOINT_VALIDATION_REPORT"],
+            str(train._first_step_checkpoint_validation_path(args.out_dir)),
+        )
         self.assertEqual(first_env["SWEHERO_ENABLE_PROFILER"], "0")
         self.assertEqual(first_env["SWEHERO_PROFILER_FREQ"], "10")
         self.assertEqual(first_env["SWEHERO_ENABLE_MEMORY_SNAPSHOT"], "0")
@@ -2070,6 +2143,71 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(first_env["SWEHERO_DETECT_ANOMALY"], "1")
         self.assertEqual(first_env["CUDA_DEVICE_MAX_CONNECTIONS"], "2")
         self.assertEqual(first_env["TORCH_NCCL_ASYNC_ERROR_HANDLING"], "3")
+
+    def test_first_step_checkpoint_validation_marks_status_after_first_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            stage = plan.stages[0]
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+
+            def fake_run_stage(*_args, **_kwargs):
+                self._write_first_step_checkpoint_validation_report(args.out_dir)
+
+            with patch.object(train, "run_stage", side_effect=fake_run_stage):
+                train.run_stage_with_status(args, stage, plan, manifest)
+
+            status = json.loads(
+                (args.out_dir / train.STAGE_STATUS_FILENAME).read_text()
+            )
+
+        self.assertEqual(status["stages"][0]["status"], "succeeded")
+        first_validation = status["first_step_checkpoint_validation"]
+        self.assertEqual(first_validation["status"], "succeeded")
+        self.assertEqual(first_validation["summary"]["step"], 1)
+        self.assertEqual(
+            status["summary"]["first_step_checkpoint_validation_status"],
+            "succeeded",
+        )
+
+    def test_first_step_checkpoint_validation_failure_marks_stage_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            stage = plan.stages[0]
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+
+            with (
+                patch.object(train, "run_stage", return_value=None),
+                self.assertRaisesRegex(RuntimeError, "First-step checkpoint"),
+            ):
+                train.run_stage_with_status(args, stage, plan, manifest)
+
+            status = json.loads(
+                (args.out_dir / train.STAGE_STATUS_FILENAME).read_text()
+            )
+
+        self.assertEqual(status["stages"][0]["status"], "failed")
+        first_validation = status["first_step_checkpoint_validation"]
+        self.assertEqual(first_validation["status"], "failed")
+        self.assertEqual(
+            first_validation["failure"]["phase"],
+            "first_step_checkpoint_validation",
+        )
+        self.assertEqual(
+            status["failures"][0]["phase"],
+            "first_step_checkpoint_validation",
+        )
 
     def test_run_spec_rejects_hidden_torchtitan_env_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2289,6 +2427,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("SWEHERO_FINAL_EXPORT_FOLDER", source)
         self.assertIn("save_last_step_full_checkpoint=", source)
         self.assertIn("SWEHERO_SAVE_FINAL_FULL_CHECKPOINT", source)
+        self.assertIn("enable_first_step_checkpoint=", source)
+        self.assertIn("SWEHERO_ENABLE_FIRST_STEP_CHECKPOINT", source)
+        self.assertIn("first_step_checkpoint_validation_report=", source)
+        self.assertIn("SWEHERO_FIRST_STEP_CHECKPOINT_VALIDATION_REPORT", source)
         self.assertIn('"final_export"', source)
 
     def test_torchtitan_checkpoint_manager_supports_separate_final_exports(self):
@@ -2302,6 +2444,8 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("save_last_step_full_checkpoint", source)
         self.assertIn("Saving a full resumable checkpoint at last step", source)
         self.assertIn("checkpoint.final_model_export_folder must differ", source)
+        self.assertIn("first_step_checkpoint_validation_report", source)
+        self.assertIn("_validate_first_step_checkpoint", source)
 
     def test_resume_contract_rejects_changed_training_config(self):
         with tempfile.TemporaryDirectory() as tmp:

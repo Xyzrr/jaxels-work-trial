@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import enum
 import functools
+import hashlib
+import json
 import os
 import queue
 import re
@@ -306,6 +308,14 @@ class CheckpointManager(Configurable):
         for many steps or checkpointing too frequently. The default value is False.
         """
 
+        first_step_checkpoint_validation_report: str = ""
+        """
+        Optional JSON report path written after validating the first-step DCP
+        checkpoint. When set with enable_first_step_checkpoint, rank 0 waits for
+        the step-1 save, verifies metadata and payload files, and writes a
+        small report before stale checkpoint purging can remove the checkpoint.
+        """
+
         create_seed_checkpoint: bool = False
         """
         Initializes the full model without applying parallelisms, and then saves it as a seed checkpoint.
@@ -394,6 +404,9 @@ class CheckpointManager(Configurable):
         self.exclude_from_loading = config.exclude_from_loading
         self.interval = config.interval
         self.enable_first_step_checkpoint = config.enable_first_step_checkpoint
+        self.first_step_checkpoint_validation_report = (
+            config.first_step_checkpoint_validation_report
+        )
 
         # Async checkpoint related fields.
         async_mode = config.async_mode.lower()
@@ -587,6 +600,123 @@ class CheckpointManager(Configurable):
             if MODEL in self.states:
                 self.states[MODEL].load_state_dict(state_dict)
 
+    def _is_rank_zero(self) -> bool:
+        return (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_rank() == 0
+        )
+
+    @staticmethod
+    def _hash_file(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _write_json_atomic(path: str, payload: dict[str, Any]) -> None:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{path}.tmp-{os.getpid()}-{time.time_ns()}"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+
+    def _first_step_checkpoint_report(self, checkpoint_id: str) -> dict[str, Any]:
+        metadata_path = os.path.join(checkpoint_id, ".metadata")
+        if not os.path.isfile(metadata_path) or os.path.getsize(metadata_path) <= 0:
+            raise RuntimeError(
+                "First-step DCP checkpoint metadata is missing or empty: "
+                f"{metadata_path}"
+            )
+
+        payloads = []
+        total_payload_bytes = 0
+        rank_ids: set[int] = set()
+        shard_ids: set[int] = set()
+        for filename in sorted(os.listdir(checkpoint_id)):
+            if not filename.endswith(".distcp"):
+                continue
+            match = re.fullmatch(r"__(\d+)_(\d+)\.distcp", filename)
+            if not match:
+                raise RuntimeError(
+                    "First-step DCP checkpoint payload file name does not match "
+                    f"the expected '__<rank>_<shard>.distcp' pattern: {filename}"
+                )
+            path = os.path.join(checkpoint_id, filename)
+            payload_bytes = os.path.getsize(path) if os.path.isfile(path) else 0
+            if payload_bytes <= 0:
+                raise RuntimeError(
+                    "First-step DCP checkpoint payload is missing or empty: "
+                    f"{path}"
+                )
+            rank_id = int(match.group(1))
+            shard_id = int(match.group(2))
+            rank_ids.add(rank_id)
+            shard_ids.add(shard_id)
+            total_payload_bytes += payload_bytes
+            payloads.append(
+                {
+                    "path": path,
+                    "bytes": payload_bytes,
+                    "rank": rank_id,
+                    "shard": shard_id,
+                }
+            )
+
+        if not payloads:
+            raise RuntimeError(
+                f"First-step DCP checkpoint has no .distcp payload files: {checkpoint_id}"
+            )
+
+        return {
+            "schema_version": 1,
+            "created_at_unix": time.time(),
+            "step": 1,
+            "checkpoint": {
+                "step": 1,
+                "path": checkpoint_id,
+                "metadata_path": metadata_path,
+                "metadata_bytes": os.path.getsize(metadata_path),
+                "metadata_sha256": self._hash_file(metadata_path),
+                "payload_file_count": len(payloads),
+                "payload_total_bytes": total_payload_bytes,
+                "payload_rank_count": len(rank_ids),
+                "payload_ranks": sorted(rank_ids),
+                "payload_shards": sorted(shard_ids),
+                "payload_files": payloads,
+            },
+        }
+
+    def _validate_first_step_checkpoint(
+        self,
+        curr_step: int,
+        checkpoint_id: str,
+    ) -> None:
+        if (
+            curr_step != 1
+            or not self.enable_first_step_checkpoint
+            or not self.first_step_checkpoint_validation_report
+        ):
+            return
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        if self._is_rank_zero():
+            report = self._first_step_checkpoint_report(checkpoint_id)
+            self._write_json_atomic(
+                self.first_step_checkpoint_validation_report,
+                report,
+            )
+            logger.info(
+                "Validated first-step DCP checkpoint and wrote report to %s",
+                self.first_step_checkpoint_validation_report,
+            )
+
     @sl.log_trace_span("checkpoint_save")
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> bool:
@@ -628,8 +758,11 @@ class CheckpointManager(Configurable):
                     async_mode=AsyncMode.DISABLED,
                     enable_garbage_collection=True,
                 )
+                self._validate_first_step_checkpoint(curr_step, checkpoint_id)
                 self._purge_stale_checkpoints()
             self._save_last_step(curr_step)
+            if not self.last_save_model_only:
+                self._validate_first_step_checkpoint(curr_step, checkpoint_id)
             return True
 
         states = self._flattened_model_states_sd()
@@ -659,6 +792,9 @@ class CheckpointManager(Configurable):
                 async_mode=AsyncMode.DISABLED,
                 enable_garbage_collection=True,
             )
+        if curr_step == 1 and self.first_step_checkpoint_validation_report:
+            self._async_wait()
+            self._validate_first_step_checkpoint(curr_step, checkpoint_id)
         self._purge_stale_checkpoints()
 
         logger.info(

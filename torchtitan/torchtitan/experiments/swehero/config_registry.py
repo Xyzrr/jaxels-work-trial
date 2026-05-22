@@ -183,6 +183,14 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
             export_dtype="bfloat16",
             async_mode=_env("SWEHERO_CHECKPOINT_ASYNC_MODE", "async"),  # type: ignore[arg-type]
             exclude_from_loading=_checkpoint_exclude_from_loading(),
+            enable_first_step_checkpoint=_env_bool(
+                "SWEHERO_ENABLE_FIRST_STEP_CHECKPOINT",
+                False,
+            ),
+            first_step_checkpoint_validation_report=_env(
+                "SWEHERO_FIRST_STEP_CHECKPOINT_VALIDATION_REPORT",
+                "",
+            ),
             keep_latest_k=3,
         ),
         activation_checkpoint=ActivationCheckpointConfig(

@@ -107,6 +107,9 @@ RESUME_CONTRACT_SCHEMA_VERSION = 1
 RESUME_CONTRACT_FILENAME = "resume_contract.json"
 REQUIRED_HF_ASSET_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 FINAL_MODEL_EXPORT_FOLDER = "final_export"
+DEFAULT_VALIDATE_FIRST_STEP_CHECKPOINT = True
+FIRST_STEP_CHECKPOINT_VALIDATION_SCHEMA_VERSION = 1
+FIRST_STEP_CHECKPOINT_VALIDATION_FILENAME = "first_step_checkpoint_validation.json"
 FINAL_ARTIFACT_VALIDATION_SCHEMA_VERSION = 1
 FINAL_ARTIFACT_VALIDATION_FILENAME = "final_artifact_validation.json"
 POST_TRAINING_EVAL_STATUS_SCHEMA_VERSION = 1
@@ -191,6 +194,7 @@ RESUME_ARG_FIELDS = (
     "activation_checkpoint_mode",
     "chunked_ce_chunks",
     "detect_anomaly",
+    "validate_first_step_checkpoint",
     "enable_wandb",
     "wandb_project",
     "wandb_entity",
@@ -261,6 +265,7 @@ RUN_SPEC_ARG_FIELDS = (
     "detect_anomaly",
     "checkpoint_interval",
     "checkpoint_async_mode",
+    "validate_first_step_checkpoint",
     "metrics_log_freq",
     "enable_profiler",
     "profiler_trace_folder",
@@ -337,6 +342,8 @@ RESUME_STAGE_ENV_KEYS = (
     "SWEHERO_CHUNKED_CE_CHUNKS",
     "SWEHERO_DETECT_ANOMALY",
     "SWEHERO_SAVE_FINAL_FULL_CHECKPOINT",
+    "SWEHERO_ENABLE_FIRST_STEP_CHECKPOINT",
+    "SWEHERO_FIRST_STEP_CHECKPOINT_VALIDATION_REPORT",
 )
 LAUNCH_STAGE_ENV_KEYS = (
     *RESUME_STAGE_ENV_KEYS,
@@ -884,6 +891,11 @@ def _production_mode_errors(
         ("--min-learning-rate", args.min_learning_rate, DEFAULT_MIN_LEARNING_RATE),
         ("--warmup-ratio", args.warmup_ratio, DEFAULT_WARMUP_RATIO),
         ("--weight-decay", args.weight_decay, DEFAULT_WEIGHT_DECAY),
+        (
+            "--validate-first-step-checkpoint",
+            args.validate_first_step_checkpoint,
+            DEFAULT_VALIDATE_FIRST_STEP_CHECKPOINT,
+        ),
     )
     for name, actual, expected in required_values:
         if not _values_match(actual, expected):
@@ -1328,6 +1340,10 @@ def _run_spec_sha256_path(out_dir: Path) -> Path:
 
 def _final_artifact_validation_path(out_dir: Path) -> Path:
     return out_dir / FINAL_ARTIFACT_VALIDATION_FILENAME
+
+
+def _first_step_checkpoint_validation_path(out_dir: Path) -> Path:
+    return out_dir / FIRST_STEP_CHECKPOINT_VALIDATION_FILENAME
 
 
 def _post_training_eval_status_path(out_dir: Path) -> Path:
@@ -2086,6 +2102,19 @@ def parse_args(
         "--checkpoint-async-mode",
         choices=("disabled", "async", "async_with_pinned_mem"),
         default=os.environ.get("CHECKPOINT_ASYNC_MODE", "async"),
+    )
+    parser.add_argument(
+        "--validate-first-step-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag(
+            "VALIDATE_FIRST_STEP_CHECKPOINT",
+            DEFAULT_VALIDATE_FIRST_STEP_CHECKPOINT,
+        ),
+        help=(
+            "Ask TorchTitan to save and validate a full DCP checkpoint after "
+            "optimizer step 1, then require the validation report before the "
+            "launcher continues. Keep enabled for production."
+        ),
     )
     parser.add_argument(
         "--metrics-log-freq",
@@ -4704,6 +4733,74 @@ def _validate_dcp_checkpoint_step(step_dir: Path) -> dict[str, Any]:
     }
 
 
+def validate_first_step_checkpoint_report(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    report_path = _first_step_checkpoint_validation_path(args.out_dir)
+    if not report_path.is_file():
+        raise RuntimeError(
+            "First-step checkpoint validation report is missing: "
+            f"{report_path}. TorchTitan must validate step-1 DCP checkpoint "
+            "contents before a production launch can continue."
+        )
+    report = _read_json_object_required(
+        report_path,
+        "first-step checkpoint validation report",
+    )
+    if report.get("schema_version") != FIRST_STEP_CHECKPOINT_VALIDATION_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported first-step checkpoint validation schema version in "
+            f"{report_path}: {report.get('schema_version')!r}"
+        )
+    if report.get("step") != 1:
+        raise RuntimeError(
+            "First-step checkpoint validation report must describe step 1; "
+            f"got {report.get('step')!r}"
+        )
+    checkpoint = report.get("checkpoint")
+    if not isinstance(checkpoint, Mapping):
+        raise RuntimeError(
+            "First-step checkpoint validation report has no checkpoint object: "
+            f"{report_path}"
+        )
+    if checkpoint.get("step") != 1:
+        raise RuntimeError(
+            "First-step checkpoint validation checkpoint payload must describe "
+            f"step 1; got {checkpoint.get('step')!r}"
+        )
+    payload_file_count = checkpoint.get("payload_file_count")
+    payload_total_bytes = checkpoint.get("payload_total_bytes")
+    payload_rank_count = checkpoint.get("payload_rank_count")
+    if (
+        not isinstance(payload_file_count, int)
+        or isinstance(payload_file_count, bool)
+        or payload_file_count <= 0
+    ):
+        raise RuntimeError(
+            "First-step checkpoint validation report has invalid "
+            f"payload_file_count: {payload_file_count!r}"
+        )
+    if (
+        not isinstance(payload_total_bytes, int)
+        or isinstance(payload_total_bytes, bool)
+        or payload_total_bytes <= 0
+    ):
+        raise RuntimeError(
+            "First-step checkpoint validation report has invalid "
+            f"payload_total_bytes: {payload_total_bytes!r}"
+        )
+    if (
+        not isinstance(payload_rank_count, int)
+        or isinstance(payload_rank_count, bool)
+        or payload_rank_count <= 0
+    ):
+        raise RuntimeError(
+            "First-step checkpoint validation report has invalid "
+            f"payload_rank_count: {payload_rank_count!r}"
+        )
+    return dict(report)
+
+
 def _select_final_export_step_dir(
     out_dir: Path,
     step: int,
@@ -5198,6 +5295,12 @@ def build_stage_env(
             "SWEHERO_CHUNKED_CE_CHUNKS": str(args.chunked_ce_chunks),
             "SWEHERO_DETECT_ANOMALY": "1" if args.detect_anomaly else "0",
             "SWEHERO_SAVE_FINAL_FULL_CHECKPOINT": "1",
+            "SWEHERO_ENABLE_FIRST_STEP_CHECKPOINT": "1"
+            if args.validate_first_step_checkpoint
+            else "0",
+            "SWEHERO_FIRST_STEP_CHECKPOINT_VALIDATION_REPORT": str(
+                _first_step_checkpoint_validation_path(args.out_dir)
+            ),
             "SWEHERO_CHECKPOINT_INTERVAL": str(args.checkpoint_interval),
             "SWEHERO_CHECKPOINT_ASYNC_MODE": args.checkpoint_async_mode,
             "SWEHERO_METRICS_LOG_FREQ": str(args.metrics_log_freq),
@@ -5341,6 +5444,9 @@ def build_run_spec(
             "wandb_identity": str(_wandb_identity_path(args.out_dir)),
             "torchtitan_dump": str(_torchtitan_dump_dir(args.out_dir)),
             "resumable_checkpoints": str(_checkpoint_dir(args.out_dir)),
+            "first_step_checkpoint_validation": str(
+                _first_step_checkpoint_validation_path(args.out_dir)
+            ),
             "final_model_exports": str(_final_model_export_dir(args.out_dir)),
             "runtime_metadata": str(_runtime_metadata_path(args.out_dir)),
             "post_training_eval_status": str(
@@ -5548,6 +5654,12 @@ def _stage_status_summary(document: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(final_validation, Mapping)
         else None
     )
+    first_step_validation = document.get("first_step_checkpoint_validation")
+    first_step_validation_status = (
+        first_step_validation.get("status")
+        if isinstance(first_step_validation, Mapping)
+        else None
+    )
     post_training_eval = document.get("post_training_eval")
     post_training_eval_status = (
         post_training_eval.get("status")
@@ -5567,6 +5679,7 @@ def _stage_status_summary(document: Mapping[str, Any]) -> dict[str, Any]:
             if stage.get("status") == "pending" and "id" in stage
         ],
         "failure_count": len(document.get("failures", [])),
+        "first_step_checkpoint_validation_status": first_step_validation_status,
         "final_artifact_validation_status": final_validation_status,
         "post_training_eval_status": post_training_eval_status,
     }
@@ -5671,6 +5784,9 @@ def _build_stage_status_document(
             "launcher_plan": str(args.out_dir / "launcher_plan.json"),
             "wandb_identity": str(_wandb_identity_path(args.out_dir)),
             "runtime_metadata": str(_runtime_metadata_path(args.out_dir)),
+            "first_step_checkpoint_validation": str(
+                _first_step_checkpoint_validation_path(args.out_dir)
+            ),
             "final_artifact_validation": str(
                 _final_artifact_validation_path(args.out_dir)
             ),
@@ -5705,6 +5821,18 @@ def _build_stage_status_document(
             "warmup_steps": plan.warmup_steps,
         },
         "stages": stage_records,
+        "first_step_checkpoint_validation": {
+            "status": "pending"
+            if args.validate_first_step_checkpoint and not resume_state
+            else "disabled",
+            "started_at_unix": None,
+            "finished_at_unix": None,
+            "duration_seconds": None,
+            "report_path": str(_first_step_checkpoint_validation_path(args.out_dir)),
+            "report_sha256": None,
+            "summary": None,
+            "failure": None,
+        },
         "final_artifact_validation": {
             "status": "pending",
             "started_at_unix": None,
@@ -5773,6 +5901,16 @@ def _merge_existing_stage_status(
         "created_at_unix", new_document["created_at_unix"]
     )
     new_document["failures"] = list(existing_document.get("failures", []))
+    first_step_validation = existing_document.get("first_step_checkpoint_validation")
+    if isinstance(first_step_validation, Mapping):
+        new_document["first_step_checkpoint_validation"] = {
+            **new_document["first_step_checkpoint_validation"],
+            **dict(first_step_validation),
+        }
+        if new_document["first_step_checkpoint_validation"].get("status") == "running":
+            new_document["first_step_checkpoint_validation"]["status"] = "pending"
+            new_document["first_step_checkpoint_validation"]["finished_at_unix"] = None
+            new_document["first_step_checkpoint_validation"]["duration_seconds"] = None
     final_validation = existing_document.get("final_artifact_validation")
     if isinstance(final_validation, Mapping):
         new_document["final_artifact_validation"] = {
@@ -5854,6 +5992,117 @@ def _exception_failure_record(
         if exc.stderr is not None:
             record["stderr"] = str(exc.stderr)
     return record
+
+
+def _first_step_checkpoint_validation_summary(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    checkpoint = report.get("checkpoint")
+    checkpoint_mapping = checkpoint if isinstance(checkpoint, Mapping) else {}
+    return {
+        "step": report.get("step"),
+        "checkpoint_path": checkpoint_mapping.get("path"),
+        "metadata_sha256": checkpoint_mapping.get("metadata_sha256"),
+        "payload_file_count": checkpoint_mapping.get("payload_file_count"),
+        "payload_total_bytes": checkpoint_mapping.get("payload_total_bytes"),
+        "payload_rank_count": checkpoint_mapping.get("payload_rank_count"),
+        "payload_ranks": checkpoint_mapping.get("payload_ranks"),
+    }
+
+
+def _record_first_step_checkpoint_validation_started(args: argparse.Namespace) -> float:
+    path = _stage_status_path(args.out_dir)
+    if not path.exists():
+        return time.time()
+    document = _load_stage_status_document(path)
+    record = document["first_step_checkpoint_validation"]
+    started_at = time.time()
+    record.update(
+        {
+            "status": "running",
+            "started_at_unix": started_at,
+            "finished_at_unix": None,
+            "duration_seconds": None,
+            "report_path": str(_first_step_checkpoint_validation_path(args.out_dir)),
+            "report_sha256": None,
+            "summary": None,
+            "failure": None,
+        }
+    )
+    _write_stage_status_document(path, document)
+    return started_at
+
+
+def _record_first_step_checkpoint_validation_finished(
+    args: argparse.Namespace,
+    *,
+    started_at_unix: float,
+    report: Mapping[str, Any] | None,
+    failure: dict[str, Any] | None,
+) -> None:
+    path = _stage_status_path(args.out_dir)
+    if not path.exists():
+        return
+    document = _load_stage_status_document(path)
+    record = document["first_step_checkpoint_validation"]
+    report_path = _first_step_checkpoint_validation_path(args.out_dir)
+    finished_at = time.time()
+    record.update(
+        {
+            "status": "failed" if failure is not None else "succeeded",
+            "started_at_unix": started_at_unix,
+            "finished_at_unix": finished_at,
+            "duration_seconds": finished_at - started_at_unix,
+            "report_path": str(report_path),
+            "report_sha256": _hash_file(report_path) if report_path.is_file() else None,
+            "summary": _first_step_checkpoint_validation_summary(report or {}),
+            "failure": failure,
+        }
+    )
+    _write_stage_status_document(path, document)
+
+
+def validate_first_step_checkpoint_report_with_status(
+    args: argparse.Namespace,
+    *,
+    stage_id: str | None = None,
+) -> dict[str, Any]:
+    started_at = _record_first_step_checkpoint_validation_started(args)
+    try:
+        report = validate_first_step_checkpoint_report(args)
+    except BaseException as exc:
+        failure = _exception_failure_record(
+            exc,
+            phase="first_step_checkpoint_validation",
+            stage_id=stage_id,
+        )
+        _record_first_step_checkpoint_validation_finished(
+            args,
+            started_at_unix=started_at,
+            report=None,
+            failure=failure,
+        )
+        raise
+    _record_first_step_checkpoint_validation_finished(
+        args,
+        started_at_unix=started_at,
+        report=report,
+        failure=None,
+    )
+    return report
+
+
+def should_validate_first_step_checkpoint_after_stage(
+    args: argparse.Namespace,
+    stage: BucketStage,
+    plan: BucketPlan,
+) -> bool:
+    return (
+        bool(args.validate_first_step_checkpoint)
+        and not args.resume
+        and bool(plan.stages)
+        and stage.cumulative_steps == plan.stages[0].cumulative_steps
+    )
 
 
 def _record_stage_started(
@@ -5968,6 +6217,7 @@ def run_stage_with_status(
         manifest,
         load_dataloader_state=load_dataloader_state,
     )
+    failure_phase = "stage"
     try:
         run_stage(
             args,
@@ -5976,10 +6226,16 @@ def run_stage_with_status(
             int(manifest["pad_token_id"]),
             load_dataloader_state=load_dataloader_state,
         )
+        if should_validate_first_step_checkpoint_after_stage(args, stage, plan):
+            failure_phase = "first_step_checkpoint_validation"
+            validate_first_step_checkpoint_report_with_status(
+                args,
+                stage_id=stage_id,
+            )
     except BaseException as exc:
         failure = _exception_failure_record(
             exc,
-            phase="stage",
+            phase=failure_phase,
             stage_id=stage_id,
         )
         _record_stage_finished(
