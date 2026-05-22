@@ -710,6 +710,14 @@ def validate_launch_inputs(
     bucket_cp: Mapping[int, int],
 ) -> None:
     errors: list[str] = []
+    if args.model_id != MODEL_ID:
+        errors.append(
+            "--model-id must be "
+            f"{MODEL_ID!r} because this launcher always starts the hardcoded "
+            "TorchTitan qwen25_coder7b_direct_to_hero config "
+            "(model_registry('coder7b')). Use a separate launcher/config pair "
+            "for 14B or 32B runs."
+        )
     if not re.fullmatch(r"[0-9a-f]{40}", str(args.model_revision)):
         errors.append(
             "--model-revision must be an exact 40-character lowercase "

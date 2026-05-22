@@ -502,6 +502,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
     def test_launch_input_validation_rejects_bad_numeric_values(self):
         cases = [
+            (
+                ["--model-id", "Qwen/Qwen2.5-Coder-14B-Instruct"],
+                "--model-id must be",
+            ),
             (["--model-revision", "main"], "--model-revision must be an exact"),
             (["--source-dataset-rows-per-shard", "0"], "--source-dataset-rows-per-shard"),
             (["--source-dataset-build-batch-size", "0"], "--source-dataset-build-batch-size"),
