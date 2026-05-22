@@ -11,7 +11,7 @@ Ship prototype ASAP: skip post-task validation, parent-branch merges, and PR cer
 Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HERO" (arXiv:2604.01496):
 
 - Base models: `Qwen2.5-Coder-7B-Instruct`, `Qwen2.5-Coder-14B-Instruct`, `Qwen2.5-Coder-32B-Instruct`.
-- Dataset: use the public `nvidia/SWE-Hero-openhands-trajectories` Hugging Face release as canonical, even though its current row count differs from the paper's `~13.2k` wording.
+- Dataset: use the manually filtered local public approximation at `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`. It selects one rollout per task/`instance_id` from the oldest public `nvidia/SWE-Hero-openhands-trajectories` revision (`5b2ed21270ad773a50163e2999c510f0cbb92cfa`) because that revision has the most public tasks. This is a best-effort match for the paper's "one rollout per task" setup, not the exact internal `~13.2k` paper manifest; the local artifact has 12,633 selected rows.
 - Eval: SWE-bench Verified through the OpenHands harness.
 - Paper caveat: the reported direct-to-hero ablation is for 32B; 7B and 14B direct-to-hero runs are a scale-study extension unless a paper table proves otherwise.
 
