@@ -627,6 +627,34 @@ def stages_to_run_for_resume(
     )
 
 
+def should_load_dataloader_state_for_stage(
+    *,
+    stage_start_step: int,
+    stage: BucketStage,
+    resume_state: ResumeCheckpointState | None,
+) -> bool:
+    if resume_state is None:
+        return False
+    checkpoint_step = resume_state.latest_resumable_step
+    return stage_start_step < checkpoint_step < stage.cumulative_steps
+
+
+def dataloader_resume_flags_by_stage(
+    plan: BucketPlan,
+    resume_state: ResumeCheckpointState | None,
+) -> dict[int, bool]:
+    flags: dict[int, bool] = {}
+    stage_start_step = 0
+    for stage in plan.stages:
+        flags[stage.cumulative_steps] = should_load_dataloader_state_for_stage(
+            stage_start_step=stage_start_step,
+            stage=stage,
+            resume_state=resume_state,
+        )
+        stage_start_step = stage.cumulative_steps
+    return flags
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Materialize bucketed SWE-HERO training data and launch TorchTitan."
@@ -1668,6 +1696,7 @@ def build_stage_env(
     total_steps: int,
     warmup_steps: int,
     pad_token_id: int,
+    load_dataloader_state: bool = False,
 ) -> dict[str, str]:
     env = os.environ.copy()
     repo_root = Path(__file__).resolve().parents[1]
@@ -1711,6 +1740,9 @@ def build_stage_env(
             "SWEHERO_CHECKPOINT_INTERVAL": str(args.checkpoint_interval),
             "SWEHERO_CHECKPOINT_ASYNC_MODE": args.checkpoint_async_mode,
             "SWEHERO_METRICS_LOG_FREQ": str(args.metrics_log_freq),
+            "SWEHERO_LOAD_DATALOADER_STATE": "1"
+            if load_dataloader_state
+            else "0",
             "SWEHERO_ENABLE_WANDB": "1" if args.enable_wandb else "0",
             "WANDB_PROJECT": args.wandb_project,
             "WANDB_RUN_NAME": args.wandb_run_name,
@@ -1746,13 +1778,21 @@ def build_torchrun_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def run_stage(args: argparse.Namespace, stage: BucketStage, plan: BucketPlan, pad_token_id: int) -> None:
+def run_stage(
+    args: argparse.Namespace,
+    stage: BucketStage,
+    plan: BucketPlan,
+    pad_token_id: int,
+    *,
+    load_dataloader_state: bool = False,
+) -> None:
     env = build_stage_env(
         args,
         stage=stage,
         total_steps=plan.total_steps,
         warmup_steps=plan.warmup_steps,
         pad_token_id=pad_token_id,
+        load_dataloader_state=load_dataloader_state,
     )
     command = build_torchrun_command(args)
     print(
@@ -1767,7 +1807,10 @@ def _write_launcher_plan(
     args: argparse.Namespace,
     plan: BucketPlan,
     manifest: Mapping[str, Any],
+    *,
+    dataloader_resume_flags: Mapping[int, bool] | None = None,
 ) -> None:
+    dataloader_resume_flags = dataloader_resume_flags or {}
     launcher_plan = {
         "stages": [
             {
@@ -1782,6 +1825,9 @@ def _write_launcher_plan(
                         total_steps=plan.total_steps,
                         warmup_steps=plan.warmup_steps,
                         pad_token_id=int(manifest["pad_token_id"]),
+                        load_dataloader_state=dataloader_resume_flags.get(
+                            stage.cumulative_steps, False
+                        ),
                     ).items()
                     if key.startswith("SWEHERO_")
                     or key in {"LOG_RANK", "WANDB_PROJECT", "WANDB_RUN_NAME"}
@@ -1866,7 +1912,13 @@ def main(argv: list[str] | None = None) -> None:
         validate_resume_progress(plan, resume_state)
     else:
         _write_resume_contract(args, plan, manifest)
-    _write_launcher_plan(args, plan, manifest)
+    dataloader_resume_flags = dataloader_resume_flags_by_stage(plan, resume_state)
+    _write_launcher_plan(
+        args,
+        plan,
+        manifest,
+        dataloader_resume_flags=dataloader_resume_flags,
+    )
 
     print(json.dumps({"bucket_plan": [asdict(stage) for stage in plan.stages]}, default=str, indent=2))
     if args.prepare_data_only or args.dry_run:
@@ -1885,7 +1937,15 @@ def main(argv: list[str] | None = None) -> None:
             print("No bucket stages remain; training is already complete for this plan.")
             return
     for stage in stages_to_run:
-        run_stage(args, stage, plan, pad_token_id)
+        run_stage(
+            args,
+            stage,
+            plan,
+            pad_token_id,
+            load_dataloader_state=dataloader_resume_flags.get(
+                stage.cumulative_steps, False
+            ),
+        )
 
 
 if __name__ == "__main__":

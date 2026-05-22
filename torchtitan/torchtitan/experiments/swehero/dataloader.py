@@ -7,19 +7,21 @@
 from __future__ import annotations
 
 import json
+import pickle
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
 import torch
+from torchdata.stateful_dataloader.stateful import Stateful
 from torch.utils.data import IterableDataset, get_worker_info
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
 
 
-class _SweHeroJsonlDataset(IterableDataset):
+class _SweHeroJsonlDataset(IterableDataset, Stateful):
     def __init__(
         self,
         *,
@@ -37,6 +39,8 @@ class _SweHeroJsonlDataset(IterableDataset):
         self.seed = seed
         self.shuffle = shuffle
         self.infinite = infinite
+        self._epoch = 0
+        self._offset = 0
 
     def _records_for_iterator(self) -> list[dict[str, Any]]:
         records = self.records[self.dp_rank :: self.dp_world_size]
@@ -53,16 +57,62 @@ class _SweHeroJsonlDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         records = self._records_for_iterator()
-        epoch = 0
+        epoch = self._epoch
+        offset = self._offset
         while True:
             order = list(range(len(records)))
             if self.shuffle:
-                random.Random(self.seed + self.dp_rank + epoch * 1_000_003).shuffle(order)
-            for index in order:
+                random.Random(self.seed + self.dp_rank + epoch * 1_000_003).shuffle(
+                    order
+                )
+            while offset < len(order):
+                index = order[offset]
+                offset += 1
+                self._epoch = epoch
+                self._offset = offset
                 yield records[index]
             epoch += 1
+            offset = 0
+            self._epoch = epoch
+            self._offset = offset
             if not self.infinite:
                 break
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "epoch": self._epoch,
+            "offset": self._offset,
+            "dp_rank": self.dp_rank,
+            "dp_world_size": self.dp_world_size,
+            "seed": self.seed,
+            "shuffle": self.shuffle,
+            "infinite": self.infinite,
+            "record_count": len(self._records_for_iterator()),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if not state_dict:
+            return
+        expected = {
+            "dp_rank": self.dp_rank,
+            "dp_world_size": self.dp_world_size,
+            "seed": self.seed,
+            "shuffle": self.shuffle,
+            "infinite": self.infinite,
+            "record_count": len(self._records_for_iterator()),
+        }
+        mismatches = {
+            key: {"expected": expected[key], "actual": state_dict.get(key)}
+            for key in expected
+            if state_dict.get(key) != expected[key]
+        }
+        if mismatches:
+            raise ValueError(
+                "SWE-HERO dataloader checkpoint does not match this dataloader: "
+                f"{mismatches}"
+            )
+        self._epoch = int(state_dict["epoch"])
+        self._offset = int(state_dict["offset"])
 
 
 class SweHeroDataLoader(ParallelAwareDataloader):
@@ -108,6 +158,7 @@ class SweHeroDataLoader(ParallelAwareDataloader):
             shuffle=config.shuffle,
             infinite=config.infinite,
         )
+        self._swehero_dataset = dataset
         super().__init__(
             dataset,
             dp_rank=dp_rank,
@@ -119,6 +170,27 @@ class SweHeroDataLoader(ParallelAwareDataloader):
             pin_memory=config.pin_memory,
             prefetch_factor=config.prefetch_factor,
         )
+
+    def _legacy_dataset_state_from_num_yielded(
+        self, num_yielded: int
+    ) -> dict[str, Any]:
+        records = self._swehero_dataset._records_for_iterator()
+        consumed_records = num_yielded * int(self.batch_size or 1)
+        state = self._swehero_dataset.state_dict()
+        state["epoch"] = consumed_records // len(records)
+        state["offset"] = consumed_records % len(records)
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if state_dict and self._rank_id in state_dict:
+            rank_state = pickle.loads(state_dict[self._rank_id])
+            if rank_state.get("dataset_state") is None:
+                rank_state["dataset_state"] = self._legacy_dataset_state_from_num_yielded(
+                    int(rank_state.get("_num_yielded", 0))
+                )
+                state_dict = dict(state_dict)
+                state_dict[self._rank_id] = pickle.dumps(rank_state)
+        super().load_state_dict(state_dict)
 
     def _collate(
         self, records: list[dict[str, Any]]

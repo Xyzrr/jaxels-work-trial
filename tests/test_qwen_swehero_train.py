@@ -267,6 +267,69 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual([stage.bucket for stage in stages], [32768])
 
+    def test_mid_stage_resume_loads_dataloader_state_for_current_stage_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            resume_state = train.ResumeCheckpointState(
+                checkpoint_dir=checkpoint_root,
+                latest_resumable_step=2,
+                latest_any_step=2,
+            )
+
+            flags = train.dataloader_resume_flags_by_stage(plan, resume_state)
+            stages = train.stages_to_run_for_resume(plan, resume_state)
+
+            first_env = train.build_stage_env(
+                args,
+                stage=plan.stages[0],
+                total_steps=plan.total_steps,
+                warmup_steps=plan.warmup_steps,
+                pad_token_id=151643,
+                load_dataloader_state=flags[plan.stages[0].cumulative_steps],
+            )
+            second_env = train.build_stage_env(
+                args,
+                stage=plan.stages[1],
+                total_steps=plan.total_steps,
+                warmup_steps=plan.warmup_steps,
+                pad_token_id=151643,
+                load_dataloader_state=flags[plan.stages[1].cumulative_steps],
+            )
+
+        self.assertEqual([stage.bucket for stage in stages], [8192, 32768])
+        self.assertTrue(flags[plan.stages[0].cumulative_steps])
+        self.assertFalse(flags[plan.stages[1].cumulative_steps])
+        self.assertEqual(first_env["SWEHERO_LOAD_DATALOADER_STATE"], "1")
+        self.assertEqual(second_env["SWEHERO_LOAD_DATALOADER_STATE"], "0")
+
+    def test_stage_boundary_resume_does_not_load_previous_bucket_dataloader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            checkpoint_root = args.out_dir / "torchtitan" / "checkpoint"
+            resume_state = train.ResumeCheckpointState(
+                checkpoint_dir=checkpoint_root,
+                latest_resumable_step=4,
+                latest_any_step=4,
+            )
+
+            flags = train.dataloader_resume_flags_by_stage(plan, resume_state)
+            stages = train.stages_to_run_for_resume(plan, resume_state)
+
+        self.assertEqual([stage.bucket for stage in stages], [32768])
+        self.assertFalse(flags[plan.stages[0].cumulative_steps])
+        self.assertFalse(flags[plan.stages[1].cumulative_steps])
+
+    def test_swehero_config_can_load_dataloader_state_for_mid_stage_resume(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (
+            repo_root / "torchtitan/torchtitan/experiments/swehero/config_registry.py"
+        ).read_text()
+
+        self.assertIn("SWEHERO_LOAD_DATALOADER_STATE", source)
+        self.assertIn("_checkpoint_exclude_from_loading()", source)
+        self.assertNotIn("exclude_from_loading=[\"dataloader\"]", source)
+
     def test_resume_contract_rejects_changed_training_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, manifest, plan = self._resume_test_setup(tmp)

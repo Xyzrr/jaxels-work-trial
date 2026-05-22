@@ -46,6 +46,12 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
+def _checkpoint_exclude_from_loading() -> list[str]:
+    if _env_bool("SWEHERO_LOAD_DATALOADER_STATE", False):
+        return []
+    return ["dataloader"]
+
+
 def _fp8_converters(
     *,
     enabled: bool,
@@ -160,7 +166,7 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
             last_save_in_hf=is_final_stage,
             export_dtype="bfloat16",
             async_mode=_env("SWEHERO_CHECKPOINT_ASYNC_MODE", "async"),  # type: ignore[arg-type]
-            exclude_from_loading=["dataloader"],
+            exclude_from_loading=_checkpoint_exclude_from_loading(),
             keep_latest_k=3,
         ),
         activation_checkpoint=ActivationCheckpointConfig(
