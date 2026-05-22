@@ -85,6 +85,8 @@ RESUME_CONTRACT_SCHEMA_VERSION = 1
 RESUME_CONTRACT_FILENAME = "resume_contract.json"
 REQUIRED_HF_ASSET_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 FINAL_MODEL_EXPORT_FOLDER = "final_export"
+FINAL_ARTIFACT_VALIDATION_SCHEMA_VERSION = 1
+FINAL_ARTIFACT_VALIDATION_FILENAME = "final_artifact_validation.json"
 RESUME_ARG_FIELDS = (
     "model_id",
     "dataset_id",
@@ -465,6 +467,10 @@ def _run_spec_path(out_dir: Path) -> Path:
 
 def _run_spec_sha256_path(out_dir: Path) -> Path:
     return out_dir / RUN_SPEC_SHA256_FILENAME
+
+
+def _final_artifact_validation_path(out_dir: Path) -> Path:
+    return out_dir / FINAL_ARTIFACT_VALIDATION_FILENAME
 
 
 def _torchtitan_dump_dir(out_dir: Path) -> Path:
@@ -2601,14 +2607,21 @@ def _require_nonempty_file(path: Path, label: str) -> None:
         raise RuntimeError(f"Required {label} is empty: {path}")
 
 
-def _asset_path_from_relative(hf_assets_path: Path, relative_path: object) -> Path:
+def _safe_child_path(base_path: Path, relative_path: object, *, label: str) -> Path:
     relative = Path(str(relative_path))
     if relative.is_absolute() or ".." in relative.parts:
         raise RuntimeError(
-            "Model asset provenance contains an unsafe relative path: "
-            f"{relative_path!r}"
+            f"{label} contains an unsafe relative path: {relative_path!r}"
         )
-    return hf_assets_path / relative
+    return base_path / relative
+
+
+def _asset_path_from_relative(hf_assets_path: Path, relative_path: object) -> Path:
+    return _safe_child_path(
+        hf_assets_path,
+        relative_path,
+        label="Model asset provenance",
+    )
 
 
 def _safetensors_launch_summary(hf_assets_path: Path) -> dict[str, Any]:
@@ -2993,6 +3006,178 @@ def validate_launch_preflight(
         "bucket_files": checked_bucket_files,
         "out_dir": str(args.out_dir),
     }
+
+
+def _final_export_step_dir(out_dir: Path, step: int) -> Path:
+    return _final_model_export_dir(out_dir) / f"step-{step}"
+
+
+def _legacy_final_export_step_dir(out_dir: Path, step: int) -> Path:
+    return _checkpoint_dir(out_dir) / f"step-{step}"
+
+
+def _validate_dcp_checkpoint_step(step_dir: Path) -> dict[str, Any]:
+    metadata_path = step_dir / ".metadata"
+    _require_nonempty_file(metadata_path, "DCP checkpoint metadata")
+    distcp_files = sorted(step_dir.glob("*.distcp"))
+    if not distcp_files:
+        raise RuntimeError(f"DCP checkpoint has no .distcp payload files: {step_dir}")
+
+    payloads = []
+    total_payload_bytes = 0
+    for path in distcp_files:
+        _require_nonempty_file(path, "DCP checkpoint payload")
+        payload_bytes = path.stat().st_size
+        total_payload_bytes += payload_bytes
+        payloads.append(
+            {
+                "path": str(path),
+                "bytes": payload_bytes,
+            }
+        )
+
+    return {
+        "step": _checkpoint_step(step_dir),
+        "path": str(step_dir),
+        "metadata_path": str(metadata_path),
+        "metadata_bytes": metadata_path.stat().st_size,
+        "payload_file_count": len(payloads),
+        "payload_total_bytes": total_payload_bytes,
+        "payload_files": payloads,
+    }
+
+
+def _select_final_export_step_dir(
+    out_dir: Path,
+    step: int,
+    *,
+    allow_legacy_export: bool,
+) -> tuple[Path, str]:
+    final_step_dir = _final_export_step_dir(out_dir, step)
+    legacy_step_dir = _legacy_final_export_step_dir(out_dir, step)
+    final_index = final_step_dir / "model.safetensors.index.json"
+    legacy_index = legacy_step_dir / "model.safetensors.index.json"
+
+    if final_index.is_file():
+        if legacy_index.is_file():
+            raise RuntimeError(
+                "Final model export exists in both the separated final export "
+                f"directory and the resumable checkpoint directory: {final_step_dir} "
+                f"and {legacy_step_dir}"
+            )
+        return final_step_dir, "final_export"
+
+    if allow_legacy_export and legacy_index.is_file():
+        return legacy_step_dir, "legacy_checkpoint_export"
+
+    raise RuntimeError(
+        "Final model export is missing. Expected "
+        f"{final_step_dir / 'model.safetensors.index.json'}"
+    )
+
+
+def _validate_final_export_step(
+    out_dir: Path,
+    step: int,
+    *,
+    allow_legacy_export: bool = False,
+) -> dict[str, Any]:
+    step_dir, layout = _select_final_export_step_dir(
+        out_dir,
+        step,
+        allow_legacy_export=allow_legacy_export,
+    )
+    index_path = step_dir / "model.safetensors.index.json"
+    _require_nonempty_file(index_path, "final model export safetensors index")
+    index = _read_json_object_required(
+        index_path,
+        "final model export safetensors index",
+    )
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, Mapping) or not weight_map:
+        raise RuntimeError(
+            f"Final model export index has no weight_map entries: {index_path}"
+        )
+
+    shard_names = sorted(set(str(path) for path in weight_map.values()))
+    shards = []
+    total_shard_bytes = 0
+    for shard_name in shard_names:
+        if not shard_name.endswith(".safetensors"):
+            raise RuntimeError(
+                "Final model export index references a non-safetensors shard: "
+                f"{shard_name!r}"
+            )
+        shard_path = _safe_child_path(
+            step_dir,
+            shard_name,
+            label="Final model export index",
+        )
+        _require_nonempty_file(shard_path, "final model export shard")
+        shard_bytes = shard_path.stat().st_size
+        total_shard_bytes += shard_bytes
+        shards.append(
+            {
+                "path": shard_name,
+                "bytes": shard_bytes,
+            }
+        )
+
+    return {
+        "step": step,
+        "layout": layout,
+        "path": str(step_dir),
+        "index_path": str(index_path),
+        "index_sha256": _hash_file(index_path),
+        "weight_map_entries": len(weight_map),
+        "shard_count": len(shards),
+        "total_shard_bytes": total_shard_bytes,
+        "shards": shards,
+    }
+
+
+def validate_final_artifacts(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    *,
+    allow_legacy_export: bool = False,
+    write_report: bool = True,
+) -> dict[str, Any]:
+    final_export = _validate_final_export_step(
+        args.out_dir,
+        plan.total_steps,
+        allow_legacy_export=allow_legacy_export,
+    )
+
+    checkpoint_steps = _checkpoint_steps(_checkpoint_dir(args.out_dir))
+    if checkpoint_steps and max(checkpoint_steps) > plan.total_steps:
+        raise RuntimeError(
+            "Latest resumable checkpoint step exceeds the final plan step: "
+            f"{max(checkpoint_steps)} > {plan.total_steps}"
+        )
+
+    dcp_checkpoints = [
+        _validate_dcp_checkpoint_step(
+            _checkpoint_dir(args.out_dir) / f"step-{step}"
+        )
+        for step in checkpoint_steps
+    ]
+
+    report = {
+        "schema_version": FINAL_ARTIFACT_VALIDATION_SCHEMA_VERSION,
+        "created_at_unix": time.time(),
+        "plan_total_steps": plan.total_steps,
+        "resumable_checkpoints": {
+            "path": str(_checkpoint_dir(args.out_dir)),
+            "steps": checkpoint_steps,
+            "latest_step": max(checkpoint_steps) if checkpoint_steps else None,
+            "checkpoints": dcp_checkpoints,
+        },
+        "final_export": final_export,
+    }
+    if write_report:
+        _write_json_atomic(_final_artifact_validation_path(args.out_dir), report)
+    return report
 
 
 def build_hf_logits_parity_command(args: argparse.Namespace) -> list[str]:
@@ -3410,6 +3595,17 @@ def main(argv: list[str] | None = None) -> None:
             f"{len(stages_to_run)} bucket stage(s) remain."
         )
         if not stages_to_run:
+            final_validation = validate_final_artifacts(
+                args,
+                plan,
+                allow_legacy_export=True,
+            )
+            print(
+                json.dumps(
+                    {"final_artifact_validation": final_validation},
+                    indent=2,
+                )
+            )
             print("No bucket stages remain; training is already complete for this plan.")
             return
     for stage in stages_to_run:
@@ -3422,6 +3618,8 @@ def main(argv: list[str] | None = None) -> None:
                 stage.cumulative_steps, False
             ),
         )
+    final_validation = validate_final_artifacts(args, plan)
+    print(json.dumps({"final_artifact_validation": final_validation}, indent=2))
 
 
 if __name__ == "__main__":

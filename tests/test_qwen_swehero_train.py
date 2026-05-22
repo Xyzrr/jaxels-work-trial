@@ -278,6 +278,44 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             )
         }
 
+    def _write_dcp_checkpoint(self, out_dir: Path, step: int) -> Path:
+        step_dir = train._checkpoint_dir(out_dir) / f"step-{step}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        (step_dir / ".metadata").write_bytes(b"metadata")
+        (step_dir / "__0_0.distcp").write_bytes(b"dcp-payload")
+        return step_dir
+
+    def _write_final_export(
+        self,
+        out_dir: Path,
+        step: int,
+        *,
+        legacy: bool = False,
+    ) -> Path:
+        root = (
+            train._checkpoint_dir(out_dir)
+            if legacy
+            else train._final_model_export_dir(out_dir)
+        )
+        step_dir = root / f"step-{step}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        (step_dir / "model-00001-of-00002.safetensors").write_bytes(b"shard-1")
+        (step_dir / "model-00002-of-00002.safetensors").write_bytes(b"shard-2")
+        (step_dir / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {"total_size": len(b"shard-1") + len(b"shard-2")},
+                    "weight_map": {
+                        "lm_head.weight": "model-00002-of-00002.safetensors",
+                        "model.embed_tokens.weight": (
+                            "model-00001-of-00002.safetensors"
+                        ),
+                    },
+                }
+            )
+        )
+        return step_dir
+
     def test_defaults_track_paper_hyperparameters_and_target_pod(self):
         args = train.parse_args([])
 
@@ -734,6 +772,76 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "full DCP"):
                 train.validate_resume_progress(plan, resume_state)
+
+    def test_final_artifact_validation_writes_report_for_completed_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_dcp_checkpoint(args.out_dir, step=4)
+            self._write_final_export(args.out_dir, step=5)
+
+            report = train.validate_final_artifacts(args, plan)
+            persisted = json.loads(
+                (args.out_dir / train.FINAL_ARTIFACT_VALIDATION_FILENAME).read_text()
+            )
+
+        self.assertEqual(
+            report["schema_version"],
+            train.FINAL_ARTIFACT_VALIDATION_SCHEMA_VERSION,
+        )
+        self.assertEqual(report, persisted)
+        self.assertEqual(report["plan_total_steps"], 5)
+        self.assertEqual(report["final_export"]["layout"], "final_export")
+        self.assertEqual(report["final_export"]["shard_count"], 2)
+        self.assertEqual(report["final_export"]["weight_map_entries"], 2)
+        self.assertEqual(report["resumable_checkpoints"]["steps"], [4])
+        self.assertEqual(
+            report["resumable_checkpoints"]["checkpoints"][0]["payload_file_count"],
+            1,
+        )
+
+    def test_final_artifact_validation_rejects_missing_export_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            export = self._write_final_export(args.out_dir, step=5)
+            (export / "model-00002-of-00002.safetensors").unlink()
+
+            with self.assertRaisesRegex(RuntimeError, "final model export shard"):
+                train.validate_final_artifacts(args, plan, write_report=False)
+
+    def test_final_artifact_validation_rejects_empty_dcp_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            checkpoint = self._write_dcp_checkpoint(args.out_dir, step=4)
+            (checkpoint / "__0_0.distcp").write_bytes(b"")
+            self._write_final_export(args.out_dir, step=5)
+
+            with self.assertRaisesRegex(RuntimeError, "DCP checkpoint payload"):
+                train.validate_final_artifacts(args, plan, write_report=False)
+
+    def test_final_artifact_validation_rejects_duplicate_legacy_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_final_export(args.out_dir, step=5)
+            self._write_final_export(args.out_dir, step=5, legacy=True)
+
+            with self.assertRaisesRegex(RuntimeError, "both"):
+                train.validate_final_artifacts(args, plan, write_report=False)
+
+    def test_final_artifact_validation_can_accept_legacy_export_for_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_final_export(args.out_dir, step=5, legacy=True)
+
+            with self.assertRaisesRegex(RuntimeError, "Final model export is missing"):
+                train.validate_final_artifacts(args, plan, write_report=False)
+            report = train.validate_final_artifacts(
+                args,
+                plan,
+                allow_legacy_export=True,
+                write_report=False,
+            )
+
+        self.assertEqual(report["final_export"]["layout"], "legacy_checkpoint_export")
 
     def test_resume_contract_accepts_same_config_and_skips_completed_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
