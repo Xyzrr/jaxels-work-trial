@@ -87,6 +87,8 @@ REQUIRED_HF_ASSET_FILES = ("config.json", "tokenizer.json", "tokenizer_config.js
 FINAL_MODEL_EXPORT_FOLDER = "final_export"
 FINAL_ARTIFACT_VALIDATION_SCHEMA_VERSION = 1
 FINAL_ARTIFACT_VALIDATION_FILENAME = "final_artifact_validation.json"
+STAGE_STATUS_SCHEMA_VERSION = 1
+STAGE_STATUS_FILENAME = "stage_status.json"
 RESUME_ARG_FIELDS = (
     "model_id",
     "dataset_id",
@@ -471,6 +473,10 @@ def _run_spec_sha256_path(out_dir: Path) -> Path:
 
 def _final_artifact_validation_path(out_dir: Path) -> Path:
     return out_dir / FINAL_ARTIFACT_VALIDATION_FILENAME
+
+
+def _stage_status_path(out_dir: Path) -> Path:
+    return out_dir / STAGE_STATUS_FILENAME
 
 
 def _torchtitan_dump_dir(out_dir: Path) -> Path:
@@ -3457,6 +3463,553 @@ def run_stage(
     subprocess.run(command, check=True, env=env, cwd=Path(__file__).resolve().parents[1])
 
 
+def _stage_status_id(index: int, stage: BucketStage) -> str:
+    return f"stage-{index + 1:02d}-bucket-{stage.bucket}-step-{stage.cumulative_steps}"
+
+
+def _stage_status_by_id(document: Mapping[str, Any], stage_id: str) -> dict[str, Any]:
+    for stage_record in document.get("stages", []):
+        if isinstance(stage_record, dict) and stage_record.get("id") == stage_id:
+            return stage_record
+    raise RuntimeError(f"Stage status record is missing stage id {stage_id!r}")
+
+
+def _stage_status_counts(stages: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    counts = Counter(str(stage.get("status")) for stage in stages)
+    return dict(sorted(counts.items()))
+
+
+def _stage_status_summary(document: Mapping[str, Any]) -> dict[str, Any]:
+    stages = [
+        stage
+        for stage in document.get("stages", [])
+        if isinstance(stage, Mapping)
+    ]
+    counts = _stage_status_counts(stages)
+    completed_statuses = {"succeeded", "completed_before_resume"}
+    failed_stage_ids = [
+        str(stage["id"])
+        for stage in stages
+        if stage.get("status") == "failed" and "id" in stage
+    ]
+    running_stage_ids = [
+        str(stage["id"])
+        for stage in stages
+        if stage.get("status") == "running" and "id" in stage
+    ]
+    final_validation = document.get("final_artifact_validation")
+    final_validation_status = (
+        final_validation.get("status")
+        if isinstance(final_validation, Mapping)
+        else None
+    )
+    return {
+        "stage_status_counts": counts,
+        "completed_stage_count": sum(
+            1 for stage in stages if stage.get("status") in completed_statuses
+        ),
+        "failed_stage_ids": failed_stage_ids,
+        "running_stage_ids": running_stage_ids,
+        "pending_stage_ids": [
+            str(stage["id"])
+            for stage in stages
+            if stage.get("status") == "pending" and "id" in stage
+        ],
+        "failure_count": len(document.get("failures", [])),
+        "final_artifact_validation_status": final_validation_status,
+    }
+
+
+def _write_stage_status_document(path: Path, document: dict[str, Any]) -> None:
+    document["updated_at_unix"] = time.time()
+    document["summary"] = _stage_status_summary(document)
+    _write_json_atomic(path, document)
+
+
+def _load_stage_status_document(path: Path) -> dict[str, Any]:
+    document = _read_json_object_required(path, "stage status")
+    if document.get("schema_version") != STAGE_STATUS_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported stage status schema version in "
+            f"{path}: {document.get('schema_version')!r}"
+        )
+    if not isinstance(document.get("stages"), list):
+        raise RuntimeError(f"Stage status has no stages list: {path}")
+    if not isinstance(document.get("failures"), list):
+        raise RuntimeError(f"Stage status has no failures list: {path}")
+    return document
+
+
+def _resume_state_status_record(
+    resume_state: ResumeCheckpointState | None,
+) -> dict[str, Any] | None:
+    if resume_state is None:
+        return None
+    return {
+        "checkpoint_dir": str(resume_state.checkpoint_dir),
+        "final_export_dir": str(resume_state.final_export_dir),
+        "latest_resumable_step": resume_state.latest_resumable_step,
+        "latest_model_export_step": resume_state.latest_model_export_step,
+        "latest_any_step": resume_state.latest_any_step,
+    }
+
+
+def _initial_stage_status(
+    *,
+    stage: BucketStage,
+    stage_id: str,
+    index: int,
+    should_run: bool,
+    load_dataloader_state: bool,
+) -> dict[str, Any]:
+    return {
+        "id": stage_id,
+        "index": index,
+        "bucket": stage.bucket,
+        "cp_degree": stage.cp_degree,
+        "example_count": stage.example_count,
+        "steps": stage.steps,
+        "cumulative_steps": stage.cumulative_steps,
+        "bucket_file": str(stage.bucket_file),
+        "load_dataloader_state": load_dataloader_state,
+        "status": "pending" if should_run else "completed_before_resume",
+        "started_at_unix": None,
+        "finished_at_unix": None,
+        "duration_seconds": None,
+        "attempts": [],
+        "failure": None,
+    }
+
+
+def _build_stage_status_document(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    *,
+    resume_state: ResumeCheckpointState | None,
+    stages_to_run: Iterable[BucketStage],
+    dataloader_resume_flags: Mapping[int, bool],
+) -> dict[str, Any]:
+    stages_to_run_by_step = {
+        stage.cumulative_steps
+        for stage in stages_to_run
+    }
+    stage_records = []
+    for index, stage in enumerate(plan.stages):
+        stage_id = _stage_status_id(index, stage)
+        stage_records.append(
+            _initial_stage_status(
+                stage=stage,
+                stage_id=stage_id,
+                index=index,
+                should_run=stage.cumulative_steps in stages_to_run_by_step,
+                load_dataloader_state=dataloader_resume_flags.get(
+                    stage.cumulative_steps, False
+                ),
+            )
+        )
+
+    now = time.time()
+    return {
+        "schema_version": STAGE_STATUS_SCHEMA_VERSION,
+        "created_at_unix": now,
+        "updated_at_unix": now,
+        "paths": {
+            "out_dir": str(args.out_dir),
+            "run_spec": str(_run_spec_path(args.out_dir)),
+            "launcher_plan": str(args.out_dir / "launcher_plan.json"),
+            "final_artifact_validation": str(
+                _final_artifact_validation_path(args.out_dir)
+            ),
+        },
+        "launch": {
+            "resume": bool(args.resume),
+            "resume_state": _resume_state_status_record(resume_state),
+            "stages_to_run": [
+                _stage_status_id(index, stage)
+                for index, stage in enumerate(plan.stages)
+                if stage.cumulative_steps in stages_to_run_by_step
+            ],
+        },
+        "plan": {
+            "total_steps": plan.total_steps,
+            "warmup_steps": plan.warmup_steps,
+        },
+        "stages": stage_records,
+        "final_artifact_validation": {
+            "status": "pending",
+            "started_at_unix": None,
+            "finished_at_unix": None,
+            "duration_seconds": None,
+            "report_path": str(_final_artifact_validation_path(args.out_dir)),
+            "report_sha256": None,
+            "summary": None,
+            "failure": None,
+        },
+        "failures": [],
+    }
+
+
+def _merge_existing_stage_status(
+    new_document: dict[str, Any],
+    existing_document: Mapping[str, Any],
+) -> dict[str, Any]:
+    existing_by_id = {
+        str(stage.get("id")): stage
+        for stage in existing_document.get("stages", [])
+        if isinstance(stage, Mapping) and stage.get("id") is not None
+    }
+    for stage in new_document["stages"]:
+        existing = existing_by_id.get(stage["id"])
+        if not isinstance(existing, Mapping):
+            continue
+        existing_attempts = existing.get("attempts")
+        stage["attempts"] = (
+            list(existing_attempts)
+            if isinstance(existing_attempts, list)
+            else []
+        )
+        if stage["status"] == "completed_before_resume":
+            stage["status"] = (
+                "succeeded"
+                if existing.get("status") == "succeeded"
+                else "completed_before_resume"
+            )
+            stage["started_at_unix"] = existing.get("started_at_unix")
+            stage["finished_at_unix"] = existing.get("finished_at_unix")
+            stage["duration_seconds"] = existing.get("duration_seconds")
+            stage["failure"] = existing.get("failure")
+            if stage["status"] == "completed_before_resume":
+                stage["finished_at_unix"] = None
+                stage["duration_seconds"] = None
+                stage["failure"] = None
+        else:
+            stage["started_at_unix"] = None
+            stage["finished_at_unix"] = None
+            stage["duration_seconds"] = None
+            stage["failure"] = None
+
+    new_document["created_at_unix"] = existing_document.get(
+        "created_at_unix", new_document["created_at_unix"]
+    )
+    new_document["failures"] = list(existing_document.get("failures", []))
+    final_validation = existing_document.get("final_artifact_validation")
+    if isinstance(final_validation, Mapping):
+        new_document["final_artifact_validation"] = {
+            **new_document["final_artifact_validation"],
+            **dict(final_validation),
+        }
+        if new_document["final_artifact_validation"].get("status") == "running":
+            new_document["final_artifact_validation"]["status"] = "pending"
+            new_document["final_artifact_validation"]["finished_at_unix"] = None
+            new_document["final_artifact_validation"]["duration_seconds"] = None
+    return new_document
+
+
+def initialize_stage_status(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    *,
+    resume_state: ResumeCheckpointState | None,
+    stages_to_run: Iterable[BucketStage],
+    dataloader_resume_flags: Mapping[int, bool],
+) -> dict[str, Any]:
+    path = _stage_status_path(args.out_dir)
+    document = _build_stage_status_document(
+        args,
+        plan,
+        resume_state=resume_state,
+        stages_to_run=stages_to_run,
+        dataloader_resume_flags=dataloader_resume_flags,
+    )
+    if path.exists():
+        document = _merge_existing_stage_status(
+            document,
+            _load_stage_status_document(path),
+        )
+    _write_stage_status_document(path, document)
+    return document
+
+
+def _exception_failure_record(
+    exc: BaseException,
+    *,
+    phase: str,
+    stage_id: str | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "phase": phase,
+        "created_at_unix": time.time(),
+        "exception_type": type(exc).__name__,
+        "message": str(exc) or repr(exc),
+    }
+    if stage_id is not None:
+        record["stage_id"] = stage_id
+    if isinstance(exc, subprocess.CalledProcessError):
+        record["returncode"] = exc.returncode
+        record["command"] = _jsonable(exc.cmd)
+        if exc.stdout is not None:
+            record["stdout"] = str(exc.stdout)
+        if exc.stderr is not None:
+            record["stderr"] = str(exc.stderr)
+    return record
+
+
+def _record_stage_started(
+    args: argparse.Namespace,
+    stage: BucketStage,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+    *,
+    load_dataloader_state: bool,
+) -> tuple[str, int]:
+    path = _stage_status_path(args.out_dir)
+    document = _load_stage_status_document(path)
+    index = next(
+        (
+            candidate_index
+            for candidate_index, candidate_stage in enumerate(plan.stages)
+            if candidate_stage.cumulative_steps == stage.cumulative_steps
+        ),
+        None,
+    )
+    if index is None:
+        raise RuntimeError(f"Stage is not present in the bucket plan: {stage}")
+    stage_id = _stage_status_id(index, stage)
+    stage_record = _stage_status_by_id(document, stage_id)
+    now = time.time()
+    attempts = stage_record.setdefault("attempts", [])
+    attempt_number = len(attempts) + 1
+    attempts.append(
+        {
+            "attempt": attempt_number,
+            "status": "running",
+            "started_at_unix": now,
+            "finished_at_unix": None,
+            "duration_seconds": None,
+            "torchrun_command": build_torchrun_command(args),
+            "load_dataloader_state": load_dataloader_state,
+            "target_cumulative_steps": stage.cumulative_steps,
+            "env_overrides": _stage_env_overrides(
+                args,
+                stage=stage,
+                total_steps=plan.total_steps,
+                warmup_steps=plan.warmup_steps,
+                pad_token_id=int(manifest["pad_token_id"]),
+                load_dataloader_state=load_dataloader_state,
+            ),
+            "failure": None,
+        }
+    )
+    stage_record["status"] = "running"
+    stage_record["started_at_unix"] = now
+    stage_record["finished_at_unix"] = None
+    stage_record["duration_seconds"] = None
+    stage_record["failure"] = None
+    _write_stage_status_document(path, document)
+    return stage_id, attempt_number
+
+
+def _record_stage_finished(
+    args: argparse.Namespace,
+    *,
+    stage_id: str,
+    attempt_number: int,
+    failure: dict[str, Any] | None,
+) -> None:
+    path = _stage_status_path(args.out_dir)
+    document = _load_stage_status_document(path)
+    stage_record = _stage_status_by_id(document, stage_id)
+    attempts = stage_record.get("attempts")
+    if not isinstance(attempts, list) or len(attempts) < attempt_number:
+        raise RuntimeError(
+            f"Stage status has no attempt {attempt_number} for {stage_id}"
+        )
+    attempt = attempts[attempt_number - 1]
+    if not isinstance(attempt, dict):
+        raise RuntimeError(
+            f"Stage status attempt {attempt_number} for {stage_id} is invalid"
+        )
+
+    now = time.time()
+    started_at = attempt.get("started_at_unix")
+    duration = (
+        now - float(started_at)
+        if isinstance(started_at, (int, float))
+        else None
+    )
+    status = "failed" if failure is not None else "succeeded"
+    attempt["status"] = status
+    attempt["finished_at_unix"] = now
+    attempt["duration_seconds"] = duration
+    attempt["failure"] = failure
+    stage_record["status"] = status
+    stage_record["finished_at_unix"] = now
+    stage_record["duration_seconds"] = duration
+    stage_record["failure"] = failure
+    if failure is not None:
+        document.setdefault("failures", []).append(failure)
+    _write_stage_status_document(path, document)
+
+
+def run_stage_with_status(
+    args: argparse.Namespace,
+    stage: BucketStage,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+    *,
+    load_dataloader_state: bool = False,
+) -> None:
+    stage_id, attempt_number = _record_stage_started(
+        args,
+        stage,
+        plan,
+        manifest,
+        load_dataloader_state=load_dataloader_state,
+    )
+    try:
+        run_stage(
+            args,
+            stage,
+            plan,
+            int(manifest["pad_token_id"]),
+            load_dataloader_state=load_dataloader_state,
+        )
+    except BaseException as exc:
+        failure = _exception_failure_record(
+            exc,
+            phase="stage",
+            stage_id=stage_id,
+        )
+        _record_stage_finished(
+            args,
+            stage_id=stage_id,
+            attempt_number=attempt_number,
+            failure=failure,
+        )
+        raise
+    _record_stage_finished(
+        args,
+        stage_id=stage_id,
+        attempt_number=attempt_number,
+        failure=None,
+    )
+
+
+def record_launch_failure(
+    args: argparse.Namespace,
+    *,
+    phase: str,
+    exc: BaseException,
+) -> None:
+    path = _stage_status_path(args.out_dir)
+    if not path.exists():
+        return
+    document = _load_stage_status_document(path)
+    failure = _exception_failure_record(exc, phase=phase)
+    document.setdefault("failures", []).append(failure)
+    _write_stage_status_document(path, document)
+
+
+def _final_validation_status_summary(report: Mapping[str, Any]) -> dict[str, Any]:
+    final_export = report.get("final_export")
+    resumable = report.get("resumable_checkpoints")
+    return {
+        "plan_total_steps": report.get("plan_total_steps"),
+        "resumable_checkpoint_steps": resumable.get("steps")
+        if isinstance(resumable, Mapping)
+        else None,
+        "final_export": {
+            key: final_export.get(key)
+            for key in (
+                "step",
+                "layout",
+                "weight_map_entries",
+                "shard_count",
+                "total_shard_bytes",
+                "index_sha256",
+            )
+        }
+        if isinstance(final_export, Mapping)
+        else None,
+    }
+
+
+def _record_final_validation_started(args: argparse.Namespace) -> None:
+    path = _stage_status_path(args.out_dir)
+    document = _load_stage_status_document(path)
+    record = document["final_artifact_validation"]
+    now = time.time()
+    record.update(
+        {
+            "status": "running",
+            "started_at_unix": now,
+            "finished_at_unix": None,
+            "duration_seconds": None,
+            "report_path": str(_final_artifact_validation_path(args.out_dir)),
+            "report_sha256": None,
+            "summary": None,
+            "failure": None,
+        }
+    )
+    _write_stage_status_document(path, document)
+
+
+def _record_final_validation_finished(
+    args: argparse.Namespace,
+    *,
+    report: Mapping[str, Any] | None,
+    failure: dict[str, Any] | None,
+) -> None:
+    path = _stage_status_path(args.out_dir)
+    document = _load_stage_status_document(path)
+    record = document["final_artifact_validation"]
+    now = time.time()
+    started_at = record.get("started_at_unix")
+    duration = (
+        now - float(started_at)
+        if isinstance(started_at, (int, float))
+        else None
+    )
+    report_path = _final_artifact_validation_path(args.out_dir)
+    record.update(
+        {
+            "status": "failed" if failure is not None else "succeeded",
+            "finished_at_unix": now,
+            "duration_seconds": duration,
+            "report_path": str(report_path),
+            "report_sha256": _hash_file(report_path) if report_path.is_file() else None,
+            "summary": _final_validation_status_summary(report)
+            if report is not None
+            else None,
+            "failure": failure,
+        }
+    )
+    if failure is not None:
+        document.setdefault("failures", []).append(failure)
+    _write_stage_status_document(path, document)
+
+
+def validate_final_artifacts_with_status(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    *,
+    allow_legacy_export: bool = False,
+) -> dict[str, Any]:
+    _record_final_validation_started(args)
+    try:
+        report = validate_final_artifacts(
+            args,
+            plan,
+            allow_legacy_export=allow_legacy_export,
+        )
+    except BaseException as exc:
+        failure = _exception_failure_record(exc, phase="final_artifact_validation")
+        _record_final_validation_finished(args, report=None, failure=failure)
+        raise
+    _record_final_validation_finished(args, report=report, failure=None)
+    return report
+
+
 def _write_launcher_plan(
     args: argparse.Namespace,
     plan: BucketPlan,
@@ -3482,6 +4035,7 @@ def _write_launcher_plan(
         "warmup_steps": plan.warmup_steps,
         "manifest": str(args.out_dir / "data" / "manifest.json"),
         "run_spec": str(_run_spec_path(args.out_dir)),
+        "stage_status": str(_stage_status_path(args.out_dir)),
     }
     (args.out_dir / "launcher_plan.json").write_text(
         json.dumps(launcher_plan, indent=2)
@@ -3570,23 +4124,33 @@ def main(argv: list[str] | None = None) -> None:
     else:
         _write_resume_contract(args, plan, manifest)
     dataloader_resume_flags = dataloader_resume_flags_by_stage(plan, resume_state)
-    if not (args.dry_run or args.prepare_data_only):
-        launch_preflight = validate_launch_preflight(args, plan, manifest)
-        print(json.dumps({"launch_preflight": launch_preflight}, indent=2))
+    stages_to_run = stages_to_run_for_resume(plan, resume_state)
     _write_launcher_plan(
         args,
         plan,
         manifest,
         dataloader_resume_flags=dataloader_resume_flags,
     )
+    if not (args.dry_run or args.prepare_data_only):
+        initialize_stage_status(
+            args,
+            plan,
+            resume_state=resume_state,
+            stages_to_run=stages_to_run,
+            dataloader_resume_flags=dataloader_resume_flags,
+        )
+        try:
+            launch_preflight = validate_launch_preflight(args, plan, manifest)
+        except BaseException as exc:
+            record_launch_failure(args, phase="launch_preflight", exc=exc)
+            raise
+        print(json.dumps({"launch_preflight": launch_preflight}, indent=2))
 
     print(json.dumps({"bucket_plan": [asdict(stage) for stage in plan.stages]}, default=str, indent=2))
     if args.prepare_data_only or args.dry_run:
         print(f"Wrote launcher plan to {args.out_dir / 'launcher_plan.json'}")
         return
 
-    pad_token_id = int(manifest["pad_token_id"])
-    stages_to_run = stages_to_run_for_resume(plan, resume_state)
     if resume_state is not None:
         print(
             "Resume state: "
@@ -3595,7 +4159,7 @@ def main(argv: list[str] | None = None) -> None:
             f"{len(stages_to_run)} bucket stage(s) remain."
         )
         if not stages_to_run:
-            final_validation = validate_final_artifacts(
+            final_validation = validate_final_artifacts_with_status(
                 args,
                 plan,
                 allow_legacy_export=True,
@@ -3609,16 +4173,16 @@ def main(argv: list[str] | None = None) -> None:
             print("No bucket stages remain; training is already complete for this plan.")
             return
     for stage in stages_to_run:
-        run_stage(
+        run_stage_with_status(
             args,
             stage,
             plan,
-            pad_token_id,
+            manifest,
             load_dataloader_state=dataloader_resume_flags.get(
                 stage.cumulative_steps, False
             ),
         )
-    final_validation = validate_final_artifacts(args, plan)
+    final_validation = validate_final_artifacts_with_status(args, plan)
     print(json.dumps({"final_artifact_validation": final_validation}, indent=2))
 
 

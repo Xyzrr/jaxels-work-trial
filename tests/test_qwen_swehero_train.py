@@ -843,6 +843,152 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual(report["final_export"]["layout"], "legacy_checkpoint_export")
 
+    def test_stage_status_records_successful_stage_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+
+            with (
+                patch.object(train.subprocess, "run") as run_mock,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                train.run_stage_with_status(args, plan.stages[0], plan, manifest)
+
+            status = json.loads(
+                (args.out_dir / train.STAGE_STATUS_FILENAME).read_text()
+            )
+
+        run_mock.assert_called_once()
+        stage = status["stages"][0]
+        self.assertEqual(stage["status"], "succeeded")
+        self.assertEqual(stage["attempts"][0]["status"], "succeeded")
+        self.assertIn("torchrun_command", stage["attempts"][0])
+        self.assertEqual(status["failures"], [])
+        self.assertEqual(status["summary"]["stage_status_counts"]["succeeded"], 1)
+
+    def test_stage_status_records_failed_stage_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, manifest, plan = self._resume_test_setup(tmp)
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+            error = train.subprocess.CalledProcessError(
+                42,
+                ["torchrun", "-m", "torchtitan.train"],
+            )
+
+            with (
+                patch.object(train.subprocess, "run", side_effect=error),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(train.subprocess.CalledProcessError):
+                    train.run_stage_with_status(args, plan.stages[0], plan, manifest)
+
+            status = json.loads(
+                (args.out_dir / train.STAGE_STATUS_FILENAME).read_text()
+            )
+
+        stage = status["stages"][0]
+        self.assertEqual(stage["status"], "failed")
+        self.assertEqual(stage["attempts"][0]["status"], "failed")
+        self.assertEqual(stage["failure"]["returncode"], 42)
+        self.assertEqual(status["failures"][0]["phase"], "stage")
+        self.assertEqual(status["failures"][0]["stage_id"], stage["id"])
+        self.assertEqual(status["summary"]["failure_count"], 1)
+
+    def test_stage_status_marks_resume_completed_and_pending_stages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            self._write_dcp_checkpoint(args.out_dir, step=4)
+            args.resume = True
+            resume_state = train.validate_resume_request(args)
+            stages_to_run = train.stages_to_run_for_resume(plan, resume_state)
+            dataloader_resume_flags = train.dataloader_resume_flags_by_stage(
+                plan,
+                resume_state,
+            )
+
+            status = train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=resume_state,
+                stages_to_run=stages_to_run,
+                dataloader_resume_flags=dataloader_resume_flags,
+            )
+
+        self.assertEqual([stage["status"] for stage in status["stages"]], [
+            "completed_before_resume",
+            "pending",
+        ])
+        self.assertEqual(status["launch"]["stages_to_run"], [
+            status["stages"][1]["id"],
+        ])
+
+    def test_final_validation_status_records_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+            self._write_final_export(args.out_dir, step=5)
+
+            train.validate_final_artifacts_with_status(args, plan)
+            status_path = args.out_dir / train.STAGE_STATUS_FILENAME
+            status = json.loads(status_path.read_text())
+            report_sha256 = train._hash_file(
+                args.out_dir / train.FINAL_ARTIFACT_VALIDATION_FILENAME
+            )
+
+        final_status = status["final_artifact_validation"]
+        self.assertEqual(final_status["status"], "succeeded")
+        self.assertEqual(final_status["report_sha256"], report_sha256)
+        self.assertEqual(
+            final_status["summary"]["final_export"]["shard_count"],
+            2,
+        )
+        self.assertEqual(
+            status["summary"]["final_artifact_validation_status"],
+            "succeeded",
+        )
+
+    def test_final_validation_status_records_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _manifest, plan = self._resume_test_setup(tmp)
+            train.initialize_stage_status(
+                args,
+                plan,
+                resume_state=None,
+                stages_to_run=plan.stages,
+                dataloader_resume_flags={},
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Final model export is missing"):
+                train.validate_final_artifacts_with_status(args, plan)
+
+            status = json.loads(
+                (args.out_dir / train.STAGE_STATUS_FILENAME).read_text()
+            )
+
+        final_status = status["final_artifact_validation"]
+        self.assertEqual(final_status["status"], "failed")
+        self.assertEqual(final_status["failure"]["phase"], "final_artifact_validation")
+        self.assertEqual(status["failures"][0]["phase"], "final_artifact_validation")
+        self.assertEqual(status["summary"]["failure_count"], 1)
+
     def test_resume_contract_accepts_same_config_and_skips_completed_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, manifest, plan = self._resume_test_setup(tmp)
