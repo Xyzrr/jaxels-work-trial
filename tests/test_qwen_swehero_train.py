@@ -1,3 +1,4 @@
+import ast
 import tempfile
 import unittest
 from pathlib import Path
@@ -155,6 +156,23 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             self.assertNotIn("class DataParallelMeshDims", source)
             self.assertNotIn("Compatibility shim", source)
             self.assertNotIn("except ImportError", source)
+
+    def test_torchtitan_rmsnorm_uses_upstream_forward(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source_path = repo_root / "torchtitan/torchtitan/models/common/rmsnorm.py"
+        source = source_path.read_text()
+        tree = ast.parse(source)
+        rmsnorm_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "RMSNorm"
+        )
+        method_names = {
+            node.name for node in rmsnorm_class.body if isinstance(node, ast.FunctionDef)
+        }
+
+        self.assertNotIn("forward", method_names)
+        self.assertNotIn("weight.clone", source)
 
 
 if __name__ == "__main__":
