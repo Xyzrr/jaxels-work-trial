@@ -278,11 +278,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 "--hf-assets-path",
                 str(Path(tmp) / "hf" / "Qwen2.5-Coder-7B-Instruct"),
                 "--buckets",
-                "8192,32768",
+                "32768,65536",
                 "--bucket-cp",
-                "8192:1,32768:2",
+                "32768:2,65536:4",
                 "--max-length",
-                "32768",
+                "65536",
                 "--num-examples",
                 "34",
                 "--max-streamed-examples",
@@ -293,8 +293,8 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         bucket_cp = train.parse_bucket_cp_map(args.bucket_cp)
         args.bucket_cp = train._format_bucket_cp_map(bucket_cp)
         bucket_files = {
-            8192: data_dir / "bucket_8192.jsonl",
             32768: data_dir / "bucket_32768.jsonl",
+            65536: data_dir / "bucket_65536.jsonl",
         }
         for path in bucket_files.values():
             path.write_text("")
@@ -370,11 +370,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             },
             "pad_token_id": 151643,
             "max_length": args.max_length,
-            "buckets": [8192, 32768],
+            "buckets": [32768, 65536],
             "bucket_files": {
                 str(bucket): str(path) for bucket, path in bucket_files.items()
             },
-            "bucket_counts": {"8192": 33, "32768": 1},
+            "bucket_counts": {"32768": 33, "65536": 1},
             "num_usable_examples": 34,
             "streamed_examples_scanned": 34,
             "skipped": {},
@@ -382,7 +382,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         }
         (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
         plan = train.build_bucket_plan(
-            bucket_counts={8192: 33, 32768: 1},
+            bucket_counts={32768: 33, 65536: 1},
             bucket_files=bucket_files,
             bucket_cp=bucket_cp,
             epochs=args.num_train_epochs,
@@ -822,6 +822,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.profiler_warmup, 3)
         self.assertFalse(args.enable_memory_snapshot)
         self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
+        self.assertEqual(train.DEFAULT_BUCKETS, (32768, 65536, 131072))
+        self.assertNotIn(8192, train.DEFAULT_BUCKETS)
+        self.assertNotIn(16384, train.DEFAULT_BUCKETS)
+        self.assertEqual(train.choose_bucket(8192, train.DEFAULT_BUCKETS), 32768)
+        self.assertEqual(train.choose_bucket(16384, train.DEFAULT_BUCKETS), 32768)
         self.assertTrue(args.validate_first_step_checkpoint)
         self.assertEqual(args.workspace_root, train._detected_workspace_root())
 
@@ -847,13 +852,13 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 "--max-streamed-examples",
                 "64",
                 "--max-length",
-                "8192",
+                "32768",
                 "--long-example-policy",
                 "skip",
                 "--buckets",
-                "8192",
+                "32768",
                 "--bucket-cp",
-                "8192:1",
+                "32768:2",
                 "--bucket-curriculum",
                 "single-bucket",
                 "--num-train-epochs",
@@ -1166,7 +1171,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             (
                 [
                     "--bucket-cp",
-                    "8192:1,16384:1,32768:1,65536:4,131072:8",
+                    "32768:1,65536:4,131072:8",
                 ],
                 "--bucket-cp",
             ),
@@ -2089,13 +2094,13 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_bucket_plan_uses_epochs_and_cumulative_steps(self):
         with tempfile.TemporaryDirectory() as tmp:
             bucket_files = {
-                8192: Path(tmp) / "bucket_8192.jsonl",
                 32768: Path(tmp) / "bucket_32768.jsonl",
+                65536: Path(tmp) / "bucket_65536.jsonl",
             }
             plan = train.build_bucket_plan(
-                bucket_counts={8192: 33, 32768: 1},
+                bucket_counts={32768: 33, 65536: 1},
                 bucket_files=bucket_files,
-                bucket_cp={8192: 1, 32768: 2},
+                bucket_cp={32768: 2, 65536: 4},
                 epochs=3.0,
                 global_batch_size=32,
                 warmup_ratio=0.1,
@@ -2103,44 +2108,44 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual(plan.total_steps, 5)
         self.assertEqual(plan.warmup_steps, 1)
-        self.assertEqual([stage.bucket for stage in plan.stages], [8192, 32768])
+        self.assertEqual([stage.bucket for stage in plan.stages], [32768, 65536])
         self.assertEqual([stage.steps for stage in plan.stages], [4, 1])
         self.assertEqual([stage.cumulative_steps for stage in plan.stages], [4, 5])
-        self.assertEqual([stage.cp_degree for stage in plan.stages], [1, 2])
+        self.assertEqual([stage.cp_degree for stage in plan.stages], [2, 4])
 
     def test_bucket_plan_uses_explicit_curriculum_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             bucket_files = {
-                8192: Path(tmp) / "bucket_8192.jsonl",
                 32768: Path(tmp) / "bucket_32768.jsonl",
+                65536: Path(tmp) / "bucket_65536.jsonl",
             }
             plan = train.build_bucket_plan(
-                bucket_counts={8192: 33, 32768: 1},
+                bucket_counts={32768: 33, 65536: 1},
                 bucket_files=bucket_files,
-                bucket_cp={8192: 1, 32768: 2},
+                bucket_cp={32768: 2, 65536: 4},
                 epochs=3.0,
                 global_batch_size=32,
                 warmup_ratio=0.1,
                 bucket_curriculum="long-to-short",
             )
 
-        self.assertEqual([stage.bucket for stage in plan.stages], [32768, 8192])
+        self.assertEqual([stage.bucket for stage in plan.stages], [65536, 32768])
         self.assertEqual([stage.steps for stage in plan.stages], [1, 4])
         self.assertEqual([stage.cumulative_steps for stage in plan.stages], [1, 5])
-        self.assertEqual([stage.cp_degree for stage in plan.stages], [2, 1])
+        self.assertEqual([stage.cp_degree for stage in plan.stages], [4, 2])
 
     def test_single_bucket_curriculum_requires_one_non_empty_bucket(self):
         with tempfile.TemporaryDirectory() as tmp:
             bucket_files = {
-                8192: Path(tmp) / "bucket_8192.jsonl",
                 32768: Path(tmp) / "bucket_32768.jsonl",
+                65536: Path(tmp) / "bucket_65536.jsonl",
             }
 
             with self.assertRaisesRegex(ValueError, "single-bucket curriculum"):
                 train.build_bucket_plan(
-                    bucket_counts={8192: 33, 32768: 1},
+                    bucket_counts={32768: 33, 65536: 1},
                     bucket_files=bucket_files,
-                    bucket_cp={8192: 1, 32768: 2},
+                    bucket_cp={32768: 2, 65536: 4},
                     epochs=3.0,
                     global_batch_size=32,
                     warmup_ratio=0.1,
@@ -2963,7 +2968,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             train.validate_resume_contract(args, plan, manifest)
             stages = train.stages_to_run_for_resume(plan, resume_state)
 
-        self.assertEqual([stage.bucket for stage in stages], [32768])
+        self.assertEqual([stage.bucket for stage in stages], [65536])
 
     def test_run_spec_is_written_once_with_checksum(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2983,7 +2988,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(spec_sha, train._sha256_text(spec_text))
         self.assertEqual(spec["schema_version"], train.RUN_SPEC_SCHEMA_VERSION)
         self.assertFalse(spec["args"]["production_mode"])
-        self.assertEqual(spec["args"]["max_length"], 32768)
+        self.assertEqual(spec["args"]["max_length"], 65536)
         self.assertEqual(spec["manifest"], train._resume_manifest_contract(manifest))
         self.assertEqual(
             spec["paths"]["resumable_checkpoints"],
@@ -3019,7 +3024,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             first_env["SWEHERO_WORKSPACE_ROOT"],
             str(train._configured_workspace_root(args)),
         )
-        self.assertEqual(first_env["SWEHERO_BUCKET_SEQ_LEN"], "8192")
+        self.assertEqual(first_env["SWEHERO_BUCKET_SEQ_LEN"], "32768")
         self.assertEqual(first_env["SWEHERO_ALLOW_EMPTY_RANK_REUSE"], "1")
         self.assertEqual(
             first_env["SWEHERO_FINAL_EXPORT_FOLDER"],
@@ -3202,11 +3207,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 "--hf-assets-path",
                 str(hf_assets_path),
                 "--buckets",
-                "8192,32768",
+                "32768,65536",
                 "--bucket-cp",
-                "8192:1,32768:2",
+                "32768:2,65536:4",
                 "--max-length",
-                "32768",
+                "65536",
                 "--num-examples",
                 "34",
                 "--max-streamed-examples",
@@ -3350,7 +3355,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 load_dataloader_state=flags[plan.stages[1].cumulative_steps],
             )
 
-        self.assertEqual([stage.bucket for stage in stages], [8192, 32768])
+        self.assertEqual([stage.bucket for stage in stages], [32768, 65536])
         self.assertTrue(flags[plan.stages[0].cumulative_steps])
         self.assertFalse(flags[plan.stages[1].cumulative_steps])
         self.assertEqual(first_env["SWEHERO_LOAD_DATALOADER_STATE"], "1")
@@ -3405,7 +3410,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             flags = train.dataloader_resume_flags_by_stage(plan, resume_state)
             stages = train.stages_to_run_for_resume(plan, resume_state)
 
-        self.assertEqual([stage.bucket for stage in stages], [32768])
+        self.assertEqual([stage.bucket for stage in stages], [65536])
         self.assertFalse(flags[plan.stages[0].cumulative_steps])
         self.assertFalse(flags[plan.stages[1].cumulative_steps])
 
@@ -3501,8 +3506,8 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
     def test_varlen_attention_is_rejected_when_any_bucket_uses_cp(self):
         with self.assertRaisesRegex(ValueError, "VarlenAttention"):
             train.validate_bucket_config(
-                buckets=(8192, 32768),
-                bucket_cp={8192: 1, 32768: 2},
+                buckets=(32768, 65536),
+                bucket_cp={32768: 2, 65536: 4},
                 nproc_per_node=8,
                 attention_backend="varlen",
             )
@@ -3949,23 +3954,11 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         ]
         golden_manifest = {
             "bucket_counts": {
-                "8192": 0,
-                "16384": 0,
                 "32768": 3,
                 "65536": 4,
                 "131072": 1,
             },
             "bucket_file_integrity": {
-                "8192": {
-                    "bytes": 0,
-                    "records": 0,
-                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                },
-                "16384": {
-                    "bytes": 0,
-                    "records": 0,
-                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                },
                 "32768": {
                     "bytes": 1014056,
                     "records": 3,
@@ -4013,9 +4006,9 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                     "--max-streamed-examples",
                     "64",
                     "--buckets",
-                    "8192,16384,32768,65536,131072",
+                    "32768,65536,131072",
                     "--bucket-cp",
-                    "8192:1,16384:1,32768:2,65536:4,131072:8",
+                    "32768:2,65536:4,131072:8",
                     "--max-length",
                     "131072",
                     "--long-example-policy",

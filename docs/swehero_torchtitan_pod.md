@@ -293,7 +293,7 @@ $TORCHTITAN_POD_VENV/bin/python scripts/qwen_swehero_gpu_lifecycle_smoke.py \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
   --dataset-path /workspace/datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout-final-acceptance-subset \
   --production-acceptance-smoke \
-  --bucket 16384 \
+  --bucket 32768 \
   --num-examples 1 \
   --max-streamed-examples 1 \
   --nproc-per-node 8

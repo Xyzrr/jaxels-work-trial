@@ -72,8 +72,6 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
                     str(Path(tmp) / "launcher.sh"),
                     "--nproc-per-node",
                     "8",
-                    "--bucket",
-                    "8192",
                     "--production-acceptance-smoke",
                     "--num-examples",
                     "8",
@@ -107,7 +105,7 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
                 "skip",
             )
             self.assertEqual(self._flag_value(command, "--shuffle-buffer"), "0")
-            self.assertEqual(self._flag_value(command, "--max-length"), "8192")
+            self.assertEqual(self._flag_value(command, "--max-length"), "32768")
             self.assertEqual(self._flag_value(command, "--wandb-mode"), "online")
 
     def _write_minimal_smoke_outputs(self, out_dir: Path, *, step: int) -> None:

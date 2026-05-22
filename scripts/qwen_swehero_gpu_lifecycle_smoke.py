@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-lifecycle-smoke")
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
 DEFAULT_BUCKET = 1024
-DEFAULT_ACCEPTANCE_BUCKET = 16_384
+DEFAULT_ACCEPTANCE_BUCKET = 32_768
 DEFAULT_CP_DEGREE = 1
 DEFAULT_TIMEOUT_SECONDS = 4 * 60 * 60
 
