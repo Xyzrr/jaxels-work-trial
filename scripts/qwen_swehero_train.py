@@ -83,6 +83,7 @@ RUN_SPEC_FILENAME = "run_spec.json"
 RUN_SPEC_SHA256_FILENAME = "run_spec.sha256"
 RESUME_CONTRACT_SCHEMA_VERSION = 1
 RESUME_CONTRACT_FILENAME = "resume_contract.json"
+REQUIRED_HF_ASSET_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 RESUME_ARG_FIELDS = (
     "model_id",
     "dataset_id",
@@ -2525,7 +2526,276 @@ def download_hf_assets_if_requested(args: argparse.Namespace) -> None:
     subprocess.run(command, check=True)
 
 
-def validate_torchtitan_runtime() -> dict[str, Any]:
+def _resolve_executable(command: str) -> str | None:
+    if not command:
+        return None
+    path = Path(command).expanduser()
+    if path.parent != Path(".") or path.is_absolute():
+        return str(path) if path.is_file() and os.access(path, os.X_OK) else None
+    return shutil.which(command)
+
+
+def _read_json_object_required(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text())
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Missing required {label}: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Required {label} is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Required {label} must be a JSON object: {path}")
+    return payload
+
+
+def _require_nonempty_file(path: Path, label: str) -> None:
+    if not path.is_file():
+        raise RuntimeError(f"Missing required {label}: {path}")
+    if path.stat().st_size <= 0:
+        raise RuntimeError(f"Required {label} is empty: {path}")
+
+
+def _asset_path_from_relative(hf_assets_path: Path, relative_path: object) -> Path:
+    relative = Path(str(relative_path))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError(
+            "Model asset provenance contains an unsafe relative path: "
+            f"{relative_path!r}"
+        )
+    return hf_assets_path / relative
+
+
+def _safetensors_launch_summary(hf_assets_path: Path) -> dict[str, Any]:
+    index_path = hf_assets_path / "model.safetensors.index.json"
+    if index_path.exists():
+        _require_nonempty_file(index_path, "safetensors index")
+        index = _read_json_object_required(index_path, "safetensors index")
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, Mapping) or not weight_map:
+            raise RuntimeError(
+                f"Safetensors index has no weight_map entries: {index_path}"
+            )
+        shard_names = sorted(set(str(path) for path in weight_map.values()))
+        total_bytes = 0
+        for shard_name in shard_names:
+            shard_path = _asset_path_from_relative(hf_assets_path, shard_name)
+            _require_nonempty_file(shard_path, "safetensors shard")
+            total_bytes += shard_path.stat().st_size
+        return {
+            "index_path": str(index_path),
+            "weight_map_entries": len(weight_map),
+            "shard_count": len(shard_names),
+            "total_shard_bytes": total_bytes,
+        }
+
+    shards = sorted(hf_assets_path.rglob("*.safetensors"))
+    if not shards:
+        raise RuntimeError(
+            f"No safetensors weights found under Hugging Face asset directory: "
+            f"{hf_assets_path}"
+        )
+    total_bytes = 0
+    for shard_path in shards:
+        _require_nonempty_file(shard_path, "safetensors shard")
+        total_bytes += shard_path.stat().st_size
+    return {
+        "index_path": None,
+        "weight_map_entries": None,
+        "shard_count": len(shards),
+        "total_shard_bytes": total_bytes,
+    }
+
+
+def _validate_manifest_model_asset_preflight(
+    args: argparse.Namespace,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    model_assets = manifest.get("model_assets")
+    if not isinstance(model_assets, Mapping):
+        raise RuntimeError("Materialized manifest is missing model_assets provenance")
+    if model_assets.get("schema_version") != MODEL_ASSET_PROVENANCE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported model_assets provenance schema version during preflight: "
+            f"{model_assets.get('schema_version')!r}"
+        )
+    if model_assets.get("model_id") != args.model_id:
+        raise RuntimeError(
+            "Materialized model_assets.model_id does not match launch model_id: "
+            f"{model_assets.get('model_id')!r} != {args.model_id!r}"
+        )
+
+    recorded_realpath = model_assets.get("hf_assets_realpath")
+    current_realpath = str(args.hf_assets_path.resolve())
+    if recorded_realpath is not None and str(recorded_realpath) != current_realpath:
+        raise RuntimeError(
+            "Materialized model_assets.hf_assets_realpath does not match the "
+            "current --hf-assets-path: "
+            f"{recorded_realpath!r} != {current_realpath!r}"
+        )
+    recorded_path = model_assets.get("hf_assets_path")
+    if recorded_realpath is None and recorded_path is not None:
+        if str(Path(str(recorded_path)).resolve()) != current_realpath:
+            raise RuntimeError(
+                "Materialized model_assets.hf_assets_path does not match the "
+                "current --hf-assets-path"
+            )
+
+    files = model_assets.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("model_assets.files must contain at least one asset file")
+
+    checked_files = 0
+    checked_bytes = 0
+    for record in files:
+        if not isinstance(record, Mapping):
+            raise RuntimeError("model_assets.files entries must be objects")
+        asset_path = _asset_path_from_relative(args.hf_assets_path, record.get("path"))
+        if not asset_path.is_file():
+            raise RuntimeError(
+                "Model asset from materialized provenance is missing on disk: "
+                f"{asset_path}"
+            )
+        expected_bytes = int(record.get("bytes", -1))
+        actual_bytes = asset_path.stat().st_size
+        if actual_bytes != expected_bytes:
+            raise RuntimeError(
+                "Model asset byte size does not match model_assets provenance: "
+                f"{asset_path} has {actual_bytes} byte(s), expected {expected_bytes}"
+            )
+        checked_files += 1
+        checked_bytes += actual_bytes
+
+    if int(model_assets.get("file_count", -1)) != checked_files:
+        raise RuntimeError(
+            "model_assets.file_count does not match checked file count during "
+            f"preflight: {model_assets.get('file_count')!r} != {checked_files}"
+        )
+    if int(model_assets.get("total_bytes", -1)) != checked_bytes:
+        raise RuntimeError(
+            "model_assets.total_bytes does not match checked asset bytes during "
+            f"preflight: {model_assets.get('total_bytes')!r} != {checked_bytes}"
+        )
+
+    safetensors = model_assets.get("safetensors")
+    if not isinstance(safetensors, Mapping):
+        raise RuntimeError("model_assets.safetensors must be present during preflight")
+    for shard_record in safetensors.get("shard_files", []):
+        if not isinstance(shard_record, Mapping):
+            raise RuntimeError(
+                "model_assets.safetensors.shard_files entries must be objects"
+            )
+        if not shard_record.get("present"):
+            raise RuntimeError(
+                "model_assets provenance recorded a missing safetensors shard: "
+                f"{shard_record.get('path')!r}"
+            )
+        if int(shard_record.get("bytes") or 0) <= 0:
+            raise RuntimeError(
+                "model_assets provenance recorded an empty safetensors shard: "
+                f"{shard_record.get('path')!r}"
+            )
+
+    return {
+        "model_id": model_assets.get("model_id"),
+        "file_count": checked_files,
+        "total_bytes": checked_bytes,
+    }
+
+
+def validate_hf_asset_preflight(
+    args: argparse.Namespace,
+    manifest: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not args.hf_assets_path.is_dir():
+        raise RuntimeError(
+            f"Hugging Face asset directory does not exist: {args.hf_assets_path}"
+        )
+
+    for filename in REQUIRED_HF_ASSET_FILES:
+        _require_nonempty_file(args.hf_assets_path / filename, filename)
+    config = _read_json_object_required(
+        args.hf_assets_path / "config.json",
+        "config.json",
+    )
+    if config.get("model_type") != "qwen2":
+        raise RuntimeError(
+            "Hugging Face config.json is not a Qwen2-family model config: "
+            f"model_type={config.get('model_type')!r}"
+        )
+    _read_json_object_required(
+        args.hf_assets_path / "tokenizer_config.json",
+        "tokenizer_config.json",
+    )
+    _read_json_object_required(
+        args.hf_assets_path / "tokenizer.json",
+        "tokenizer.json",
+    )
+    safetensors = _safetensors_launch_summary(args.hf_assets_path)
+    manifest_assets = (
+        _validate_manifest_model_asset_preflight(args, manifest)
+        if manifest is not None
+        else None
+    )
+
+    return {
+        "hf_assets_path": str(args.hf_assets_path),
+        "required_files": list(REQUIRED_HF_ASSET_FILES),
+        "config_model_type": config.get("model_type"),
+        "safetensors": safetensors,
+        "manifest_model_assets": manifest_assets,
+    }
+
+
+def _cuda_launch_summary(
+    torch_module: Any,
+    *,
+    nproc_per_node: int | None = None,
+) -> dict[str, Any]:
+    cuda = getattr(torch_module, "cuda", None)
+    available = bool(cuda is not None and cuda.is_available())
+    device_count = int(cuda.device_count()) if available else 0
+    devices: list[dict[str, Any]] = []
+    for index in range(device_count):
+        device: dict[str, Any] = {"index": index}
+        try:
+            device["name"] = cuda.get_device_name(index)
+        except Exception as exc:
+            device["name_error"] = repr(exc)
+        try:
+            capability = cuda.get_device_capability(index)
+            device["capability"] = list(capability)
+        except Exception as exc:
+            device["capability_error"] = repr(exc)
+        devices.append(device)
+
+    if nproc_per_node is not None:
+        if nproc_per_node <= 0:
+            raise RuntimeError(
+                f"--nproc-per-node must be positive, got {nproc_per_node}"
+            )
+        if not available:
+            raise RuntimeError(
+                "CUDA is not available in the current Python environment; "
+                "launch from the GPU pod venv."
+            )
+        if device_count < nproc_per_node:
+            raise RuntimeError(
+                f"Launch requires --nproc-per-node={nproc_per_node}, but only "
+                f"{device_count} visible CUDA device(s) are available. Check "
+                "CUDA_VISIBLE_DEVICES and the pod GPU allocation."
+            )
+
+    return {
+        "available": available,
+        "device_count": device_count,
+        "required_nproc_per_node": nproc_per_node,
+        "devices": devices,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
+
+
+def validate_torchtitan_runtime(
+    args: argparse.Namespace | None = None,
+) -> dict[str, Any]:
     try:
         import torch
         from torch.distributed.fsdp import DataParallelMeshDims
@@ -2582,13 +2852,99 @@ def validate_torchtitan_runtime() -> dict[str, Any]:
             "Could not validate the TorchTitan Qwen2.5-Coder-7B YaRN config."
         ) from exc
 
+    torchrun_bin = None
+    cuda = _cuda_launch_summary(
+        torch,
+        nproc_per_node=args.nproc_per_node if args is not None else None,
+    )
+    if args is not None:
+        torchrun_bin = _resolve_executable(args.torchrun_bin)
+        if torchrun_bin is None:
+            raise RuntimeError(
+                f"torchrun executable is missing or not executable: "
+                f"{args.torchrun_bin!r}"
+            )
+
     return {
         "python": sys.executable,
         "torch": getattr(torch, "__version__", None),
         "torch_cuda": getattr(torch.version, "cuda", None),
         "torchao": getattr(torchao, "__version__", None),
+        "cuda": cuda,
+        "torchrun_bin": {
+            "requested": args.torchrun_bin if args is not None else None,
+            "resolved": torchrun_bin,
+        },
         "DataParallelMeshDims": repr(DataParallelMeshDims),
         "qwen_yarn_rope": qwen_yarn_rope,
+    }
+
+
+def validate_launch_preflight(
+    args: argparse.Namespace,
+    plan: BucketPlan,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    resolved_torchrun = _resolve_executable(args.torchrun_bin)
+    if resolved_torchrun is None:
+        raise RuntimeError(
+            f"torchrun executable is missing or not executable: {args.torchrun_bin!r}"
+        )
+    if plan.total_steps <= 0 or not plan.stages:
+        raise RuntimeError("Launch plan has no training steps to run")
+
+    hf_assets = validate_hf_asset_preflight(args, manifest)
+    checked_bucket_files = []
+    for stage in plan.stages:
+        if stage.steps <= 0:
+            raise RuntimeError(f"Launch stage has no steps: {stage}")
+        if stage.example_count <= 0:
+            raise RuntimeError(f"Launch stage has no examples: {stage}")
+        if not stage.bucket_file.is_file():
+            raise RuntimeError(
+                f"Launch bucket file does not exist: {stage.bucket_file}"
+            )
+        if not os.access(stage.bucket_file, os.R_OK):
+            raise RuntimeError(
+                f"Launch bucket file is not readable: {stage.bucket_file}"
+            )
+        bucket_bytes = stage.bucket_file.stat().st_size
+        if bucket_bytes <= 0:
+            raise RuntimeError(f"Launch bucket file is empty: {stage.bucket_file}")
+        checked_bucket_files.append(
+            {
+                "bucket": stage.bucket,
+                "path": str(stage.bucket_file),
+                "bytes": bucket_bytes,
+                "examples": stage.example_count,
+                "steps": stage.steps,
+            }
+        )
+
+    probe = (
+        args.out_dir
+        / f".launch-preflight-write-test-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        probe.write_text("ok\n")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Launch output directory is not writable: {args.out_dir}"
+        ) from exc
+    finally:
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass
+
+    return {
+        "torchrun_bin": {
+            "requested": args.torchrun_bin,
+            "resolved": resolved_torchrun,
+        },
+        "hf_assets": hf_assets,
+        "bucket_files": checked_bucket_files,
+        "out_dir": str(args.out_dir),
     }
 
 
@@ -2938,7 +3294,9 @@ def main(argv: list[str] | None = None) -> None:
     download_hf_assets_if_requested(args)
 
     if not (args.dry_run or args.prepare_data_only):
-        runtime = validate_torchtitan_runtime()
+        hf_asset_preflight = validate_hf_asset_preflight(args)
+        print(json.dumps({"hf_asset_preflight": hf_asset_preflight}, indent=2))
+        runtime = validate_torchtitan_runtime(args)
         print(json.dumps({"torchtitan_runtime": runtime}, indent=2))
 
     verify_hf_logits_parity_if_requested(args)
@@ -2972,6 +3330,9 @@ def main(argv: list[str] | None = None) -> None:
     else:
         _write_resume_contract(args, plan, manifest)
     dataloader_resume_flags = dataloader_resume_flags_by_stage(plan, resume_state)
+    if not (args.dry_run or args.prepare_data_only):
+        launch_preflight = validate_launch_preflight(args, plan, manifest)
+        print(json.dumps({"launch_preflight": launch_preflight}, indent=2))
     _write_launcher_plan(
         args,
         plan,

@@ -239,6 +239,45 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         ):
             return train.materialize_training_buckets(args)
 
+    def _write_preflight_hf_assets(self, hf_assets: Path) -> None:
+        hf_assets.mkdir(parents=True, exist_ok=True)
+        (hf_assets / "config.json").write_text(
+            json.dumps({"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]})
+        )
+        (hf_assets / "tokenizer.json").write_text('{"version":"1.0"}')
+        (hf_assets / "tokenizer_config.json").write_text("{}")
+        (hf_assets / "model-00001-of-00001.safetensors").write_bytes(b"shard")
+        (hf_assets / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {"total_size": 5},
+                    "weight_map": {
+                        "model.embed_tokens.weight": (
+                            "model-00001-of-00001.safetensors"
+                        )
+                    },
+                }
+            )
+        )
+
+    def _model_assets_manifest(self, args) -> dict:
+        tokenizer_metadata = {
+            "hf_assets_path": str(args.hf_assets_path),
+            "tokenizer_json_sha256": train._hash_file(
+                args.hf_assets_path / "tokenizer.json"
+            ),
+            "tokenizer_config_sha256": train._hash_file(
+                args.hf_assets_path / "tokenizer_config.json"
+            ),
+        }
+        return {
+            "model_assets": train._model_asset_provenance(
+                model_id=args.model_id,
+                hf_assets_path=args.hf_assets_path,
+                tokenizer_metadata=tokenizer_metadata,
+            )
+        }
+
     def test_defaults_track_paper_hyperparameters_and_target_pod(self):
         args = train.parse_args([])
 
@@ -449,6 +488,72 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             ["orphan.safetensors"],
         )
         self.assertEqual(provenance["tokenizer"], tokenizer_metadata)
+
+    def test_hf_asset_preflight_requires_indexed_weight_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hf_assets = Path(tmp) / "hf"
+            self._write_preflight_hf_assets(hf_assets)
+            shard = hf_assets / "model-00001-of-00001.safetensors"
+            shard.unlink()
+            args = train.parse_args(["--hf-assets-path", str(hf_assets)])
+
+            with self.assertRaisesRegex(RuntimeError, "safetensors shard"):
+                train.validate_hf_asset_preflight(args)
+
+            shard.write_bytes(b"shard")
+            summary = train.validate_hf_asset_preflight(args)
+
+        self.assertEqual(summary["config_model_type"], "qwen2")
+        self.assertEqual(summary["safetensors"]["shard_count"], 1)
+        self.assertEqual(summary["safetensors"]["weight_map_entries"], 1)
+
+    def test_hf_asset_preflight_rejects_manifest_asset_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hf_assets = Path(tmp) / "hf"
+            self._write_preflight_hf_assets(hf_assets)
+            args = train.parse_args(["--hf-assets-path", str(hf_assets)])
+            manifest = self._model_assets_manifest(args)
+
+            summary = train.validate_hf_asset_preflight(args, manifest)
+            mismatched_manifest = json.loads(json.dumps(manifest))
+            mismatched_manifest["model_assets"]["model_id"] = "other/model"
+            with self.assertRaisesRegex(RuntimeError, "model_assets.model_id"):
+                train.validate_hf_asset_preflight(args, mismatched_manifest)
+
+            (hf_assets / "model-00001-of-00001.safetensors").write_bytes(
+                b"changed-length"
+            )
+            with self.assertRaisesRegex(RuntimeError, "byte size"):
+                train.validate_hf_asset_preflight(args, manifest)
+
+        self.assertEqual(summary["manifest_model_assets"]["file_count"], 5)
+
+    def test_cuda_launch_summary_requires_visible_device_per_rank(self):
+        class FakeCuda:
+            def __init__(self, count):
+                self.count = count
+
+            def is_available(self):
+                return self.count > 0
+
+            def device_count(self):
+                return self.count
+
+            def get_device_name(self, index):
+                return f"Fake GPU {index}"
+
+            def get_device_capability(self, index):
+                return (9, 0)
+
+        fake_torch = types.SimpleNamespace(cuda=FakeCuda(1))
+
+        with self.assertRaisesRegex(RuntimeError, "visible CUDA device"):
+            train._cuda_launch_summary(fake_torch, nproc_per_node=2)
+
+        summary = train._cuda_launch_summary(fake_torch, nproc_per_node=1)
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["device_count"], 1)
+        self.assertEqual(summary["devices"][0]["capability"], [9, 0])
 
     def test_dataset_artifact_metadata_records_selection_and_shard_hashes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1389,6 +1494,43 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("swehero", command)
         self.assertIn("--config", command)
         self.assertIn("qwen25_coder7b_direct_to_hero", command)
+
+    def test_launch_preflight_checks_executable_assets_and_bucket_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            hf_assets = Path(tmp) / "hf"
+            self._write_preflight_hf_assets(hf_assets)
+            bucket_file = out_dir / "data" / "bucket_256.jsonl"
+            bucket_file.parent.mkdir(parents=True)
+            bucket_file.write_text('{"input_ids":[1],"labels":[1]}\n')
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(out_dir),
+                    "--hf-assets-path",
+                    str(hf_assets),
+                    "--torchrun-bin",
+                    sys.executable,
+                ]
+            )
+            manifest = self._model_assets_manifest(args)
+            stage = train.BucketStage(
+                bucket=256,
+                cp_degree=1,
+                example_count=1,
+                steps=1,
+                cumulative_steps=1,
+                bucket_file=bucket_file,
+            )
+            plan = train.BucketPlan((stage,), total_steps=1, warmup_steps=0)
+
+            summary = train.validate_launch_preflight(args, plan, manifest)
+            bucket_file.unlink()
+            with self.assertRaisesRegex(RuntimeError, "bucket file"):
+                train.validate_launch_preflight(args, plan, manifest)
+
+        self.assertEqual(summary["torchrun_bin"]["resolved"], sys.executable)
+        self.assertEqual(summary["bucket_files"][0]["bucket"], 256)
 
     def test_hf_logits_parity_command_uses_paper_yarn_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
