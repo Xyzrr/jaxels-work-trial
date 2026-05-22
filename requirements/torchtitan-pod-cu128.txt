@@ -1,0 +1,19 @@
+# Canonical GPU pod runtime for the vendored TorchTitan SWE-HERO trainer.
+#
+# TorchTitan's source install requires a PyTorch nightly or a source build.
+# These are the exact CUDA 12.8 nightlies verified on the 8xH100 pod. Keep the
+# torch/torchao/torchdata versions pinned together; do not replace them with the
+# pod's pre-existing /workspace/venv packages.
+--extra-index-url https://download.pytorch.org/whl/nightly/cu128
+--extra-index-url https://download.pytorch.org/whl/nightly/cpu
+
+torch==2.12.0.dev20260408+cu128
+torchao==0.18.0.dev20260407+cu128
+torchdata==0.12.0.dev20260408+cpu
+
+# TorchTitan's own dependency contract for this vendored source tree.
+-r ../torchtitan/.ci/docker/requirements.txt
+
+# Required by our SWE-HERO materialization/smoke entrypoints.
+transformers>=4.51.0
+huggingface_hub

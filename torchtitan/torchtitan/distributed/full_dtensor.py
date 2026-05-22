@@ -15,22 +15,12 @@ TP, CP, and EP shardings are handled by ``Module.parallelize(parallel_dims)``
 using config-based ``ShardingConfig``.
 """
 
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-
-try:
-    from torch.distributed.fsdp import DataParallelMeshDims
-except ImportError:
-
-    class DataParallelMeshDims(NamedTuple):
-        """Compatibility shim for PyTorch builds without exported full-DTensor FSDP axes."""
-
-        shard: str | tuple[str, ...] | None = None
-        replicate: str | None = None
-
+from torch.distributed.fsdp import DataParallelMeshDims
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 

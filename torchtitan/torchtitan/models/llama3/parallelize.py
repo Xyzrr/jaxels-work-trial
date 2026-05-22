@@ -6,26 +6,15 @@
 
 # This file applies the PT-D parallelisms (except pipeline parallelism) and various
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
-from typing import NamedTuple
-
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
+    DataParallelMeshDims,
     fully_shard,
     MixedPrecisionPolicy,
 )
-
-try:
-    from torch.distributed.fsdp import DataParallelMeshDims
-except ImportError:
-
-    class DataParallelMeshDims(NamedTuple):
-        """Compatibility shim for PyTorch builds without exported full-DTensor FSDP axes."""
-
-        shard: str | tuple[str, ...] | None = None
-        replicate: str | None = None
 
 from torchtitan.config import (
     ActivationCheckpointConfig,

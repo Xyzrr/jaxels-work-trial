@@ -104,6 +104,13 @@ def _env_path(name: str, default: Path) -> Path:
     return default if raw is None else Path(raw)
 
 
+def _default_torchrun_bin() -> str:
+    candidate = Path(sys.executable).with_name("torchrun")
+    if candidate.exists():
+        return str(candidate)
+    return "torchrun"
+
+
 def parse_bucket_list(raw: str | Iterable[int]) -> tuple[int, ...]:
     if isinstance(raw, str):
         values = [int(part.strip()) for part in raw.split(",") if part.strip()]
@@ -465,7 +472,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--torchrun-bin",
-        default=os.environ.get("TORCHRUN_BIN", "torchrun"),
+        default=os.environ.get("TORCHRUN_BIN", _default_torchrun_bin()),
     )
     parser.add_argument(
         "--log-rank",
@@ -910,6 +917,39 @@ def download_hf_assets_if_requested(args: argparse.Namespace) -> None:
     subprocess.run(command, check=True)
 
 
+def validate_torchtitan_runtime() -> dict[str, str | None]:
+    try:
+        import torch
+        from torch.distributed.fsdp import DataParallelMeshDims
+    except ImportError as exc:
+        raise RuntimeError(
+            "The current Python environment does not satisfy the vendored "
+            "TorchTitan dependency contract. Create the canonical pod venv with "
+            "scripts/setup_torchtitan_pod_venv.sh and launch through "
+            "scripts/run_qwen_swehero_torchtitan_pod.sh."
+        ) from exc
+
+    try:
+        import torchao
+        from torchao.float8 import Float8LinearConfig
+
+        Float8LinearConfig.from_recipe_name("rowwise")
+    except Exception as exc:
+        raise RuntimeError(
+            "TorchAO float8 support is missing from the current Python "
+            "environment. Rebuild the canonical pod venv with "
+            "scripts/setup_torchtitan_pod_venv.sh."
+        ) from exc
+
+    return {
+        "python": sys.executable,
+        "torch": getattr(torch, "__version__", None),
+        "torch_cuda": getattr(torch.version, "cuda", None),
+        "torchao": getattr(torchao, "__version__", None),
+        "DataParallelMeshDims": repr(DataParallelMeshDims),
+    }
+
+
 def build_stage_env(
     args: argparse.Namespace,
     *,
@@ -1080,6 +1120,10 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     download_hf_assets_if_requested(args)
+
+    if not (args.dry_run or args.prepare_data_only):
+        runtime = validate_torchtitan_runtime()
+        print(json.dumps({"torchtitan_runtime": runtime}, indent=2))
 
     if args.skip_data_prep:
         manifest = _load_manifest(args.out_dir)

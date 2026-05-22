@@ -144,6 +144,18 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertIn("--config", command)
         self.assertIn("qwen25_coder7b_direct_to_hero", command)
 
+    def test_dataparallel_mesh_dims_must_come_from_torch(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        for relative_path in (
+            "torchtitan/torchtitan/distributed/full_dtensor.py",
+            "torchtitan/torchtitan/models/llama3/parallelize.py",
+        ):
+            source = (repo_root / relative_path).read_text()
+            self.assertIn("DataParallelMeshDims", source)
+            self.assertNotIn("class DataParallelMeshDims", source)
+            self.assertNotIn("Compatibility shim", source)
+            self.assertNotIn("except ImportError", source)
+
 
 if __name__ == "__main__":
     unittest.main()
