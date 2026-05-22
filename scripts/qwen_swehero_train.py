@@ -77,6 +77,7 @@ QWEN_YARN_BETA_FAST = 32.0
 QWEN_YARN_BETA_SLOW = 1.0
 MATERIALIZED_DATA_SCHEMA_VERSION = 1
 MODEL_ASSET_PROVENANCE_SCHEMA_VERSION = 1
+DATA_PROVENANCE_SCHEMA_VERSION = 1
 RUN_SPEC_SCHEMA_VERSION = 1
 RUN_SPEC_FILENAME = "run_spec.json"
 RUN_SPEC_SHA256_FILENAME = "run_spec.sha256"
@@ -550,12 +551,22 @@ def _jsonable(value: object) -> object:
     return value
 
 
-def _canonical_json_text(payload: Mapping[str, Any]) -> str:
+def _canonical_json_text(payload: Any) -> str:
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_json(payload: Any) -> str:
+    text = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return _sha256_text(text)
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -590,6 +601,7 @@ def _resume_manifest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "source_dataset_id": manifest.get("source_dataset_id"),
         "source_dataset_revision": manifest.get("source_dataset_revision"),
         "model_assets": manifest.get("model_assets"),
+        "data_provenance": manifest.get("data_provenance"),
         "tokenizer": tokenizer_contract,
         "pad_token_id": manifest.get("pad_token_id"),
         "max_length": manifest.get("max_length"),
@@ -1205,12 +1217,31 @@ def _dataset_artifact_metadata(dataset_path: Path) -> dict[str, Any]:
 
     return {
         "path": str(dataset_path),
+        "realpath": str(dataset_path.resolve()),
         "metadata": metadata,
+        "metadata_json": {
+            "path": str(metadata_path),
+            "exists": metadata_path.exists(),
+            "bytes": metadata_path.stat().st_size if metadata_path.exists() else 0,
+            "sha256": _hash_file(metadata_path),
+        },
         "metadata_json_sha256": _hash_file(metadata_path),
+        "selection_manifest": {
+            "path": str(selection_manifest_path),
+            "exists": selection_manifest_path.exists(),
+            "bytes": selection_manifest_path.stat().st_size
+            if selection_manifest_path.exists()
+            else 0,
+            "sha256": _hash_file(selection_manifest_path),
+        },
         "selection_manifest_sha256": _hash_file(selection_manifest_path),
+        "data_file_count": len(data_files),
         "data_files": [
             {
                 "path": str(path),
+                "relative_path": path.name
+                if dataset_path.is_file()
+                else path.relative_to(dataset_path).as_posix(),
                 "bytes": path.stat().st_size,
                 "sha256": _hash_file(path),
             }
@@ -1796,6 +1827,289 @@ def _resolve_bucket_file_for_validation(
     return path_overrides.get(str(path), path)
 
 
+def _id_list_record(source_ids: Iterable[str]) -> dict[str, Any]:
+    values = list(source_ids)
+    return {
+        "count": len(values),
+        "sha256": _sha256_json(values),
+        "source_ids": values,
+    }
+
+
+def _numeric_summary(values: Iterable[int]) -> dict[str, int | None]:
+    items = list(values)
+    if not items:
+        return {"min": None, "max": None, "sum": 0}
+    return {"min": min(items), "max": max(items), "sum": sum(items)}
+
+
+def _build_data_provenance(
+    args: argparse.Namespace,
+    *,
+    buckets: tuple[int, ...],
+    bucket_paths: Mapping[int, Path],
+    bucket_file_integrity: Mapping[str, Mapping[str, Any]],
+    bucket_counts: Mapping[int, int],
+    dataset_artifact: Mapping[str, Any],
+    source_dataset_revision: Mapping[str, Any],
+    streamed_source_ids: list[str],
+    included_source_ids: list[str],
+    skipped_source_ids_by_reason: Mapping[str, list[str]],
+    bucket_source_ids: Mapping[int, list[str]],
+    bucket_lengths: Mapping[int, list[int]],
+    bucket_trainable_tokens: Mapping[int, list[int]],
+    bucket_length_histograms: Mapping[int, Counter[int]],
+) -> dict[str, Any]:
+    skipped_by_reason = {
+        reason: _id_list_record(ids)
+        for reason, ids in sorted(skipped_source_ids_by_reason.items())
+    }
+    return {
+        "schema_version": DATA_PROVENANCE_SCHEMA_VERSION,
+        "dataset": {
+            "dataset_id": args.dataset_id,
+            "dataset_path": str(args.dataset_path),
+            "dataset_artifact": dict(dataset_artifact),
+            "source_dataset_id": args.source_dataset_id,
+            "source_dataset_revision": dict(source_dataset_revision),
+        },
+        "materialization": {
+            "num_examples_requested": args.num_examples,
+            "max_streamed_examples": args.max_streamed_examples,
+            "shuffle_buffer": args.shuffle_buffer,
+            "seed": args.seed,
+            "max_length": args.max_length,
+            "long_example_policy": args.long_example_policy,
+            "min_trainable_tokens": args.min_trainable_tokens,
+            "include_model_patch": args.include_model_patch,
+            "buckets": list(buckets),
+        },
+        "record_schema": {
+            "format": "jsonl",
+            "fields": ["input_ids", "labels", "length", "bucket", "source_id"],
+            "label_ignore_index": IGNORE_INDEX,
+            "source_id_priority": [
+                "instance_id",
+                "problem_statement_id",
+                "task_id",
+                "id",
+                "stream_row_<n>",
+            ],
+        },
+        "streamed": _id_list_record(streamed_source_ids),
+        "included": _id_list_record(included_source_ids),
+        "skipped": {
+            "total": sum(len(ids) for ids in skipped_source_ids_by_reason.values()),
+            "counts": {
+                reason: len(record["source_ids"])
+                for reason, record in skipped_by_reason.items()
+            },
+            "by_reason": skipped_by_reason,
+        },
+        "buckets": {
+            str(bucket): {
+                "sequence_length": bucket,
+                "bucket_file": str(bucket_paths[bucket]),
+                "record_count": int(bucket_counts[bucket]),
+                "integrity": dict(bucket_file_integrity[str(bucket)]),
+                "source_ids": _id_list_record(bucket_source_ids[bucket]),
+                "length": _numeric_summary(bucket_lengths[bucket]),
+                "trainable_tokens": _numeric_summary(bucket_trainable_tokens[bucket]),
+                "length_histogram_rounded_to_1024": {
+                    str(length): count
+                    for length, count in sorted(bucket_length_histograms[bucket].items())
+                },
+            }
+            for bucket in buckets
+        },
+    }
+
+
+def _validate_id_list_record(record: Any, label: str) -> list[str]:
+    if not isinstance(record, Mapping):
+        raise RuntimeError(f"{label} must be an object")
+    source_ids = record.get("source_ids")
+    if not isinstance(source_ids, list) or not all(
+        isinstance(source_id, str) for source_id in source_ids
+    ):
+        raise RuntimeError(f"{label}.source_ids must be a list of strings")
+    if int(record.get("count", -1)) != len(source_ids):
+        raise RuntimeError(
+            f"{label}.count does not match source_ids length: "
+            f"{record.get('count')!r} != {len(source_ids)}"
+        )
+    if record.get("sha256") != _sha256_json(source_ids):
+        raise RuntimeError(f"{label}.sha256 does not match source_ids")
+    return source_ids
+
+
+def _validate_data_provenance(
+    manifest: Mapping[str, Any],
+    *,
+    bucket_files: Mapping[str, Any],
+    bucket_counts: Mapping[str, Any],
+    bucket_integrity: Mapping[str, Any],
+) -> None:
+    data_provenance = manifest.get("data_provenance")
+    if not isinstance(data_provenance, Mapping):
+        raise RuntimeError(
+            "Materialized data manifest is missing complete data_provenance"
+        )
+    if data_provenance.get("schema_version") != DATA_PROVENANCE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported data provenance schema version: "
+            f"{data_provenance.get('schema_version')!r}; expected "
+            f"{DATA_PROVENANCE_SCHEMA_VERSION}"
+        )
+
+    materialization = data_provenance.get("materialization")
+    if not isinstance(materialization, Mapping):
+        raise RuntimeError("data_provenance.materialization must be an object")
+    expected_materialization = {
+        "max_length": manifest.get("max_length"),
+        "long_example_policy": manifest.get("long_example_policy"),
+        "include_model_patch": manifest.get("include_model_patch"),
+        "buckets": manifest.get("buckets"),
+    }
+    for key, expected in expected_materialization.items():
+        if materialization.get(key) != expected:
+            raise RuntimeError(
+                f"data_provenance.materialization.{key} does not match manifest: "
+                f"{materialization.get(key)!r} != {expected!r}"
+            )
+    dataset = data_provenance.get("dataset")
+    if not isinstance(dataset, Mapping):
+        raise RuntimeError("data_provenance.dataset must be an object")
+    expected_dataset = {
+        "dataset_id": manifest.get("dataset_id"),
+        "dataset_path": manifest.get("dataset_path"),
+        "dataset_artifact": manifest.get("dataset_artifact"),
+        "source_dataset_id": manifest.get("source_dataset_id"),
+        "source_dataset_revision": manifest.get("source_dataset_revision"),
+    }
+    for key, expected in expected_dataset.items():
+        if dataset.get(key) != expected:
+            raise RuntimeError(
+                f"data_provenance.dataset.{key} does not match manifest"
+            )
+
+    streamed_source_ids = _validate_id_list_record(
+        data_provenance.get("streamed"),
+        "data_provenance.streamed",
+    )
+    if int(manifest.get("streamed_examples_scanned", -1)) != len(streamed_source_ids):
+        raise RuntimeError(
+            "data_provenance.streamed count does not match "
+            f"streamed_examples_scanned: {len(streamed_source_ids)} != "
+            f"{manifest.get('streamed_examples_scanned')!r}"
+        )
+
+    included_source_ids = _validate_id_list_record(
+        data_provenance.get("included"),
+        "data_provenance.included",
+    )
+    if int(manifest.get("num_usable_examples", -1)) != len(included_source_ids):
+        raise RuntimeError(
+            "data_provenance.included count does not match num_usable_examples: "
+            f"{len(included_source_ids)} != {manifest.get('num_usable_examples')!r}"
+        )
+
+    skipped = data_provenance.get("skipped")
+    if not isinstance(skipped, Mapping):
+        raise RuntimeError("data_provenance.skipped must be an object")
+    by_reason = skipped.get("by_reason")
+    if not isinstance(by_reason, Mapping):
+        raise RuntimeError("data_provenance.skipped.by_reason must be an object")
+    skipped_counts: dict[str, int] = {}
+    for reason, record in by_reason.items():
+        skipped_counts[str(reason)] = len(
+            _validate_id_list_record(
+                record,
+                f"data_provenance.skipped.by_reason.{reason}",
+            )
+        )
+    if skipped_counts != {
+        str(reason): int(count)
+        for reason, count in manifest.get("skipped", {}).items()
+    }:
+        raise RuntimeError(
+            "data_provenance skipped counts do not match manifest skipped counts: "
+            f"{skipped_counts!r} != {manifest.get('skipped', {})!r}"
+        )
+    if int(skipped.get("total", -1)) != sum(skipped_counts.values()):
+        raise RuntimeError(
+            "data_provenance.skipped.total does not match skipped reason counts"
+        )
+
+    provenance_buckets = data_provenance.get("buckets")
+    if not isinstance(provenance_buckets, Mapping):
+        raise RuntimeError("data_provenance.buckets must be an object")
+    if set(str(bucket) for bucket in provenance_buckets) != set(bucket_files):
+        raise RuntimeError(
+            "data_provenance.buckets does not match manifest bucket_files"
+        )
+
+    bucket_source_ids = []
+    aggregate_length_histogram: Counter[str] = Counter()
+    for bucket, bucket_file in bucket_files.items():
+        bucket_record = provenance_buckets[str(bucket)]
+        if not isinstance(bucket_record, Mapping):
+            raise RuntimeError(f"data_provenance.buckets[{bucket!r}] must be an object")
+        if bucket_record.get("bucket_file") != bucket_file:
+            raise RuntimeError(
+                f"data_provenance bucket {bucket} file does not match manifest"
+            )
+        if int(bucket_record.get("record_count", -1)) != int(bucket_counts[str(bucket)]):
+            raise RuntimeError(
+                f"data_provenance bucket {bucket} count does not match manifest"
+            )
+        if bucket_record.get("integrity") != bucket_integrity[str(bucket)]:
+            raise RuntimeError(
+                f"data_provenance bucket {bucket} integrity does not match manifest"
+            )
+        source_ids = _validate_id_list_record(
+            bucket_record.get("source_ids"),
+            f"data_provenance.buckets.{bucket}.source_ids",
+        )
+        if len(source_ids) != int(bucket_counts[str(bucket)]):
+            raise RuntimeError(
+                f"data_provenance bucket {bucket} source_id count does not match "
+                "bucket count"
+            )
+        bucket_source_ids.extend(source_ids)
+        histogram = bucket_record.get("length_histogram_rounded_to_1024")
+        if not isinstance(histogram, Mapping):
+            raise RuntimeError(
+                f"data_provenance bucket {bucket} length histogram must be an object"
+            )
+        if sum(int(count) for count in histogram.values()) != int(
+            bucket_counts[str(bucket)]
+        ):
+            raise RuntimeError(
+                f"data_provenance bucket {bucket} length histogram does not sum "
+                "to bucket count"
+            )
+        aggregate_length_histogram.update(
+            {str(length): int(count) for length, count in histogram.items()}
+        )
+
+    if Counter(bucket_source_ids) != Counter(included_source_ids):
+        raise RuntimeError(
+            "data_provenance bucket source IDs do not match included source IDs"
+        )
+    expected_histogram = {
+        str(length): int(count)
+        for length, count in manifest.get(
+            "length_histogram_rounded_to_1024", {}
+        ).items()
+    }
+    if dict(aggregate_length_histogram) != expected_histogram:
+        raise RuntimeError(
+            "data_provenance bucket length histograms do not match manifest "
+            "length_histogram_rounded_to_1024"
+        )
+
+
 def validate_materialized_data_manifest(
     manifest: Mapping[str, Any],
     *,
@@ -1875,6 +2189,12 @@ def validate_materialized_data_manifest(
             f"bucket_files: integrity={sorted(integrity_buckets)} "
             f"bucket_files={sorted(manifest_buckets)}"
         )
+    _validate_data_provenance(
+        manifest,
+        bucket_files=bucket_files,
+        bucket_counts=bucket_counts,
+        bucket_integrity=bucket_integrity,
+    )
 
     total_records = 0
     for bucket, raw_path in bucket_files.items():
@@ -1981,6 +2301,15 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     }
     bucket_counts: Counter[int] = Counter()
     skipped: Counter[str] = Counter()
+    streamed_source_ids: list[str] = []
+    included_source_ids: list[str] = []
+    skipped_source_ids_by_reason: dict[str, list[str]] = {}
+    bucket_source_ids: dict[int, list[str]] = {bucket: [] for bucket in buckets}
+    bucket_lengths: dict[int, list[int]] = {bucket: [] for bucket in buckets}
+    bucket_trainable_tokens: dict[int, list[int]] = {bucket: [] for bucket in buckets}
+    bucket_length_histograms: dict[int, Counter[int]] = {
+        bucket: Counter() for bucket in buckets
+    }
     long_examples_sample: list[dict[str, Any]] = []
     length_histogram: Counter[int] = Counter()
     streamed_examples = 0
@@ -1993,6 +2322,7 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
         for example in raw:
             streamed_examples += 1
             source_id = _example_id(example, streamed_examples)
+            streamed_source_ids.append(source_id)
             try:
                 encoded = encode_swehero_example(
                     tokenizer,
@@ -2003,6 +2333,9 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                 )
             except LongExampleError as exc:
                 skipped["too_long_for_max_length"] += 1
+                skipped_source_ids_by_reason.setdefault(
+                    "too_long_for_max_length", []
+                ).append(source_id)
                 long_example = {
                     "source_id": source_id,
                     "token_count": exc.token_count,
@@ -2021,11 +2354,17 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             if encoded is None:
                 skipped["not_enough_trainable_tokens"] += 1
+                skipped_source_ids_by_reason.setdefault(
+                    "not_enough_trainable_tokens", []
+                ).append(source_id)
             else:
                 try:
                     bucket = choose_bucket(encoded["length"], buckets)
                 except ValueError:
                     skipped["too_long_for_largest_bucket"] += 1
+                    skipped_source_ids_by_reason.setdefault(
+                        "too_long_for_largest_bucket", []
+                    ).append(source_id)
                 else:
                     record = {
                         **encoded,
@@ -2034,8 +2373,16 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                     }
                     handles[bucket].write(json.dumps(record) + "\n")
                     bucket_counts[bucket] += 1
+                    included_source_ids.append(source_id)
+                    bucket_source_ids[bucket].append(source_id)
+                    bucket_lengths[bucket].append(int(encoded["length"]))
+                    trainable_tokens = sum(
+                        label != IGNORE_INDEX for label in encoded["labels"]
+                    )
+                    bucket_trainable_tokens[bucket].append(trainable_tokens)
                     rounded_length = int(math.ceil(encoded["length"] / 1024) * 1024)
                     length_histogram[rounded_length] += 1
+                    bucket_length_histograms[bucket][rounded_length] += 1
                     usable_examples += 1
 
             if args.num_examples > 0 and usable_examples >= args.num_examples:
@@ -2061,23 +2408,42 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
             for bucket in buckets
         }
         tokenizer_metadata = _tokenizer_metadata(tokenizer, args.hf_assets_path)
+        dataset_artifact = _dataset_artifact_metadata(args.dataset_path)
+        source_dataset_revision = _dataset_revision_info(
+            args.source_dataset_id, args.source_dataset_revision
+        )
+        data_provenance = _build_data_provenance(
+            args,
+            buckets=buckets,
+            bucket_paths=bucket_paths,
+            bucket_file_integrity=bucket_file_integrity,
+            bucket_counts=bucket_counts,
+            dataset_artifact=dataset_artifact,
+            source_dataset_revision=source_dataset_revision,
+            streamed_source_ids=streamed_source_ids,
+            included_source_ids=included_source_ids,
+            skipped_source_ids_by_reason=skipped_source_ids_by_reason,
+            bucket_source_ids=bucket_source_ids,
+            bucket_lengths=bucket_lengths,
+            bucket_trainable_tokens=bucket_trainable_tokens,
+            bucket_length_histograms=bucket_length_histograms,
+        )
         manifest = {
             "materialized_data_schema_version": MATERIALIZED_DATA_SCHEMA_VERSION,
             "created_at_unix": time.time(),
             "model_id": args.model_id,
             "dataset_id": args.dataset_id,
             "dataset_path": str(args.dataset_path),
-            "dataset_artifact": _dataset_artifact_metadata(args.dataset_path),
+            "dataset_artifact": dataset_artifact,
             "source_dataset_id": args.source_dataset_id,
-            "source_dataset_revision": _dataset_revision_info(
-                args.source_dataset_id, args.source_dataset_revision
-            ),
+            "source_dataset_revision": source_dataset_revision,
             "paper_alignment": paper_alignment(args),
             "model_assets": _model_asset_provenance(
                 model_id=args.model_id,
                 hf_assets_path=args.hf_assets_path,
                 tokenizer_metadata=tokenizer_metadata,
             ),
+            "data_provenance": data_provenance,
             "tokenizer": tokenizer_metadata,
             "pad_token_id": pad_token_id,
             "max_length": args.max_length,

@@ -450,6 +450,43 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         )
         self.assertEqual(provenance["tokenizer"], tokenizer_metadata)
 
+    def test_dataset_artifact_metadata_records_selection_and_shard_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp) / "dataset"
+            data_dir = dataset / "data"
+            data_dir.mkdir(parents=True)
+            metadata = {"rows": 2, "source_revision": "abc123"}
+            (dataset / "metadata.json").write_text(json.dumps(metadata))
+            (dataset / "selection_manifest.jsonl").write_text(
+                '{"instance_id":"one"}\n{"instance_id":"two"}\n'
+            )
+            shard = data_dir / "train-00000-of-00001.parquet"
+            shard.write_bytes(b"parquet bytes")
+
+            artifact = train._dataset_artifact_metadata(dataset)
+
+        self.assertEqual(artifact["path"], str(dataset))
+        self.assertEqual(artifact["metadata"], metadata)
+        self.assertEqual(
+            artifact["metadata_json"]["sha256"],
+            artifact["metadata_json_sha256"],
+        )
+        self.assertEqual(
+            artifact["selection_manifest"]["sha256"],
+            artifact["selection_manifest_sha256"],
+        )
+        self.assertEqual(artifact["data_file_count"], 1)
+        self.assertEqual(
+            artifact["data_files"][0]["relative_path"],
+            shard.relative_to(dataset).as_posix(),
+        )
+        self.assertEqual(artifact["data_files"][0]["bytes"], len(b"parquet bytes"))
+        self.assertEqual(
+            artifact["data_files"][0]["sha256"],
+            train._sha256_text("parquet bytes"),
+        )
+        self.assertEqual(artifact["total_data_bytes"], len(b"parquet bytes"))
+
     def test_cos_sin_yarn_uses_huggingface_correction_range_order(self):
         repo_root = Path(__file__).resolve().parents[1]
         source = (repo_root / "torchtitan/torchtitan/models/common/rope.py").read_text()
@@ -932,6 +969,31 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(manifest["skipped"]["too_long_for_max_length"], 1)
         self.assertEqual(manifest["long_examples_sample"][0]["source_id"], "too-long")
         self.assertEqual(manifest["num_usable_examples"], 1)
+        data_provenance = manifest["data_provenance"]
+        self.assertEqual(
+            data_provenance["schema_version"],
+            train.DATA_PROVENANCE_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            data_provenance["materialization"]["long_example_policy"],
+            "skip",
+        )
+        self.assertEqual(
+            data_provenance["streamed"]["source_ids"],
+            ["too-long", "short"],
+        )
+        self.assertEqual(data_provenance["included"]["source_ids"], ["short"])
+        self.assertEqual(
+            data_provenance["skipped"]["by_reason"]["too_long_for_max_length"][
+                "source_ids"
+            ],
+            ["too-long"],
+        )
+        self.assertEqual(
+            data_provenance["buckets"]["256"]["source_ids"]["source_ids"],
+            ["short"],
+        )
+        self.assertEqual(data_provenance["buckets"]["256"]["record_count"], 1)
 
     def test_materialization_writes_self_verifying_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -973,6 +1035,18 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION,
             )
             self.assertEqual(manifest["model_assets"]["file_count"], 1)
+            self.assertEqual(
+                manifest["data_provenance"]["schema_version"],
+                train.DATA_PROVENANCE_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                manifest["data_provenance"]["included"]["source_ids"],
+                ["short"],
+            )
+            self.assertEqual(
+                manifest["data_provenance"]["buckets"]["256"]["integrity"],
+                manifest["bucket_file_integrity"]["256"],
+            )
             integrity = manifest["bucket_file_integrity"]["256"]
             bucket_path = Path(manifest["bucket_files"]["256"])
             self.assertEqual(integrity["records"], 1)
@@ -1010,6 +1084,40 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(RuntimeError, "model_assets provenance"):
+                train._load_manifest(args.out_dir)
+
+    def test_load_manifest_rejects_inconsistent_data_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train.parse_args(
+                [
+                    "--out-dir",
+                    str(Path(tmp) / "run"),
+                    "--dataset-path",
+                    str(Path(tmp) / "dataset"),
+                    "--hf-assets-path",
+                    str(Path(tmp) / "hf"),
+                    "--buckets",
+                    "256",
+                    "--max-length",
+                    "256",
+                    "--num-examples",
+                    "1",
+                ]
+            )
+            example = {
+                "instance_id": "short",
+                "trajectory": [
+                    {"role": "user", "content": "issue"},
+                    {"role": "assistant", "content": "OK"},
+                ],
+            }
+            manifest = self._materialize_with_fake_runtime(args, [example])
+            manifest["data_provenance"]["included"]["source_ids"] = ["other"]
+            (args.out_dir / "data" / "manifest.json").write_text(
+                json.dumps(manifest, indent=2)
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "included.sha256"):
                 train._load_manifest(args.out_dir)
 
     def test_main_writes_run_spec_for_dry_run_launch(self):
@@ -1072,6 +1180,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
 
         self.assertEqual(run_spec["args"]["max_length"], 256)
         self.assertEqual(run_spec["plan"]["total_steps"], 1)
+        self.assertEqual(
+            run_spec["manifest"]["data_provenance"]["included"]["source_ids"],
+            ["short"],
+        )
         self.assertEqual(
             launcher_plan["run_spec"],
             str(out_dir / train.RUN_SPEC_FILENAME),
