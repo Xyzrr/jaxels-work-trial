@@ -23,6 +23,7 @@ spec:
           missing_packages=()
           command -v tmux >/dev/null 2>&1 || missing_packages+=(tmux)
           command -v git >/dev/null 2>&1 || missing_packages+=(git)
+          command -v ssh >/dev/null 2>&1 || missing_packages+=(openssh-client)
           command -v cc >/dev/null 2>&1 || missing_packages+=(build-essential)
           command -v lspci >/dev/null 2>&1 || missing_packages+=(pciutils)
           if ((${#missing_packages[@]})); then

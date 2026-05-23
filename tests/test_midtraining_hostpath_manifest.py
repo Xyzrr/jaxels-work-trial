@@ -19,6 +19,10 @@ class MidtrainingHostpathManifestTests(unittest.TestCase):
             manifest,
         )
         self.assertIn(
+            "command -v ssh >/dev/null 2>&1 || missing_packages+=(openssh-client)",
+            manifest,
+        )
+        self.assertIn(
             "command -v cc >/dev/null 2>&1 || missing_packages+=(build-essential)",
             manifest,
         )
