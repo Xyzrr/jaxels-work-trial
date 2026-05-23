@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,10 @@ DEFAULT_TOKENIZER_PATH = (
     / "tmp"
     / "hf"
     / "Qwen2.5-Coder-7B-Instruct-tokenizer-only"
+)
+TRACE_SERIALIZER = (
+    "Qwen2.5 ChatML over OpenHands messages; same segments as "
+    "scripts.qwen_swehero_train.encode_swehero_example"
 )
 
 
@@ -66,6 +71,13 @@ class RefreshSummary:
     excluded_tasks_without_fit: int
     final_selected_rows: int
     source_rows_scanned_for_replacements: int
+
+
+@dataclass(frozen=True)
+class CurrentArtifactStatus:
+    is_current: bool
+    reasons: tuple[str, ...]
+    summary: RefreshSummary | None = None
 
 
 class QwenTokenizerAdapter:
@@ -329,6 +341,147 @@ def hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}")
+    return payload
+
+
+def context_filter_contract(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "max_shifted_context": args.max_shifted_context,
+        "max_token_count": args.max_shifted_context + 1,
+        "include_model_patch": args.include_model_patch,
+        "tokenizer_json_sha256": hash_file(args.tokenizer_path / "tokenizer.json"),
+        "tokenizer_config_sha256": hash_file(
+            args.tokenizer_path / "tokenizer_config.json"
+        ),
+        "trace_serializer": TRACE_SERIALIZER,
+    }
+
+
+def _summary_from_counts(counts: Mapping[str, Any]) -> RefreshSummary | None:
+    values: dict[str, int] = {}
+    for field in RefreshSummary.__dataclass_fields__:
+        value = counts.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        if value < 0:
+            return None
+        values[field] = value
+    return RefreshSummary(**values)
+
+
+def _is_same_path(left: Path, right: Path) -> bool:
+    return left.resolve() == right.resolve()
+
+
+def current_artifact_status(
+    dataset_path: Path,
+    args: argparse.Namespace,
+    *,
+    context_filter: Mapping[str, Any],
+) -> CurrentArtifactStatus:
+    reasons: list[str] = []
+    metadata_path = dataset_path / "metadata.json"
+    report_path = dataset_path / "context_filter_report.json"
+    manifest_path = dataset_path / "selection_manifest.jsonl"
+    data_dir = dataset_path / "data"
+
+    if not metadata_path.is_file():
+        reasons.append("missing metadata.json")
+    if not report_path.is_file():
+        reasons.append("missing context_filter_report.json")
+    if not manifest_path.is_file():
+        reasons.append("missing selection_manifest.jsonl")
+    if not data_dir.is_dir() or not any(data_dir.glob("*.parquet")):
+        reasons.append("missing parquet shards")
+    if reasons:
+        return CurrentArtifactStatus(False, tuple(reasons))
+
+    try:
+        metadata = read_json(metadata_path)
+        report = read_json(report_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return CurrentArtifactStatus(False, (f"unreadable refresh metadata: {exc}",))
+
+    if metadata.get("dataset_id") != args.dataset_id:
+        reasons.append("dataset_id changed")
+    if metadata.get("source_revision") != args.revision:
+        reasons.append("source revision changed")
+    source_files = metadata.get("source_files")
+    if (
+        not isinstance(source_files, list)
+        or not source_files
+        or not all(isinstance(item, str) and item for item in source_files)
+    ):
+        reasons.append("missing source file manifest")
+
+    expected_filters = {
+        "exactly_one_tool_call_per_assistant_turn": True,
+        "max_assistant_turns": args.max_assistant_turns,
+        "max_str_replace_editor_errors": args.max_str_replace_editor_errors,
+        "non_null_model_patch": True,
+    }
+    if metadata.get("paper_reproducible_filters") != expected_filters:
+        reasons.append("public filter settings changed")
+
+    stored_context = metadata.get("context_filter")
+    if not isinstance(stored_context, Mapping):
+        reasons.append("missing context_filter metadata")
+    else:
+        for key, expected_value in context_filter.items():
+            if stored_context.get(key) != expected_value:
+                reasons.append(f"context_filter.{key} changed")
+
+    counts = metadata.get("counts")
+    if not isinstance(counts, Mapping):
+        reasons.append("missing count summary")
+        summary = None
+    else:
+        summary = _summary_from_counts(counts)
+        if summary is None:
+            reasons.append("invalid count summary")
+
+    report_summary = report.get("summary")
+    if isinstance(counts, Mapping) and report_summary != dict(counts):
+        reasons.append("context report summary disagrees with metadata counts")
+
+    if summary is not None:
+        if summary.final_selected_rows <= 0:
+            reasons.append("empty final dataset")
+        manifest_rows = 0
+        with manifest_path.open() as handle:
+            for manifest_rows, _line in enumerate(handle, start=1):
+                pass
+        if manifest_rows != summary.final_selected_rows:
+            reasons.append("selection manifest row count disagrees with metadata")
+
+    max_final = report.get("max_final_shifted_input_length")
+    if isinstance(max_final, bool) or not isinstance(max_final, int):
+        reasons.append("missing final context maximum")
+    elif max_final > args.max_shifted_context:
+        reasons.append("final context maximum exceeds requested cap")
+
+    replaced = report.get("replaced")
+    excluded = report.get("excluded")
+    if summary is not None:
+        if not isinstance(replaced, list) or len(replaced) != summary.replacement_rows:
+            reasons.append("replacement report count disagrees with metadata")
+        if (
+            not isinstance(excluded, list)
+            or len(excluded) != summary.excluded_tasks_without_fit
+        ):
+            reasons.append("exclusion report count disagrees with metadata")
+
+    return CurrentArtifactStatus(
+        not reasons,
+        tuple(reasons),
+        summary if not reasons else None,
+    )
+
+
 def write_readme(path: Path, metadata: dict[str, Any]) -> None:
     context_filter = metadata["context_filter"]
     counts = metadata["counts"]
@@ -446,7 +599,11 @@ def write_dataset(
         raise
 
 
-def refresh_dataset(args: argparse.Namespace) -> RefreshSummary:
+def _refresh_dataset_exact(
+    args: argparse.Namespace,
+    *,
+    context_filter: Mapping[str, Any],
+) -> RefreshSummary:
     started_at = time.time()
     tokenizer = QwenTokenizerAdapter(args.tokenizer_path)
 
@@ -575,18 +732,8 @@ def refresh_dataset(args: argparse.Namespace) -> RefreshSummary:
             "model_patch_must_not_touch_test_patch_files": prep.TEST_PATCH_FILTER_CAVEAT,
         },
         "context_filter": {
-            "max_shifted_context": args.max_shifted_context,
-            "max_token_count": args.max_shifted_context + 1,
-            "include_model_patch": args.include_model_patch,
+            **dict(context_filter),
             "tokenizer_path": str(args.tokenizer_path),
-            "tokenizer_json_sha256": hash_file(args.tokenizer_path / "tokenizer.json"),
-            "tokenizer_config_sha256": hash_file(
-                args.tokenizer_path / "tokenizer_config.json"
-            ),
-            "trace_serializer": (
-                "Qwen2.5 ChatML over OpenHands messages; same segments as "
-                "scripts.qwen_swehero_train.encode_swehero_example"
-            ),
         },
         "base_dataset_path": str(args.dataset_path),
         "counts": asdict(summary),
@@ -613,6 +760,31 @@ def refresh_dataset(args: argparse.Namespace) -> RefreshSummary:
         overwrite=args.overwrite,
     )
     return summary
+
+
+def refresh_dataset(args: argparse.Namespace) -> RefreshSummary:
+    context_filter = context_filter_contract(args)
+    if _is_same_path(args.dataset_path, args.output_dir):
+        status = current_artifact_status(
+            args.dataset_path,
+            args,
+            context_filter=context_filter,
+        )
+        if status.is_current and status.summary is not None:
+            print(
+                f"{args.dataset_path} already matches requested context refresh; "
+                "leaving artifact unchanged",
+                file=sys.stderr,
+            )
+            return status.summary
+        if status.reasons:
+            print(
+                "refresh artifact metadata is not current; running exact refresh: "
+                + "; ".join(status.reasons),
+                file=sys.stderr,
+            )
+
+    return _refresh_dataset_exact(args, context_filter=context_filter)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -647,7 +819,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     summary = refresh_dataset(args)
     print(json.dumps(asdict(summary), indent=2, sort_keys=True))
-    print(f"wrote {args.output_dir}")
+    print(f"artifact ready at {args.output_dir}")
     return 0
 
 
