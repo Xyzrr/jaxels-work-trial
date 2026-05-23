@@ -16,7 +16,28 @@ spec:
     - name: trainer
       image: nvidia/cuda:12.8.0-base-ubuntu22.04
       imagePullPolicy: IfNotPresent
-      command: ["bash", "-lc", "sleep infinity"]
+      command:
+        - bash
+        - -lc
+        - |
+          missing_packages=()
+          command -v tmux >/dev/null 2>&1 || missing_packages+=(tmux)
+          command -v git >/dev/null 2>&1 || missing_packages+=(git)
+          command -v ssh >/dev/null 2>&1 || missing_packages+=(openssh-client)
+          command -v cc >/dev/null 2>&1 || missing_packages+=(build-essential)
+          command -v lspci >/dev/null 2>&1 || missing_packages+=(pciutils)
+          if ((${#missing_packages[@]})); then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends "${missing_packages[@]}"
+            rm -rf /var/lib/apt/lists/*
+          fi
+          export UV_CACHE_DIR=/workspace/.cache/uv
+          export UV_PYTHON_INSTALL_DIR=/workspace/python
+          /workspace/uv/uv-0.11.16/uv python install 3.10.12 \
+            --install-dir /workspace/python \
+            --no-bin
+          sleep infinity
       resources:
         limits:
           nvidia.com/gpu: 8
@@ -31,5 +52,5 @@ spec:
   volumes:
     - name: workspace
       hostPath:
-        path: /home/johnkey/midtraining
-        type: DirectoryOrCreate
+        path: /workspace
+        type: Directory

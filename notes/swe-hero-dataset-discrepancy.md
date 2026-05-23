@@ -146,6 +146,38 @@ Implemented local preparation workflow:
 The script applies the paper filters observable from public columns and records
 the missing `test_patch`-overlap filter caveat in the generated `metadata.json`.
 
+Implemented context-capped training artifact:
+
+- Script: `scripts/refresh_swehero_context_capped_one_rollout.py`
+- Default input/output: `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`
+- Tokenization contract: Qwen2.5-Coder ChatML over OpenHands messages, matching `scripts/qwen_swehero_train.py`; model patches are not appended by default.
+- Context cap: shifted input length must be `<= 131,072` tokens, equivalent to the 128k paper training context.
+- Selection rule for over-context rows: among same-task rollouts that pass the same public-column filters and fit the context cap, choose the lowest `str_replace_editor` error count, then lowest assistant turn count, then earliest source row index.
+- Output shape from the 2026-05-22 refresh: 12,617 selected rows. The raw artifact had 39 over-context selected rows; 23 were replaced with fitting same-task rollouts and 16 tasks were excluded because no accepted same-task rollout fit the context cap.
+- Verification from a streaming recomputation over the final Parquet shards: 12,617 rows, 12,617 unique `instance_id` values, zero rows over context, max shifted input length 130,126, and zero manifest length mismatches.
+- Exact replacement/exclusion details are recorded in `context_filter_report.json`.
+
+Tasks excluded by the 2026-05-22 context refresh:
+
+```text
+juanifioren__django-oidc-provider-329
+matthewwithanm__django-imagekit-574
+nedbat__coveragepy-0d6449874cd4d3003ce908d66fa654b64bfea0c0
+nedbat__coveragepy-1cd6c9bba0b4ba3018bf1b28fee645a7dd98fe68
+nedbat__coveragepy-35e249ff74cfcbc44889107cfcca785696dc4288
+nedbat__coveragepy-423fa596325acb8f6bcb37a3502cf7853e5d395a
+nedbat__coveragepy-84f70f69c5e3f7117d219f842ef66ec037478bc9
+nedbat__coveragepy-8eb95b5ad2ed1cee1204b1ce95bad9118063d178
+nedbat__coveragepy-9209c555c7612b4a649edca5db97a04177ee5a9a
+nedbat__coveragepy-d723b46460dc7ffb4abf54806087ffd614b81331
+nedbat__coveragepy-df1bf082f242cccdcb342000525bede537b95935
+nedbat__coveragepy-ff2b70a39bbe5f6b6e1752e4664fad64211d2280
+nipy__nipype-2669
+python__mypy-11125
+python__mypy-11521
+streamlink__streamlink-3131
+```
+
 ## Request To Authors
 
 If we need the exact paper rows, ask NVIDIA for the training manifest rather than another natural-language clarification.

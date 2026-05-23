@@ -121,6 +121,9 @@ def qwen25_coder7b_direct_to_hero() -> Trainer.Config:
             seed=_env_int("SWEHERO_SEED", 17),
             shuffle=True,
             infinite=True,
+            allow_empty_rank_reuse=_env_bool(
+                "SWEHERO_ALLOW_EMPTY_RANK_REUSE", False
+            ),
             pin_memory=True,
         ),
         optimizer=OptimizersContainer.Config(
