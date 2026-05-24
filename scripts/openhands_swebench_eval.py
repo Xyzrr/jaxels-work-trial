@@ -52,6 +52,7 @@ PAPER_MAX_ITERATIONS = 100
 PAPER_TEMPERATURE = 0.7
 PAPER_TOP_P = 0.8
 PAPER_TOP_K = 20
+DEFAULT_TOOL_CHOICE = "required"
 TOOL_CALL_PREFLIGHT_NAME = "report_eval_preflight"
 TOOL_CALL_PREFLIGHT_TOOL = {
     "type": "function",
@@ -204,6 +205,11 @@ def build_openhands_config(args: argparse.Namespace) -> str:
         )
     if args.max_output_tokens is not None:
         config_lines.append(f"max_output_tokens = {args.max_output_tokens}")
+    if args.native_tool_calling:
+        config_lines.append(
+            "completion_kwargs = "
+            f"{{ tool_choice = {_toml_string(args.tool_choice)} }}"
+        )
 
     config_lines.extend(
         [
@@ -361,6 +367,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "api_key_source": args.api_key_source,
             "custom_llm_provider": args.custom_llm_provider,
             "native_tool_calling": args.native_tool_calling,
+            "tool_choice": args.tool_choice if args.native_tool_calling else None,
             "tool_call_preflight": args.tool_call_preflight,
         },
         "dataset": {
@@ -528,7 +535,7 @@ def tool_call_preflight_payload(args: argparse.Namespace) -> dict[str, object]:
             },
         ],
         "tools": [TOOL_CALL_PREFLIGHT_TOOL],
-        "tool_choice": "required",
+        "tool_choice": args.tool_choice,
         "temperature": 0,
         "max_tokens": 128,
     }
@@ -651,6 +658,46 @@ def summarize_report(report_path: Path) -> dict[str, Any]:
     }
 
 
+def summarize_agent_tool_use(output_jsonl: Path) -> dict[str, Any]:
+    instances = 0
+    agent_messages = 0
+    agent_tool_actions = 0
+    tool_action_counts: dict[str, int] = {}
+    loop_errors = 0
+
+    for line in output_jsonl.read_text().splitlines():
+        if not line.strip():
+            continue
+        instances += 1
+        row = json.loads(line)
+        error = row.get("error")
+        if isinstance(error, str) and "AgentStuckInLoopError" in error:
+            loop_errors += 1
+        history = row.get("history")
+        if not isinstance(history, list):
+            continue
+        for event in history:
+            if not isinstance(event, dict) or event.get("source") != "agent":
+                continue
+            action = event.get("action")
+            if action in {"message", "system", None}:
+                if action == "message":
+                    agent_messages += 1
+                continue
+            action_name = str(action)
+            agent_tool_actions += 1
+            tool_action_counts[action_name] = tool_action_counts.get(action_name, 0) + 1
+
+    return {
+        "instances": instances,
+        "agent_tool_actions": agent_tool_actions,
+        "agent_message_actions": agent_messages,
+        "tool_action_counts": tool_action_counts,
+        "loop_errors": loop_errors,
+        "used_real_tools": agent_tool_actions > 0,
+    }
+
+
 def run_eval(args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands) -> None:
     if not args.skip_preflight:
         checks = check_runtime(args)
@@ -678,6 +725,12 @@ def run_eval(args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands)
         raise RuntimeError(
             f"OpenHands finished but expected output was not found: {paths.expected_output_jsonl}"
         )
+    print(
+        "agent_tool_use="
+        + json.dumps(
+            summarize_agent_tool_use(paths.expected_output_jsonl), sort_keys=True
+        )
+    )
     if not args.skip_swebench_eval:
         run_command(commands.run_eval, cwd=args.openhands_dir, env=env)
         if paths.expected_report_json.exists():
@@ -717,6 +770,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--native-tool-calling",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("NATIVE_TOOL_CALLING", True),
+    )
+    parser.add_argument(
+        "--tool-choice",
+        choices=("required", "auto", "none"),
+        default=_env("TOOL_CHOICE", DEFAULT_TOOL_CHOICE),
+        help=(
+            "OpenAI tool_choice sent through OpenHands completion_kwargs. "
+            "Qwen2.5-Coder loops under OpenHands with auto in smoke tests, "
+            "while required forces structured CodeAct tool calls."
+        ),
     )
     parser.add_argument(
         "--drop-params",

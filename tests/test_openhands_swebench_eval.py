@@ -39,6 +39,7 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(args.top_k, 20)
         self.assertIsNone(args.eval_limit)
         self.assertTrue(args.native_tool_calling)
+        self.assertEqual(args.tool_choice, "required")
         self.assertTrue(args.tool_call_preflight)
 
     def test_expected_output_path_matches_openhands_layout(self):
@@ -65,6 +66,7 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("top_k = 20", config)
         self.assertIn("max_input_tokens = 131072", config)
         self.assertIn("native_tool_calling = true", config)
+        self.assertIn('completion_kwargs = { tool_choice = "required" }', config)
         self.assertIn("[agent.swehero_openhands]", config)
         self.assertIn("enable_jupyter = false", config)
         self.assertIn("enable_browsing = false", config)
@@ -80,6 +82,7 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("sk-real-secret", paths.config_path.read_text())
         metadata = json.loads(paths.metadata_path.read_text())
         self.assertEqual(metadata["commands"]["serve_vllm"][8], "<redacted>")
+        self.assertEqual(metadata["model"]["tool_choice"], "required")
         self.assertTrue(metadata["model"]["tool_call_preflight"])
         self.assertNotIn("sk-real-secret", paths.metadata_path.read_text())
         self.assertIn("--dataset", commands.run_infer)
@@ -146,6 +149,15 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
             eval_script.TOOL_CALL_PREFLIGHT_NAME,
         )
 
+    def test_tool_choice_override_updates_config_and_preflight(self):
+        args = self._args("--tool-choice", "auto")
+
+        config = eval_script.build_openhands_config(args)
+        payload = eval_script.tool_call_preflight_payload(args)
+
+        self.assertIn('completion_kwargs = { tool_choice = "auto" }', config)
+        self.assertEqual(payload["tool_choice"], "auto")
+
     def test_tool_call_preflight_accepts_structured_tool_calls(self):
         check = eval_script.validate_tool_call_response(
             {
@@ -176,6 +188,38 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
 
         self.assertFalse(check.ok)
         self.assertIn("message.tool_calls missing", check.detail)
+
+    def test_summarize_agent_tool_use_counts_real_tools_and_loops(self):
+        output_path = Path(self.tempdir.name) / "output.jsonl"
+        output_path.write_text(
+            json.dumps(
+                {
+                    "history": [
+                        {"source": "agent", "action": "system"},
+                        {"source": "agent", "action": "message"},
+                        {"source": "agent", "action": "think"},
+                        {"source": "agent", "action": "run"},
+                    ],
+                    "error": None,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "history": [{"source": "agent", "action": "message"}],
+                    "error": "AgentStuckInLoopError: Agent got stuck in a loop",
+                }
+            )
+            + "\n"
+        )
+
+        summary = eval_script.summarize_agent_tool_use(output_path)
+
+        self.assertTrue(summary["used_real_tools"])
+        self.assertEqual(summary["agent_tool_actions"], 2)
+        self.assertEqual(summary["agent_message_actions"], 2)
+        self.assertEqual(summary["tool_action_counts"], {"think": 1, "run": 1})
+        self.assertEqual(summary["loop_errors"], 1)
 
 
 if __name__ == "__main__":
