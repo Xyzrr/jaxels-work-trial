@@ -53,6 +53,7 @@ PAPER_TEMPERATURE = 0.7
 PAPER_TOP_P = 0.8
 PAPER_TOP_K = 20
 DEFAULT_TOOL_CHOICE = "required"
+DEFAULT_DOCKER_SMOKE_IMAGE = "hello-world:latest"
 TOOL_CALL_PREFLIGHT_NAME = "report_eval_preflight"
 TOOL_CALL_PREFLIGHT_TOOL = {
     "type": "function",
@@ -375,6 +376,13 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "split": args.split,
             "eval_limit": args.eval_limit,
         },
+        "runtime": {
+            "openhands_runtime": args.runtime,
+            "swebench_eval_environment": args.eval_environment,
+            "docker_smoke_image": args.docker_smoke_image,
+            "skip_docker_run_check": args.skip_docker_run_check,
+            "skip_docker_buildx_check": args.skip_docker_buildx_check,
+        },
         "paths": {
             "config": str(paths.config_path),
             "commands": str(paths.commands_path),
@@ -476,25 +484,80 @@ def check_runtime(args: argparse.Namespace) -> list[RuntimeCheck]:
     if args.native_tool_calling and args.tool_call_preflight:
         checks.append(check_tool_call_endpoint(args))
     if args.runtime == "docker" or args.eval_environment == "local":
-        docker_path = shutil.which("docker")
-        if docker_path is None:
-            checks.append(RuntimeCheck("docker", False, "docker not found on PATH"))
+        checks.extend(check_docker_runtime(args))
+    return checks
+
+
+def _last_output_line(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1] if lines else "no output"
+
+
+def check_docker_runtime(args: argparse.Namespace) -> list[RuntimeCheck]:
+    docker_path = shutil.which("docker")
+    if docker_path is None:
+        return [RuntimeCheck("docker", False, "docker not found on PATH")]
+
+    checks: list[RuntimeCheck] = []
+    info = subprocess.run(
+        ["docker", "info"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    checks.append(
+        RuntimeCheck(
+            "docker_daemon",
+            info.returncode == 0,
+            "docker daemon reachable"
+            if info.returncode == 0
+            else _last_output_line(info.stdout),
+        )
+    )
+
+    if not args.skip_docker_run_check:
+        if info.returncode != 0:
+            checks.append(
+                RuntimeCheck(
+                    "docker_run",
+                    False,
+                    "skipped because docker daemon check failed",
+                )
+            )
         else:
-            proc = subprocess.run(
-                ["docker", "info"],
+            run = subprocess.run(
+                ["docker", "run", "--rm", args.docker_smoke_image],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
             checks.append(
                 RuntimeCheck(
-                    "docker_daemon",
-                    proc.returncode == 0,
-                    "docker daemon reachable"
-                    if proc.returncode == 0
-                    else proc.stdout.strip().splitlines()[-1],
+                    "docker_run",
+                    run.returncode == 0,
+                    f"docker run --rm {args.docker_smoke_image} succeeded"
+                    if run.returncode == 0
+                    else _last_output_line(run.stdout),
                 )
             )
+
+    if not args.skip_docker_buildx_check:
+        buildx = subprocess.run(
+            ["docker", "buildx", "version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        checks.append(
+            RuntimeCheck(
+                "docker_buildx",
+                buildx.returncode == 0,
+                _last_output_line(buildx.stdout)
+                if buildx.returncode == 0
+                else f"docker buildx unavailable: {_last_output_line(buildx.stdout)}",
+            )
+        )
+
     return checks
 
 
@@ -872,6 +935,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("local", "modal"),
         default=_env("EVAL_ENVIRONMENT", "local"),
         help="SWE-bench grader environment.",
+    )
+    parser.add_argument(
+        "--docker-smoke-image",
+        default=_env("DOCKER_SMOKE_IMAGE", DEFAULT_DOCKER_SMOKE_IMAGE),
+        help=(
+            "Image used by the Docker preflight container-run check. "
+            "The default is tiny and catches unprivileged pod/userns failures."
+        ),
+    )
+    parser.add_argument(
+        "--skip-docker-run-check",
+        action="store_true",
+        default=_env_bool("SKIP_DOCKER_RUN_CHECK", False),
+        help="Skip the preflight docker run --rm smoke container.",
+    )
+    parser.add_argument(
+        "--skip-docker-buildx-check",
+        action="store_true",
+        default=_env_bool("SKIP_DOCKER_BUILDX_CHECK", False),
+        help="Skip the preflight docker buildx version check.",
     )
     parser.add_argument("--vllm-host", default=_env("VLLM_HOST", "0.0.0.0"))
     parser.add_argument("--vllm-port", type=int, default=_env_int("VLLM_PORT", 8000))

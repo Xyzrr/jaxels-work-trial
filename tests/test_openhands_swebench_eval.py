@@ -1,7 +1,9 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import openhands_swebench_eval as eval_script
 
@@ -41,6 +43,9 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertTrue(args.native_tool_calling)
         self.assertEqual(args.tool_choice, "required")
         self.assertTrue(args.tool_call_preflight)
+        self.assertEqual(args.docker_smoke_image, "hello-world:latest")
+        self.assertFalse(args.skip_docker_run_check)
+        self.assertFalse(args.skip_docker_buildx_check)
 
     def test_expected_output_path_matches_openhands_layout(self):
         args = self._args("--eval-note", "paper-pass1", "--eval-limit", "1")
@@ -220,6 +225,68 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(summary["agent_message_actions"], 2)
         self.assertEqual(summary["tool_action_counts"], {"think": 1, "run": 1})
         self.assertEqual(summary["loop_errors"], 1)
+
+    def test_docker_preflight_runs_container_and_checks_buildx(self):
+        args = self._args()
+        completed = [
+            subprocess.CompletedProcess(["docker", "info"], 0, stdout="daemon ok\n"),
+            subprocess.CompletedProcess(
+                ["docker", "run", "--rm", "hello-world:latest"],
+                0,
+                stdout="Hello from Docker!\n",
+            ),
+            subprocess.CompletedProcess(
+                ["docker", "buildx", "version"],
+                0,
+                stdout="github.com/docker/buildx 0.30.1\n",
+            ),
+        ]
+
+        with mock.patch.object(
+            eval_script.shutil, "which", return_value="/usr/bin/docker"
+        ):
+            with mock.patch.object(
+                eval_script.subprocess, "run", side_effect=completed
+            ) as run:
+                checks = eval_script.check_docker_runtime(args)
+
+        self.assertEqual(
+            [check.name for check in checks],
+            ["docker_daemon", "docker_run", "docker_buildx"],
+        )
+        self.assertTrue(all(check.ok for check in checks))
+        run.assert_any_call(
+            ["docker", "run", "--rm", "hello-world:latest"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+    def test_docker_preflight_reports_unprivileged_run_failure(self):
+        args = self._args()
+        completed = [
+            subprocess.CompletedProcess(["docker", "info"], 0, stdout="daemon ok\n"),
+            subprocess.CompletedProcess(
+                ["docker", "run", "--rm", "hello-world:latest"],
+                1,
+                stdout="Error response from daemon: unshare: operation not permitted\n",
+            ),
+            subprocess.CompletedProcess(
+                ["docker", "buildx", "version"],
+                0,
+                stdout="github.com/docker/buildx 0.30.1\n",
+            ),
+        ]
+
+        with mock.patch.object(
+            eval_script.shutil, "which", return_value="/usr/bin/docker"
+        ):
+            with mock.patch.object(eval_script.subprocess, "run", side_effect=completed):
+                checks = eval_script.check_docker_runtime(args)
+
+        docker_run = next(check for check in checks if check.name == "docker_run")
+        self.assertFalse(docker_run.ok)
+        self.assertIn("unshare: operation not permitted", docker_run.detail)
 
 
 if __name__ == "__main__":
