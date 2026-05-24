@@ -47,6 +47,17 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertFalse(args.skip_docker_run_check)
         self.assertFalse(args.skip_docker_buildx_check)
 
+    def test_base_url_is_required_for_non_dry_run(self):
+        with self.assertRaisesRegex(ValueError, "--base-url is required"):
+            eval_script.parse_args(
+                [
+                    "--output-dir",
+                    str(Path(self.tempdir.name) / "run"),
+                    "--openhands-dir",
+                    str(Path(self.tempdir.name) / "OpenHands"),
+                ]
+            )
+
     def test_expected_output_path_matches_openhands_layout(self):
         args = self._args("--eval-note", "paper-pass1", "--eval-limit", "1")
         output = eval_script.expected_output_jsonl(args)

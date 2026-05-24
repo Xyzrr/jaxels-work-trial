@@ -44,9 +44,12 @@ DEFAULT_SPLIT = "test"
 DEFAULT_AGENT = "CodeActAgent"
 DEFAULT_MODEL_CONFIG_NAME = "llm.swehero_qwen25_coder7b"
 DEFAULT_AGENT_CONFIG_NAME = "agent.swehero_openhands"
-DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
+DEFAULT_BASE_URL = ""
 DEFAULT_API_KEY = "local-llm"
 DEFAULT_OUTPUT_DIR = Path("eval-runs/openhands-swebench-verified-pass1")
+# OpenHands' SWE-bench script names its Docker execution backend "local".
+# The canonical wrapper invokes that backend inside the GPU pod.
+SWE_BENCH_DOCKER_ENVIRONMENT = "local"
 PAPER_CONTEXT_LENGTH = 131_072
 PAPER_MAX_ITERATIONS = 100
 PAPER_TEMPERATURE = 0.7
@@ -280,7 +283,7 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
         "",
         args.dataset,
         args.split,
-        args.eval_environment,
+        SWE_BENCH_DOCKER_ENVIRONMENT,
     ]
 
     served_model_name = args.served_model_name or args.model_id
@@ -378,7 +381,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
         },
         "runtime": {
             "openhands_runtime": args.runtime,
-            "swebench_eval_environment": args.eval_environment,
+            "swebench_grader": "dockerized SWE-bench harness inside the GPU pod",
             "docker_smoke_image": args.docker_smoke_image,
             "skip_docker_run_check": args.skip_docker_run_check,
             "skip_docker_buildx_check": args.skip_docker_buildx_check,
@@ -399,8 +402,10 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "#!/usr/bin/env bash",
             "set -euo pipefail",
             "",
-            "# 1. Serve Qwen2.5-Coder-7B-Instruct from a GPU host.",
-            "# Run this in a separate terminal before launching OpenHands:",
+            "# Generated command record. The supported launcher is:",
+            "# scripts/run_openhands_swebench_eval_pod.sh",
+            "",
+            "# 1. Serve Qwen2.5-Coder-7B-Instruct from the GPU pod.",
             "# " + _shell_join(commands.serve_vllm),
             "",
             "# 2. Prepare the legacy OpenHands SWE-bench harness if needed.",
@@ -483,7 +488,7 @@ def check_runtime(args: argparse.Namespace) -> list[RuntimeCheck]:
         checks.append(check_llm_endpoint(args))
     if args.native_tool_calling and args.tool_call_preflight:
         checks.append(check_tool_call_endpoint(args))
-    if args.runtime == "docker" or args.eval_environment == "local":
+    if args.runtime == "docker":
         checks.extend(check_docker_runtime(args))
     return checks
 
@@ -815,7 +820,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env("LITELLM_MODEL", ""),
         help="Full LiteLLM model string. Defaults to openai/<served-model-name>.",
     )
-    parser.add_argument("--base-url", default=_env("LLM_BASE_URL", DEFAULT_BASE_URL))
+    parser.add_argument(
+        "--base-url",
+        default=_env("LLM_BASE_URL", DEFAULT_BASE_URL),
+        help="OpenAI-compatible endpoint. The pod launcher sets this to the GPU pod IP.",
+    )
     parser.add_argument(
         "--api-key",
         default=_env("LLM_API_KEY", _env("OPENAI_API_KEY", DEFAULT_API_KEY)),
@@ -931,12 +940,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="OpenHands runtime backend. Docker is the paper default.",
     )
     parser.add_argument(
-        "--eval-environment",
-        choices=("local", "modal"),
-        default=_env("EVAL_ENVIRONMENT", "local"),
-        help="SWE-bench grader environment.",
-    )
-    parser.add_argument(
         "--docker-smoke-image",
         default=_env("DOCKER_SMOKE_IMAGE", DEFAULT_DOCKER_SMOKE_IMAGE),
         help=(
@@ -985,6 +988,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.litellm_model = None
     if args.eval_limit is not None and args.eval_limit <= 0:
         raise ValueError("--eval-limit must be positive when provided")
+    if not args.base_url and not args.dry_run:
+        raise ValueError(
+            "--base-url is required; use scripts/run_openhands_swebench_eval_pod.sh "
+            "to launch the eval from the GPU pod."
+        )
     args.output_dir = args.output_dir.resolve()
     args.openhands_dir = args.openhands_dir.resolve()
     return args

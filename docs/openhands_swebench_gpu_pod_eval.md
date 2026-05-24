@@ -1,193 +1,122 @@
-# OpenHands SWE-bench Eval on the GPU Node
+# OpenHands SWE-bench Eval on the GPU Pod
 
-Use this path when the eval should run inside the Kubernetes GPU environment
-instead of splitting OpenHands/SWE-bench Docker work onto the local machine.
+The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
 
-The existing `midtraining-dev` pod is not sufficient by itself unless it is
-recreated as privileged. Installing Docker inside the current unprivileged pod
-can make `docker info` pass, but `docker run` still fails with
-`unshare: operation not permitted`. The verified path below keeps vLLM on
-`midtraining-dev` and runs OpenHands plus SWE-bench grading in a privileged
-no-GPU eval-driver pod on the same node with the shared `/workspace` hostPath.
+- vLLM serving Qwen2.5-Coder-7B on GPU 0;
+- OpenHands inference;
+- Dockerized SWE-bench grading.
 
-## Start vLLM on the GPU Pod
+Use `scripts/run_openhands_swebench_eval_pod.sh` from inside that pod. Do not
+run OpenHands or SWE-bench from the laptop.
 
-Run this in `midtraining-dev`:
+## Pod Requirement
+
+`midtraining-dev` must be created from `manifests/midtraining-hostpath.yaml`.
+That manifest makes the GPU pod privileged, installs Docker plus Buildx, and
+persists Docker state under `/workspace/pod-docker-data/midtraining-dev`.
+
+Pod security settings are immutable. If an older `midtraining-dev` pod is
+already running without privilege, recreate it before launching this eval:
 
 ```bash
-cd /workspace/jaxels-work-trial
-tmux kill-session -t openhands-vllm-7b 2>/dev/null || true
-tmux new-session -d -s openhands-vllm-7b \
-  "CUDA_VISIBLE_DEVICES=0 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-  /workspace/venvs/openhands-vllm/bin/vllm serve \
-    /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --api-key local-llm \
-    --served-model-name Qwen/Qwen2.5-Coder-7B-Instruct \
-    --max-model-len 131072 \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.90 \
-    --dtype bfloat16 \
-    --enable-auto-tool-choice \
-    --tool-call-parser hermes \
-    > /workspace/runlogs/openhands-vllm-7b.log 2>&1"
+kubectl delete pod -n midtraining midtraining-dev
+kubectl apply -f manifests/midtraining-hostpath.yaml
+kubectl wait -n midtraining --for=condition=Ready pod/midtraining-dev --timeout=600s
 ```
 
-The required vLLM bits for the smoke were:
-
-- `vllm==0.10.2`
-- `torch==2.8.0+cu128`
-- `transformers==4.55.4`
-- native tool calling enabled with the `hermes` parser
-
-## Create the Eval Driver Pod
-
-Apply the privileged driver pod:
+The launcher intentionally runs both:
 
 ```bash
-kubectl apply -f manifests/openhands-eval-driver.yaml
-kubectl wait -n midtraining --for=condition=Ready pod/openhands-eval-driver --timeout=300s
-```
-
-Verify the Docker failure modes that matter for OpenHands:
-
-```bash
-kubectl exec -n midtraining openhands-eval-driver -- bash -lc '
-for i in $(seq 1 60); do
-  docker info >/tmp/docker-info.out 2>/tmp/docker-info.err && break
-  sleep 1
-done
-docker info | grep -E "Server Version|Storage Driver|Docker Root Dir"
-docker run --rm hello-world
+docker run --rm hello-world:latest
 docker buildx version
-'
 ```
 
-`docker run --rm hello-world` is intentional. It catches the user namespace
-failure that `docker info` missed in the unprivileged GPU pod.
+`docker info` alone is not enough for this workflow because an unprivileged pod
+can report a reachable daemon while still failing container execution.
 
-## Prepare Python and OpenHands
+## Smoke Command
 
-Run this once in the eval-driver pod. Use a glibc Ubuntu pod, not Alpine;
-OpenHands' lock includes Linux wheels that do not resolve correctly on musl.
-
-```bash
-kubectl exec -n midtraining openhands-eval-driver -- bash -lc '
-set -euo pipefail
-/workspace/uv/uv-0.11.16/uv venv /workspace/venvs/openhands-eval-ubuntu-py312 --python 3.12
-/workspace/uv/uv-0.11.16/uv pip install \
-  --python /workspace/venvs/openhands-eval-ubuntu-py312/bin/python \
-  pip poetry
-'
-```
-
-Then install the OpenHands eval dependencies:
+Run a one-instance smoke:
 
 ```bash
-kubectl exec -n midtraining openhands-eval-driver -- bash -lc '
-set -euo pipefail
-cd /workspace/eval-runs/OpenHands
-export PATH=/workspace/venvs/openhands-eval-ubuntu-py312/bin:$PATH
-export POETRY_VIRTUALENVS_PATH=/workspace/venvs/poetry-ubuntu
-export POETRY_CACHE_DIR=/workspace/.cache/poetry-ubuntu
-poetry env use /workspace/venvs/openhands-eval-ubuntu-py312/bin/python
-poetry install --with evaluation,test --no-root
-'
-```
-
-If `/workspace/eval-runs/OpenHands` does not exist yet, the eval scaffold will
-clone it on the first run. Run the install command after that clone.
-
-## Run the 7B Smoke
-
-Resolve the vLLM pod IP from the cluster:
-
-```bash
-GPU_POD_IP=$(kubectl get pod -n midtraining midtraining-dev -o jsonpath='{.status.podIP}')
-```
-
-Preflight from inside the eval-driver pod:
-
-```bash
-kubectl exec -n midtraining openhands-eval-driver -- bash -lc "
-set -euo pipefail
+kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-export PATH=/workspace/venvs/openhands-eval-ubuntu-py312/bin:\$PATH
-export POETRY_VIRTUALENVS_PATH=/workspace/venvs/poetry-ubuntu
-export POETRY_CACHE_DIR=/workspace/.cache/poetry-ubuntu
-python scripts/openhands_swebench_eval.py \
-  --model-id /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
-  --served-model-name Qwen/Qwen2.5-Coder-7B-Instruct \
-  --litellm-model openai/Qwen/Qwen2.5-Coder-7B-Instruct \
-  --base-url http://${GPU_POD_IP}:8000/v1 \
-  --api-key local-llm \
-  --eval-limit 1 \
-  --output-dir /workspace/eval-runs/pod-openhands-swebench-verified-pass1 \
-  --openhands-dir /workspace/eval-runs/OpenHands \
-  --preflight-only
-"
+scripts/run_openhands_swebench_eval_pod.sh --smoke
+'
 ```
 
-Run the smoke:
+For a non-attached launch:
 
 ```bash
-kubectl exec -n midtraining openhands-eval-driver -- bash -lc "
-set -euo pipefail
+kubectl exec -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-export PATH=/workspace/venvs/openhands-eval-ubuntu-py312/bin:\$PATH
-export POETRY_VIRTUALENVS_PATH=/workspace/venvs/poetry-ubuntu
-export POETRY_CACHE_DIR=/workspace/.cache/poetry-ubuntu
-rm -rf /workspace/eval-runs/pod-openhands-swebench-verified-pass1/outputs/princeton-nlp__SWE-bench_Verified-test/CodeActAgent/Qwen2.5-Coder-7B-Instruct_maxiter_100_N_swehero-qwen25-coder7b-pass1
-python scripts/openhands_swebench_eval.py \
-  --model-id /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
-  --served-model-name Qwen/Qwen2.5-Coder-7B-Instruct \
-  --litellm-model openai/Qwen/Qwen2.5-Coder-7B-Instruct \
-  --base-url http://${GPU_POD_IP}:8000/v1 \
-  --api-key local-llm \
-  --eval-limit 1 \
-  --output-dir /workspace/eval-runs/pod-openhands-swebench-verified-pass1 \
-  --openhands-dir /workspace/eval-runs/OpenHands
-"
+scripts/run_openhands_swebench_eval_pod.sh --smoke --no-attach
+'
 ```
 
-## Validation Result
+The launcher creates a tmux session named
+`openhands-swebench-eval-<timestamp>` by default and writes the transcript to
+`/workspace/runlogs/<session>.log`.
 
-On May 24, 2026, the one-instance 7B smoke completed fully inside the cluster:
+## Full Pass@1 Command
 
-```json
-{
-  "resolved": 0,
-  "total": 1,
-  "pass_at_1": 0.0,
-  "report_path": "/workspace/eval-runs/pod-openhands-swebench-verified-pass1/outputs/princeton-nlp__SWE-bench_Verified-test/CodeActAgent/Qwen2.5-Coder-7B-Instruct_maxiter_100_N_swehero-qwen25-coder7b-pass1/report.json"
-}
+Run the full SWE-bench Verified split:
+
+```bash
+kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
+cd /workspace/jaxels-work-trial
+scripts/run_openhands_swebench_eval_pod.sh --full
+'
 ```
 
-The sampled instance was `scikit-learn__scikit-learn-13439`. The agent used
-real OpenHands tools instead of repeated message text:
+## Preflight Only
 
-```json
-{
-  "agent_message_actions": 0,
-  "agent_tool_actions": 32,
-  "instances": 1,
-  "loop_errors": 0,
-  "tool_action_counts": {
-    "edit": 14,
-    "finish": 1,
-    "read": 1,
-    "run": 5,
-    "think": 11
-  },
-  "used_real_tools": true
-}
+Check the pod runtime, Docker, vLLM, and structured tool calling:
+
+```bash
+kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
+cd /workspace/jaxels-work-trial
+scripts/run_openhands_swebench_eval_pod.sh --preflight-only --foreground
+'
 ```
 
-The vLLM native tool-call preflight also returned structured
-`message.tool_calls` for Qwen2.5-Coder with `tool_choice=required`.
+The tool-call preflight must return structured `message.tool_calls` for
+Qwen2.5-Coder. If it returns plain assistant text, the eval should not start.
 
-For a literal single-pod setup, recreate `midtraining-dev` as privileged, add
-Docker plus `docker-buildx`, and run the same scaffold from that pod with
-`--base-url http://127.0.0.1:8000/v1`. Do not rely on the current
-unprivileged `midtraining-dev` pod for Dockerized OpenHands/SWE-bench evals.
+## Defaults
+
+The launcher defaults are:
+
+```text
+MODEL_ID=/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
+SERVED_MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct
+LITELLM_MODEL=openai/Qwen/Qwen2.5-Coder-7B-Instruct
+LLM_API_KEY=local-llm
+VLLM_VENV=/workspace/venvs/openhands-vllm
+EVAL_VENV=/workspace/venvs/openhands-eval-pod-py312
+OPENHANDS_DIR=/workspace/eval-runs/OpenHands
+OPENHANDS_REF=0.62.0
+```
+
+Output defaults to:
+
+```text
+/workspace/eval-runs/openhands-swebench-verified-pass1/<timestamp>
+```
+
+Override with `--output-dir PATH` when a stable path is needed.
+
+## What the Launcher Does
+
+1. Refuses to run on macOS or outside `/workspace`.
+2. Starts `dockerd` in a pod tmux session if needed.
+3. Verifies Docker by running a real container and checking Buildx.
+4. Creates the Python 3.12 eval environment with the pinned `uv` binary.
+5. Starts vLLM in a pod tmux session if the model endpoint is not already up.
+6. Installs the OpenHands evaluation dependencies.
+7. Runs `scripts/openhands_swebench_eval.py` with the pod IP as the model
+   endpoint and `tool_choice=required`.
+8. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
+
+For the 7B smoke, a healthy run should show `used_real_tools: true` and
+`loop_errors: 0` before reporting pass@1.
