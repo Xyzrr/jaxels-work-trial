@@ -52,6 +52,26 @@ PAPER_MAX_ITERATIONS = 100
 PAPER_TEMPERATURE = 0.7
 PAPER_TOP_P = 0.8
 PAPER_TOP_K = 20
+TOOL_CALL_PREFLIGHT_NAME = "report_eval_preflight"
+TOOL_CALL_PREFLIGHT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": TOOL_CALL_PREFLIGHT_NAME,
+        "description": "Report that the model server emitted a structured tool call.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "Set to ok when the tool call path works.",
+                    "enum": ["ok"],
+                }
+            },
+            "required": ["status"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -171,18 +191,13 @@ def build_openhands_config(args: argparse.Namespace) -> str:
         f"api_key = {_toml_string(args.api_key)}",
         f"temperature = {args.temperature}",
         f"top_p = {args.top_p}",
+        f"top_k = {args.top_k}",
+        f"max_input_tokens = {args.max_input_tokens}",
+        f"timeout = {args.timeout}",
+        f"drop_params = {_toml_bool(args.drop_params)}",
+        f"disable_vision = {_toml_bool(args.disable_vision)}",
+        f"native_tool_calling = {_toml_bool(args.native_tool_calling)}",
     ]
-    if args.send_top_k_param:
-        config_lines.append(f"top_k = {args.top_k}")
-    config_lines.extend(
-        [
-            f"max_input_tokens = {args.max_input_tokens}",
-            f"timeout = {args.timeout}",
-            f"drop_params = {_toml_bool(args.drop_params)}",
-            f"disable_vision = {_toml_bool(args.disable_vision)}",
-            f"native_tool_calling = {_toml_bool(args.native_tool_calling)}",
-        ]
-    )
     if args.custom_llm_provider:
         config_lines.append(
             f"custom_llm_provider = {_toml_string(args.custom_llm_provider)}"
@@ -346,7 +361,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "api_key_source": args.api_key_source,
             "custom_llm_provider": args.custom_llm_provider,
             "native_tool_calling": args.native_tool_calling,
-            "send_top_k_param": args.send_top_k_param,
+            "tool_call_preflight": args.tool_call_preflight,
         },
         "dataset": {
             "name": args.dataset,
@@ -451,6 +466,8 @@ def check_runtime(args: argparse.Namespace) -> list[RuntimeCheck]:
     )
     if not args.skip_llm_endpoint_check:
         checks.append(check_llm_endpoint(args))
+    if args.native_tool_calling and args.tool_call_preflight:
+        checks.append(check_tool_call_endpoint(args))
     if args.runtime == "docker" or args.eval_environment == "local":
         docker_path = shutil.which("docker")
         if docker_path is None:
@@ -490,6 +507,120 @@ def check_llm_endpoint(args: argparse.Namespace) -> RuntimeCheck:
             )
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return RuntimeCheck("llm_endpoint", False, f"{url} unreachable: {exc}")
+
+
+def tool_call_preflight_payload(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "model": args.served_model_name or args.model_id,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are checking an OpenAI-compatible tool calling endpoint. "
+                    "Use the provided tool; do not answer in plain text."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Call {TOOL_CALL_PREFLIGHT_NAME} with status set to ok."
+                ),
+            },
+        ],
+        "tools": [TOOL_CALL_PREFLIGHT_TOOL],
+        "tool_choice": "required",
+        "temperature": 0,
+        "max_tokens": 128,
+    }
+
+
+def validate_tool_call_response(response: dict[str, object]) -> RuntimeCheck:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return RuntimeCheck("tool_call_preflight", False, "response has no choices")
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return RuntimeCheck(
+            "tool_call_preflight", False, "first choice is not an object"
+        )
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        return RuntimeCheck(
+            "tool_call_preflight", False, "first choice has no message object"
+        )
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        content = message.get("content")
+        preview = "" if content is None else str(content).replace("\n", " ")[:200]
+        return RuntimeCheck(
+            "tool_call_preflight",
+            False,
+            f"message.tool_calls missing or empty; content_preview={preview!r}",
+        )
+
+    names: list[str] = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.append(function["name"])
+    if TOOL_CALL_PREFLIGHT_NAME not in names:
+        return RuntimeCheck(
+            "tool_call_preflight",
+            False,
+            f"structured tool_calls present but expected {TOOL_CALL_PREFLIGHT_NAME!r}; got {names!r}",
+        )
+    return RuntimeCheck(
+        "tool_call_preflight",
+        True,
+        f"structured tool_calls returned: {', '.join(names)}",
+    )
+
+
+def check_tool_call_endpoint(args: argparse.Namespace) -> RuntimeCheck:
+    url = args.base_url.rstrip("/") + "/chat/completions"
+    payload = json.dumps(tool_call_preflight_payload(args)).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {args.api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=args.tool_call_preflight_timeout) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            if not (200 <= response.status < 300):
+                return RuntimeCheck(
+                    "tool_call_preflight",
+                    False,
+                    f"{url} returned HTTP {response.status}: {response_body[:300]}",
+                )
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return RuntimeCheck(
+            "tool_call_preflight",
+            False,
+            f"{url} returned HTTP {exc.code}: {body[:300]}",
+        )
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return RuntimeCheck("tool_call_preflight", False, f"{url} unreachable: {exc}")
+
+    try:
+        parsed = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        return RuntimeCheck(
+            "tool_call_preflight", False, f"response is not JSON: {exc}"
+        )
+    if not isinstance(parsed, dict):
+        return RuntimeCheck(
+            "tool_call_preflight", False, "response JSON is not an object"
+        )
+    check = validate_tool_call_response(parsed)
+    return RuntimeCheck(check.name, check.ok, f"{url}: {check.detail}")
 
 
 def assert_preflight_ok(checks: list[RuntimeCheck]) -> None:
@@ -575,7 +706,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-key-source",
-        default="LLM_API_KEY/OPENAI_API_KEY/local default",
+        default="LLM_API_KEY/OPENAI_API_KEY/default",
         help="Metadata-only description; the actual API key is not written there.",
     )
     parser.add_argument(
@@ -609,13 +740,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--top-k", type=int, default=_env_int("TOP_K", PAPER_TOP_K))
     parser.add_argument(
-        "--send-top-k-param",
+        "--tool-call-preflight",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("SEND_TOP_K_PARAM", True),
+        default=_env_bool("TOOL_CALL_PREFLIGHT", True),
         help=(
-            "Send top_k through OpenHands/LiteLLM. Disable for local "
-            "OpenAI-compatible servers that reject OpenHands' float-cast top_k."
+            "Require an OpenAI-compatible /chat/completions request to return "
+            "structured message.tool_calls before eval."
         ),
+    )
+    parser.add_argument(
+        "--tool-call-preflight-timeout",
+        type=int,
+        default=_env_int("TOOL_CALL_PREFLIGHT_TIMEOUT", 120),
+        help="Seconds to wait for the vLLM tool-call preflight request.",
     )
     parser.add_argument(
         "--max-input-tokens",
@@ -665,7 +802,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--runtime",
         choices=("docker", "remote"),
         default=_env("RUNTIME", "docker"),
-        help="OpenHands runtime backend. Docker is the paper/local default.",
+        help="OpenHands runtime backend. Docker is the paper default.",
     )
     parser.add_argument(
         "--eval-environment",

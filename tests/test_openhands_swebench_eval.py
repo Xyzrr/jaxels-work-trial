@@ -39,6 +39,7 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(args.top_k, 20)
         self.assertIsNone(args.eval_limit)
         self.assertTrue(args.native_tool_calling)
+        self.assertTrue(args.tool_call_preflight)
 
     def test_expected_output_path_matches_openhands_layout(self):
         args = self._args("--eval-note", "paper-pass1", "--eval-limit", "1")
@@ -70,14 +71,6 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("enable_llm_editor = false", config)
         self.assertNotIn("custom_llm_provider", config)
 
-    def test_generated_config_can_omit_client_top_k_for_strict_local_servers(self):
-        args = self._args("--no-send-top-k-param")
-        config = eval_script.build_openhands_config(args)
-
-        self.assertIn("temperature = 0.7", config)
-        self.assertIn("top_p = 0.8", config)
-        self.assertNotIn("top_k =", config)
-
     def test_write_scaffold_records_commands_without_leaking_real_api_key(self):
         args = self._args("--api-key", "sk-real-secret")
         paths, commands = eval_script.write_scaffold(args)
@@ -87,7 +80,7 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("sk-real-secret", paths.config_path.read_text())
         metadata = json.loads(paths.metadata_path.read_text())
         self.assertEqual(metadata["commands"]["serve_vllm"][8], "<redacted>")
-        self.assertTrue(metadata["model"]["send_top_k_param"])
+        self.assertTrue(metadata["model"]["tool_call_preflight"])
         self.assertNotIn("sk-real-secret", paths.metadata_path.read_text())
         self.assertIn("--dataset", commands.run_infer)
         self.assertIn("princeton-nlp/SWE-bench_Verified", commands.run_infer)
@@ -95,6 +88,14 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
             "evaluation/benchmarks/swe_bench/scripts/eval_infer.sh",
             commands.run_eval,
         )
+
+    def test_vllm_command_enables_qwen_native_tool_calling(self):
+        args = self._args()
+        _paths, commands = eval_script.write_scaffold(args)
+
+        self.assertIn("--enable-auto-tool-choice", commands.serve_vllm)
+        self.assertIn("--tool-call-parser", commands.serve_vllm)
+        self.assertIn("hermes", commands.serve_vllm)
 
     def test_summarize_report_computes_pass_at_1_from_resolved_ids(self):
         report_path = Path(self.tempdir.name) / "report.json"
@@ -132,6 +133,49 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(summary["resolved"], 0)
         self.assertEqual(summary["total"], 1)
         self.assertEqual(summary["pass_at_1"], 0)
+
+    def test_tool_call_preflight_payload_targets_served_model(self):
+        args = self._args("--served-model-name", "qwen-7b")
+
+        payload = eval_script.tool_call_preflight_payload(args)
+
+        self.assertEqual(payload["model"], "qwen-7b")
+        self.assertEqual(payload["tool_choice"], "required")
+        self.assertEqual(
+            payload["tools"][0]["function"]["name"],
+            eval_script.TOOL_CALL_PREFLIGHT_NAME,
+        )
+
+    def test_tool_call_preflight_accepts_structured_tool_calls(self):
+        check = eval_script.validate_tool_call_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": eval_script.TOOL_CALL_PREFLIGHT_NAME,
+                                        "arguments": "{\"status\":\"ok\"}",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+
+        self.assertTrue(check.ok)
+
+    def test_tool_call_preflight_rejects_plain_message_text(self):
+        check = eval_script.validate_tool_call_response(
+            {"choices": [{"message": {"content": "I will call the tool now."}}]}
+        )
+
+        self.assertFalse(check.ok)
+        self.assertIn("message.tool_calls missing", check.detail)
 
 
 if __name__ == "__main__":
