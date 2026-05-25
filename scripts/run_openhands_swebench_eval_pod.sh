@@ -53,7 +53,7 @@ Environment overrides:
                           Default: 2.1.3
   OPENHANDS_DIR           Default: /workspace/eval-runs/OpenHands
   OPENHANDS_REF           Default: 0.62.0
-  MAX_OUTPUT_TOKENS       Default: 8192. Set to none only for ablations.
+  MAX_OUTPUT_TOKENS       Default: 4096. Set to none only for ablations.
   REQUIRED_GPU_COUNT      Default: 8
   SWEHERO_POD_GIT_BRANCH  Required. Current local worktree branch expected on
                           the pod; the launcher fast-forwards it from origin.
