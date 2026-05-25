@@ -63,6 +63,25 @@ docker buildx version
 `docker info` alone is not enough for this workflow because an unprivileged pod
 can report a reachable daemon while still failing container execution.
 
+## Prebuild Runtime Images
+
+Prebuild the per-task OpenHands runtime images before eval:
+
+```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
+kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
+cd /workspace/jaxels-work-trial
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/prebuild_openhands_swebench_images_pod.sh
+'
+```
+
+The script runs in tmux session `openhands-swebench-image-prebuild`, logs to
+`/workspace/runlogs/openhands-swebench-image-prebuild.log`, and a rerun attaches
+to the existing session. It inspects the final OpenHands runtime image tag before
+every build, so already-built images are skipped. Use `--eval-limit N` only for a
+small prebuild smoke.
+
 ## Smoke Command
 
 Run a one-instance smoke:
