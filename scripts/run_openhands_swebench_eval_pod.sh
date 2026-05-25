@@ -40,7 +40,7 @@ Environment overrides:
   EVAL_VENV               Default: /workspace/venvs/openhands-eval-pod-py312
   OPENHANDS_DIR           Default: /workspace/eval-runs/OpenHands
   OPENHANDS_REF           Default: 0.62.0
-  MAX_OUTPUT_TOKENS       Default: 4096. Set to none only for ablations.
+  MAX_OUTPUT_TOKENS       Default: 8192. Set to none only for ablations.
   REQUIRED_GPU_COUNT      Default: 8
   OPENHANDS_EVAL_TMUX_SESSION
   OPENHANDS_EVAL_ATTACH   Default: 1 for interactive shells, otherwise 0

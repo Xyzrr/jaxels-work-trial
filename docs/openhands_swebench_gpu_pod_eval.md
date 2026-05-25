@@ -97,7 +97,7 @@ VLLM_VENV=/workspace/venvs/openhands-vllm
 EVAL_VENV=/workspace/venvs/openhands-eval-pod-py312
 OPENHANDS_DIR=/workspace/eval-runs/OpenHands
 OPENHANDS_REF=0.62.0
-MAX_OUTPUT_TOKENS=4096
+MAX_OUTPUT_TOKENS=8192
 VLLM_ENFORCE_EAGER=1
 VLLM_TENSOR_PARALLEL_SIZE=1
 VLLM_PIPELINE_PARALLEL_SIZE=1
@@ -133,7 +133,7 @@ Override with `--output-dir PATH` when a stable path is needed.
 3. Verifies Docker by running a real container and checking Buildx.
 4. Creates the Python 3.12 eval environment with the pinned `uv` binary.
 5. Starts one vLLM tmux session per GPU if the endpoints are not already up.
-   The default uses eager execution plus the 4096-token output cap for
+   The default uses eager execution plus the 8192-token output cap for
    structured tool-call decoding stability.
 6. Starts `scripts/openai_vllm_router.py` in a pod tmux session, routing to the
    per-GPU vLLM replicas with the configured per-replica concurrency limit.
