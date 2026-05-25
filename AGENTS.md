@@ -15,6 +15,11 @@ Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HE
 - Eval: SWE-bench Verified through the OpenHands harness.
 - Paper caveat: the reported direct-to-hero ablation is for 32B; 7B and 14B direct-to-hero runs are a scale-study extension unless a paper table proves otherwise.
 
+# Primary Workflow Docs
+
+- Training jobs: `docs/swehero_torchtitan_pod.md`.
+- Evals: `docs/openhands_swebench_gpu_pod_eval.md`.
+
 # Local Resources
 
 - `torchtitan/`: fully vendored TorchTitan base for distributed training.
