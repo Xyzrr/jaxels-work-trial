@@ -2,18 +2,24 @@
 
 Build a prototype mid-training pipeline for a future 100B-500B open source coding model. The pipeline consumes SWE traces.
 
+The project started from a SWE-Hero reproduction, but it is now transitioning into a more general experiment pipeline. Do not introduce new hardcoded SWE-Hero assumptions into shared launchers, config parsing, data plumbing, or eval orchestration. Prefer preset-driven experiment definitions that can support additional trace sources, models, serving topologies, OpenHands versions, and graders.
+
 # Mode
 
 Ship prototype ASAP: skip post-task validation, parent-branch merges, and PR ceremony unless explicitly asked. When done, commit task changes and push the current branch.
 
-# Current Baseline
+# Current Baselines And Eval Support
 
-Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HERO" (arXiv:2604.01496):
+The original training baseline is to replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HERO" (arXiv:2604.01496):
 
 - Base models: `Qwen2.5-Coder-7B-Instruct`, `Qwen2.5-Coder-14B-Instruct`, `Qwen2.5-Coder-32B-Instruct`.
 - Dataset: use the manually filtered local public approximation at `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`. It starts from one rollout per task/`instance_id` from the oldest public `nvidia/SWE-Hero-openhands-trajectories` revision (`5b2ed21270ad773a50163e2999c510f0cbb92cfa`) because that revision has the most public tasks. The raw one-rollout approximation has 12,633 selected rows, then `scripts/refresh_swehero_context_capped_one_rollout.py` replaces over-128k Qwen/OpenHands rows with same-task rollouts that fit the 131,072-token shifted context using the same selection rank, and excludes tasks with no fitting accepted rollout. The current local artifact has 12,617 selected rows: 23 replacements and 16 exclusions from the raw artifact. This is a best-effort match for the paper's "one rollout per task" setup, not the exact internal `~13.2k` paper manifest.
-- Eval: SWE-bench Verified through the OpenHands harness.
 - Paper caveat: the reported direct-to-hero ablation is for 32B; 7B and 14B direct-to-hero runs are a scale-study extension unless a paper table proves otherwise.
+
+Current eval support includes both:
+
+- SWE-Hero/current OpenHands evals: upstream OpenHands through `scripts/run_openhands_swebench_eval_pod.sh`, with the Qwen2.5-Coder presets under `configs/eval/`.
+- SWE-Lego evals: `configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args` uses the vendored `SWE-Lego/SWE-Lego` stack at commit `94704b69aac886e003660e1e0f69f7de163b284e`, nested `OpenHands-0.53.0`, vendored `SWE-bench-4.0.4`, and the single 8-GPU tensor-parallel `SWE-Lego/SWE-Lego-Qwen3-8B` serving contract.
 
 # Primary Workflow Docs
 
@@ -29,13 +35,14 @@ Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HE
 
 # Working Rules
 
-- Re-read the paper before changing pipeline assumptions.
+- Re-read the relevant paper or source workflow before changing pipeline assumptions. For SWE-Hero-specific training assumptions, use the SWE-Hero paper. For SWE-Lego eval behavior, inspect the vendored SWE-Lego workflow and preset rather than assuming upstream OpenHands behavior.
 - Use `tmp/pod-creds/kubeconfig.yaml` whenever running `kubectl`, `helm`, or other Kubernetes tools for this project.
 - Run both training and eval workloads on the GPU pod, not on the local machine. Local execution is only for editing, lightweight inspection, tests that do not require the training/eval stack, and Kubernetes orchestration.
 - Prefer TorchTitan's existing extension points and scripts over ad-hoc training code.
 - Keep secrets, pod credentials, `.env`, checkpoints, datasets, and generated run artifacts out of git.
 - Preserve enough metadata to reproduce each run: model, dataset revision, tokenizer/chat template, sequence length, loss masking, LR schedule, batch size, hardware, commit, and eval harness revision.
 - Verify meaningful behavior with automated tests or a concrete dry run whenever feasible.
+- When generalizing the pipeline, keep experiment-specific behavior in preset files or narrowly named adapters. Shared wrappers should select behavior by explicit arguments such as `--eval-stack`, `--context-mode`, or `@configs/...` files, not by inferring from model names or SWE-Hero legacy defaults.
 
 # Configuration Principles
 
@@ -44,3 +51,4 @@ Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HE
 - Reserve environment variables for secrets, credentials, pod/runtime plumbing, and process supervision. Do not use env vars for model, dataset, context, optimizer, eval harness, vLLM sizing, sampling, or other experiment settings.
 - Avoid aliases and convenience synonyms. Prefer primitive flags such as `--eval-limit 1` over named smoke/full shortcuts.
 - When adding or changing training/eval config, update the workflow docs with the canonical preset-based command and preserve the existing runnable behavior through preset contents or explicit CLI flags.
+- Existing names such as `SWEHERO_POD_GIT_BRANCH` are legacy compatibility names. Do not add new SWE-Hero-prefixed knobs for general functionality; use neutral names for new shared controls.

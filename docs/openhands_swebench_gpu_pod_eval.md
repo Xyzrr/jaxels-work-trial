@@ -1,4 +1,8 @@
-# OpenHands SWE-bench Eval on the GPU Pod
+# OpenHands And SWE-Lego SWE-bench Eval on the GPU Pod
+
+This eval workflow is no longer SWE-Hero-only. It is the shared GPU-pod path
+for SWE-bench-style coding eval experiments that can choose different
+OpenHands stacks, model-serving contracts, and graders through presets.
 
 The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
 
@@ -35,6 +39,24 @@ controls such as `--eval-limit`, `--eval-ids`, `--output-dir`,
 `--preflight-only`, and `--skip-swebench-eval`. Do not add convenience aliases
 for those flags.
 
+The current supported presets are:
+
+- `openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args`: current
+  SWE-Hero-style Qwen2.5-Coder-7B Instruct eval through upstream OpenHands.
+- `openhands-swebench-verified-qwen25-coder-7b-base-native-32k.args`: released
+  Qwen2.5-Coder-7B base model in its native 32k context window.
+- `openhands-swebench-verified-qwen25-coder-7b-base-paper-yarn-128k.args`:
+  released Qwen2.5-Coder-7B base model with the paper-style 128k YaRN serving
+  contract.
+- `openhands-swebench-verified-swe-lego-qwen3-8b.args`: SWE-Lego Qwen3-8B
+  reproduction through the vendored SWE-Lego eval stack.
+
+New eval experiments should add a new preset and, when necessary, a narrowly
+scoped stack adapter. Keep shared launcher behavior selected by explicit
+preset arguments such as `--eval-stack`, `--context-mode`,
+`--vllm-server-count`, and grader flags. Do not infer stack behavior from model
+names or from the historical SWE-Hero defaults.
+
 Environment variables are reserved for secrets and pod/runtime plumbing:
 `LLM_API_KEY`, `WORKSPACE_ROOT`, `VLLM_VENV`, `VLLM_REQUIREMENTS_PATH`,
 `VLLM_FORCE_RESTART`, `VLLM_VISIBLE_DEVICES`, `EVAL_VENV`,
@@ -42,6 +64,9 @@ Environment variables are reserved for secrets and pod/runtime plumbing:
 `REQUIRED_GPU_COUNT`,
 `SWEHERO_POD_GIT_BRANCH`, and tmux/uv path controls. The API key is env-only;
 set `LLM_API_KEY` when the default `local-llm` key is not appropriate.
+`SWEHERO_POD_GIT_BRANCH` is a legacy compatibility name for the branch that the
+pod checkout must fast-forward to before launch; do not add new
+SWE-Hero-prefixed env vars for general eval controls.
 
 ## Pod Requirement
 
@@ -174,6 +199,12 @@ Do not add the Qwen2.5 YaRN `--rope-scaling` override to this preset.
 For multi-GPU vLLM servers, the launcher sets `NCCL_CUMEM_ENABLE=1` by default
 because the pod's default `/dev/shm` is too small for NCCL's per-rank shared
 memory segments when vLLM disables cuMem.
+
+SWE-Lego also intentionally differs from the current Qwen2.5 OpenHands presets
+by not forcing native tool calling or `tool_choice=required`, by preserving
+`NUM_WORKERS=24`, and by grading with `--cache_level instance --timeout 500
+--max_workers 10`. Treat these as part of the preset's reproduction contract,
+not as global defaults for future evals.
 
 Run SWE-Lego-Qwen3-8B on the 16-task infrastructure check set with:
 

@@ -1,8 +1,16 @@
-# SWE-HERO TorchTitan Pod Runtime
+# TorchTitan Pod Runtime
 
 This repository vendors TorchTitan source directly under `torchtitan/`. That
 source expects a PyTorch nightly or a PyTorch source build, not the pod's
 pre-existing `/workspace/venv`.
+
+This document still uses the direct-to-hero SWE-Hero run as the canonical
+training example, but the pipeline is moving toward general preset-driven
+mid-training experiments. New training experiments should copy or add
+`configs/training/*.args` presets and keep dataset/model-specific choices in
+those presets or narrowly scoped helpers. Do not add new SWE-Hero-only defaults
+to shared TorchTitan launchers unless the behavior is explicitly part of the
+SWE-Hero reproduction.
 
 The canonical pod runtime is:
 
@@ -29,7 +37,9 @@ overrides; later flags win through normal argparse ordering. Keep secrets and
 pod/runtime plumbing as environment only: `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
 `WANDB_API_KEY`, `SWEHERO_POD_GIT_BRANCH`, `TORCHTITAN_POD_VENV`,
 `TORCHTITAN_POD_SUPERVISOR`, and tmux-related controls are not experiment
-settings and do not belong in presets.
+settings and do not belong in presets. `SWEHERO_POD_GIT_BRANCH` is a legacy
+compatibility name for the branch synchronization contract; new shared controls
+should use neutral names.
 
 The launcher runs `scripts/setup_torchtitan_pod_venv.sh` itself before the
 training entrypoint starts. On a fresh pod it creates the canonical venv; on a
