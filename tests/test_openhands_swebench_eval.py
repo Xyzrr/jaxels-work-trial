@@ -47,8 +47,12 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(args.docker_smoke_image, "hello-world:latest")
         self.assertFalse(args.skip_docker_run_check)
         self.assertFalse(args.skip_docker_buildx_check)
-        self.assertEqual(args.vllm_tensor_parallel_size, 4)
-        self.assertEqual(args.vllm_pipeline_parallel_size, 2)
+        self.assertEqual(args.num_workers, 192)
+        self.assertEqual(args.vllm_tensor_parallel_size, 1)
+        self.assertEqual(args.vllm_pipeline_parallel_size, 1)
+        self.assertEqual(args.vllm_server_count, 8)
+        self.assertEqual(args.vllm_agent_tasks_per_server, 24)
+        self.assertEqual(args.vllm_router_port, 8090)
         self.assertEqual(args.vllm_gpu_memory_utilization, 0.90)
         self.assertEqual(args.vllm_dtype, "bfloat16")
         self.assertEqual(args.vllm_distributed_executor_backend, "mp")
@@ -97,6 +101,13 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("enable_llm_editor = false", config)
         self.assertNotIn("custom_llm_provider", config)
 
+    def test_max_output_tokens_can_be_omitted_for_ablation(self):
+        args = self._args("--no-max-output-tokens")
+        config = eval_script.build_openhands_config(args)
+
+        self.assertIsNone(args.max_output_tokens)
+        self.assertNotIn("max_output_tokens", config)
+
     def test_write_scaffold_records_commands_without_leaking_real_api_key(self):
         args = self._args("--api-key", "sk-real-secret")
         paths, commands = eval_script.write_scaffold(args)
@@ -124,9 +135,9 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("--tool-call-parser", commands.serve_vllm)
         self.assertIn("hermes", commands.serve_vllm)
         self.assertIn("--tensor-parallel-size", commands.serve_vllm)
-        self.assertIn("4", commands.serve_vllm)
+        self.assertIn("1", commands.serve_vllm)
         self.assertIn("--pipeline-parallel-size", commands.serve_vllm)
-        self.assertIn("2", commands.serve_vllm)
+        self.assertIn("1", commands.serve_vllm)
         self.assertIn("--gpu-memory-utilization", commands.serve_vllm)
         self.assertIn("0.9", commands.serve_vllm)
         self.assertIn("--dtype", commands.serve_vllm)

@@ -14,7 +14,7 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn('[[ -d /workspace ]]', script)
         self.assertIn("command -v nvidia-smi", script)
         self.assertIn('POD_IP="${POD_IP:-$(pod_ip)}"', script)
-        self.assertIn('--base-url "http://${POD_IP}:${VLLM_PORT}/v1"', script)
+        self.assertIn('--base-url "http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"', script)
         self.assertNotIn("127.0.0.1", script)
         self.assertNotIn("openhands" + "-eval-driver", script)
 
@@ -29,6 +29,9 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         script = SCRIPT.read_text()
 
         self.assertIn('"$VLLM_VENV/bin/vllm") serve', script)
+        self.assertIn("CUDA_VISIBLE_DEVICES=\"$gpu\"", script)
+        self.assertIn("scripts/openai_vllm_router.py", script)
+        self.assertIn('VLLM_AGENT_TASKS_PER_SERVER="${VLLM_AGENT_TASKS_PER_SERVER:-24}"', script)
         self.assertIn("--enable-auto-tool-choice", script)
         self.assertIn("--tool-call-parser hermes", script)
         self.assertIn('"$EVAL_VENV/bin/python" scripts/openhands_swebench_eval.py', script)

@@ -2,7 +2,8 @@
 
 The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
 
-- vLLM serving Qwen2.5-Coder-7B across all 8 pod GPUs;
+- one Qwen2.5-Coder-7B vLLM replica per GPU;
+- a pod-local OpenAI-compatible router across those vLLM replicas;
 - OpenHands inference;
 - Dockerized SWE-bench grading.
 
@@ -98,17 +99,24 @@ OPENHANDS_DIR=/workspace/eval-runs/OpenHands
 OPENHANDS_REF=0.62.0
 MAX_OUTPUT_TOKENS=4096
 VLLM_ENFORCE_EAGER=1
-VLLM_TENSOR_PARALLEL_SIZE=4
-VLLM_PIPELINE_PARALLEL_SIZE=2
+VLLM_TENSOR_PARALLEL_SIZE=1
+VLLM_PIPELINE_PARALLEL_SIZE=1
+VLLM_SERVER_COUNT=8
+VLLM_AGENT_TASKS_PER_SERVER=24
+VLLM_ROUTER_PORT=8090
 VLLM_GPU_MEMORY_UTILIZATION=0.90
 VLLM_DTYPE=bfloat16
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND=mp
 REQUIRED_GPU_COUNT=8
 ```
 
-Qwen2.5-Coder-7B cannot use tensor parallel size 8 directly because its 28
-attention heads and 4 KV heads are not divisible by 8. The default TP=4, PP=2
-layout is the valid 8-GPU model-parallel layout for the pod.
+The launcher starts replicas on ports `8000..8007` and exposes the router on
+port `8090`. `VLLM_AGENT_TASKS_PER_SERVER` controls how many concurrent
+OpenHands workers are budgeted per vLLM replica; the default full-run worker
+count is `8 * 24 = 192`.
+
+Set `MAX_OUTPUT_TOKENS=none` only for ablations that intentionally reproduce
+unbounded-output behavior.
 
 Output defaults to:
 
@@ -124,13 +132,16 @@ Override with `--output-dir PATH` when a stable path is needed.
 2. Starts `dockerd` in a pod tmux session if needed.
 3. Verifies Docker by running a real container and checking Buildx.
 4. Creates the Python 3.12 eval environment with the pinned `uv` binary.
-5. Starts vLLM in a pod tmux session if the model endpoint is not already up.
-   The default uses eager execution for eval stability with structured tool
-   calls and uses TP=4, PP=2 so the 7B server spans all 8 pod GPUs.
-6. Installs the OpenHands evaluation dependencies.
-7. Runs `scripts/openhands_swebench_eval.py` with the pod IP as the model
-   endpoint, `tool_choice=required`, and bounded per-turn output.
-8. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
+5. Starts one vLLM tmux session per GPU if the endpoints are not already up.
+   The default uses eager execution plus the 4096-token output cap for
+   structured tool-call decoding stability.
+6. Starts `scripts/openai_vllm_router.py` in a pod tmux session, routing to the
+   per-GPU vLLM replicas with the configured per-replica concurrency limit.
+7. Installs the OpenHands evaluation dependencies.
+8. Runs `scripts/openhands_swebench_eval.py` with the router as the model
+   endpoint, `tool_choice=required`, bounded per-turn output, and
+   `VLLM_SERVER_COUNT * VLLM_AGENT_TASKS_PER_SERVER` workers for full runs.
+9. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
 
 For the 7B smoke, a healthy run should show `used_real_tools: true` and
 structured `tool_calls` in the preflight before reporting pass@1. `loop_errors`

@@ -28,14 +28,19 @@ Environment overrides:
   LLM_API_KEY             Default: local-llm
   VLLM_VENV               Default: /workspace/venvs/openhands-vllm
   VLLM_TENSOR_PARALLEL_SIZE
-                          Default: 4
+                          Default: 1
   VLLM_PIPELINE_PARALLEL_SIZE
-                          Default: 2
+                          Default: 1
+  VLLM_SERVER_COUNT       Default: 8
+  VLLM_AGENT_TASKS_PER_SERVER
+                          Default: 24
+  VLLM_ROUTER_PORT        Default: 8090
   VLLM_DTYPE              Default: bfloat16
   VLLM_FORCE_RESTART      Set to 1 to replace an already-running vLLM server.
   EVAL_VENV               Default: /workspace/venvs/openhands-eval-pod-py312
   OPENHANDS_DIR           Default: /workspace/eval-runs/OpenHands
   OPENHANDS_REF           Default: 0.62.0
+  MAX_OUTPUT_TOKENS       Default: 4096. Set to none only for ablations.
   REQUIRED_GPU_COUNT      Default: 8
   OPENHANDS_EVAL_TMUX_SESSION
   OPENHANDS_EVAL_ATTACH   Default: 1 for interactive shells, otherwise 0
@@ -61,13 +66,18 @@ VLLM_VENV="${VLLM_VENV:-/workspace/venvs/openhands-vllm}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_VISIBLE_DEVICES="${VLLM_VISIBLE_DEVICES:-${VLLM_GPU:-}}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
-VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-4}"
-VLLM_PIPELINE_PARALLEL_SIZE="${VLLM_PIPELINE_PARALLEL_SIZE:-2}"
+VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+VLLM_PIPELINE_PARALLEL_SIZE="${VLLM_PIPELINE_PARALLEL_SIZE:-1}"
+VLLM_SERVER_COUNT="${VLLM_SERVER_COUNT:-8}"
+VLLM_AGENT_TASKS_PER_SERVER="${VLLM_AGENT_TASKS_PER_SERVER:-24}"
+VLLM_ROUTER_PORT="${VLLM_ROUTER_PORT:-8090}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 VLLM_DTYPE="${VLLM_DTYPE:-bfloat16}"
 VLLM_FORCE_RESTART="${VLLM_FORCE_RESTART:-0}"
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
 VLLM_TMUX_SESSION="${VLLM_TMUX_SESSION:-openhands-vllm-7b}"
+VLLM_TMUX_SESSION_PREFIX="${VLLM_TMUX_SESSION_PREFIX:-openhands-vllm-7b-gpu}"
+VLLM_ROUTER_TMUX_SESSION="${VLLM_ROUTER_TMUX_SESSION:-openhands-vllm-router}"
 EVAL_VENV="${EVAL_VENV:-/workspace/venvs/openhands-eval-pod-py312}"
 OPENHANDS_DIR="${OPENHANDS_DIR:-/workspace/eval-runs/OpenHands}"
 OPENHANDS_REF="${OPENHANDS_REF:-0.62.0}"
@@ -197,7 +207,11 @@ command -v curl >/dev/null 2>&1 || die "curl not found; recreate the pod with ma
 command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
 VISIBLE_GPU_COUNT="$(nvidia-smi --list-gpus | wc -l | tr -d ' ')"
 (( VISIBLE_GPU_COUNT >= REQUIRED_GPU_COUNT )) || die "expected at least ${REQUIRED_GPU_COUNT} visible GPUs, found ${VISIBLE_GPU_COUNT}"
-(( VLLM_TENSOR_PARALLEL_SIZE * VLLM_PIPELINE_PARALLEL_SIZE <= VISIBLE_GPU_COUNT )) || die "vLLM TP*PP exceeds visible GPUs: ${VLLM_TENSOR_PARALLEL_SIZE}*${VLLM_PIPELINE_PARALLEL_SIZE} > ${VISIBLE_GPU_COUNT}"
+(( VLLM_SERVER_COUNT <= VISIBLE_GPU_COUNT )) || die "vLLM server count exceeds visible GPUs: ${VLLM_SERVER_COUNT} > ${VISIBLE_GPU_COUNT}"
+(( VLLM_TENSOR_PARALLEL_SIZE == 1 && VLLM_PIPELINE_PARALLEL_SIZE == 1 )) || die "canonical pod eval uses one vLLM per GPU; keep VLLM_TENSOR_PARALLEL_SIZE=1 and VLLM_PIPELINE_PARALLEL_SIZE=1"
+if [[ -n "$VLLM_VISIBLE_DEVICES" && "$VLLM_VISIBLE_DEVICES" != "all" && "$VLLM_SERVER_COUNT" -ne 1 ]]; then
+  die "VLLM_VISIBLE_DEVICES/VLLM_GPU override is only supported with VLLM_SERVER_COUNT=1"
+fi
 
 cd "$WORKSPACE_ROOT"
 mkdir -p /workspace/runlogs "$OUTPUT_DIR"
@@ -255,18 +269,26 @@ pod_ip() {
   hostname -I | awk '{print $1}'
 }
 
-ensure_vllm() {
+vllm_session_name() {
+  local gpu="$1"
+  printf "%s-%s" "$VLLM_TMUX_SESSION_PREFIX" "$gpu"
+}
+
+ensure_vllm_server() {
   local ip="$1"
-  local base_url="http://${ip}:${VLLM_PORT}/v1"
+  local gpu="$2"
+  local port="$3"
+  local session="$4"
+  local base_url="http://${ip}:${port}/v1"
   if [[ "$VLLM_FORCE_RESTART" == "1" || "$VLLM_FORCE_RESTART" == "true" ]]; then
-    tmux kill-session -t "$VLLM_TMUX_SESSION" 2>/dev/null || true
+    tmux kill-session -t "$session" 2>/dev/null || true
   fi
   if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1; then
     return
   fi
 
   [[ -x "$VLLM_VENV/bin/vllm" ]] || die "missing vLLM binary: $VLLM_VENV/bin/vllm"
-  tmux kill-session -t "$VLLM_TMUX_SESSION" 2>/dev/null || true
+  tmux kill-session -t "$session" 2>/dev/null || true
   local vllm_eager_arg=()
   local vllm_distributed_arg=()
   local cuda_visible_arg=()
@@ -278,33 +300,87 @@ ensure_vllm() {
   fi
   if [[ -n "$VLLM_VISIBLE_DEVICES" && "$VLLM_VISIBLE_DEVICES" != "all" ]]; then
     cuda_visible_arg=(CUDA_VISIBLE_DEVICES="$VLLM_VISIBLE_DEVICES")
+  else
+    cuda_visible_arg=(CUDA_VISIBLE_DEVICES="$gpu")
   fi
-  tmux new-session -d -s "$VLLM_TMUX_SESSION" \
-    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host 0.0.0.0 --port $(quote_args "$VLLM_PORT") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len 131072 --tensor-parallel-size $(quote_args "$VLLM_TENSOR_PARALLEL_SIZE") --pipeline-parallel-size $(quote_args "$VLLM_PIPELINE_PARALLEL_SIZE") --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") --enable-auto-tool-choice --tool-call-parser hermes $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${VLLM_TMUX_SESSION}.log 2>&1"
+  tmux new-session -d -s "$session" \
+    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host 0.0.0.0 --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len 131072 --tensor-parallel-size 1 --pipeline-parallel-size 1 --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") --enable-auto-tool-choice --tool-call-parser hermes $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
 
   for _ in $(seq 1 240); do
     curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1 && return
     sleep 2
   done
-  die "vLLM did not become ready; see /workspace/runlogs/${VLLM_TMUX_SESSION}.log"
+  die "vLLM did not become ready; see /workspace/runlogs/${session}.log"
+}
+
+ensure_vllm_router() {
+  local ip="$1"
+  local router_url="http://${ip}:${VLLM_ROUTER_PORT}/v1"
+  shift
+  local backend_args=("$@")
+  if [[ "$VLLM_FORCE_RESTART" == "1" || "$VLLM_FORCE_RESTART" == "true" ]]; then
+    tmux kill-session -t "$VLLM_ROUTER_TMUX_SESSION" 2>/dev/null || true
+  fi
+  if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${router_url}/models" >/dev/null 2>&1; then
+    return
+  fi
+  tmux kill-session -t "$VLLM_ROUTER_TMUX_SESSION" 2>/dev/null || true
+  tmux new-session -d -s "$VLLM_ROUTER_TMUX_SESSION" \
+    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "$EVAL_VENV/bin/python") scripts/openai_vllm_router.py --listen-host 0.0.0.0 --listen-port $(quote_args "$VLLM_ROUTER_PORT") --api-key $(quote_args "$LLM_API_KEY") --per-backend-concurrency $(quote_args "$VLLM_AGENT_TASKS_PER_SERVER") $(quote_args "${backend_args[@]}") > /workspace/runlogs/${VLLM_ROUTER_TMUX_SESSION}.log 2>&1"
+
+  for _ in $(seq 1 90); do
+    curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${router_url}/models" >/dev/null 2>&1 && return
+    sleep 1
+  done
+  die "vLLM router did not become ready; see /workspace/runlogs/${VLLM_ROUTER_TMUX_SESSION}.log"
+}
+
+ensure_vllm_stack() {
+  local ip="$1"
+  if [[ "$VLLM_FORCE_RESTART" == "1" || "$VLLM_FORCE_RESTART" == "true" ]]; then
+    tmux kill-session -t "$VLLM_TMUX_SESSION" 2>/dev/null || true
+  fi
+
+  local backend_args=()
+  local gpu port session
+  for gpu in $(seq 0 $((VLLM_SERVER_COUNT - 1))); do
+    port=$((VLLM_PORT + gpu))
+    session="$(vllm_session_name "$gpu")"
+    ensure_vllm_server "$ip" "$gpu" "$port" "$session"
+    backend_args+=(--backend "http://${ip}:${port}/v1")
+  done
+  ensure_vllm_router "$ip" "${backend_args[@]}"
 }
 
 ensure_docker
 ensure_eval_python
 POD_IP="${POD_IP:-$(pod_ip)}"
-ensure_vllm "$POD_IP"
+ensure_vllm_stack "$POD_IP"
+
+TOTAL_AGENT_WORKERS=$((VLLM_SERVER_COUNT * VLLM_AGENT_TASKS_PER_SERVER))
+if [[ -n "${NUM_WORKERS:-}" ]]; then
+  EVAL_NUM_WORKERS="$NUM_WORKERS"
+elif [[ -n "$EVAL_LIMIT" && "$EVAL_LIMIT" -gt 0 && "$EVAL_LIMIT" -lt "$TOTAL_AGENT_WORKERS" ]]; then
+  EVAL_NUM_WORKERS="$EVAL_LIMIT"
+else
+  EVAL_NUM_WORKERS="$TOTAL_AGENT_WORKERS"
+fi
 
 eval_args=(
   --model-id "$MODEL_ID"
   --served-model-name "$SERVED_MODEL_NAME"
   --litellm-model "$LITELLM_MODEL"
-  --base-url "http://${POD_IP}:${VLLM_PORT}/v1"
+  --base-url "http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"
   --api-key "$LLM_API_KEY"
   --output-dir "$OUTPUT_DIR"
   --openhands-dir "$OPENHANDS_DIR"
   --openhands-ref "$OPENHANDS_REF"
+  --num-workers "$EVAL_NUM_WORKERS"
   --vllm-tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
   --vllm-pipeline-parallel-size "$VLLM_PIPELINE_PARALLEL_SIZE"
+  --vllm-server-count "$VLLM_SERVER_COUNT"
+  --vllm-agent-tasks-per-server "$VLLM_AGENT_TASKS_PER_SERVER"
+  --vllm-router-port "$VLLM_ROUTER_PORT"
   --vllm-gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
   --vllm-dtype "$VLLM_DTYPE"
   --vllm-distributed-executor-backend "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND"

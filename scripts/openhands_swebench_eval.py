@@ -58,8 +58,11 @@ PAPER_TOP_K = 20
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_TOOL_CHOICE = "required"
 DEFAULT_DOCKER_SMOKE_IMAGE = "hello-world:latest"
-DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 4
-DEFAULT_VLLM_PIPELINE_PARALLEL_SIZE = 2
+DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
+DEFAULT_VLLM_PIPELINE_PARALLEL_SIZE = 1
+DEFAULT_VLLM_SERVER_COUNT = 8
+DEFAULT_VLLM_AGENT_TASKS_PER_SERVER = 24
+DEFAULT_VLLM_ROUTER_PORT = 8090
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.90
 DEFAULT_VLLM_DTYPE = "bfloat16"
 DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND = "mp"
@@ -119,6 +122,15 @@ def _env(name: str, default: str) -> str:
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     return default if value is None or value == "" else int(value)
+
+
+def _env_optional_int(name: str, default: int | None) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    if value.lower() in {"none", "null", "off", "false", "disabled", "unbounded"}:
+        return None
+    return int(value)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -412,6 +424,9 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "skip_docker_buildx_check": args.skip_docker_buildx_check,
             "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
             "vllm_pipeline_parallel_size": args.vllm_pipeline_parallel_size,
+            "vllm_server_count": args.vllm_server_count,
+            "vllm_agent_tasks_per_server": args.vllm_agent_tasks_per_server,
+            "vllm_router_port": args.vllm_router_port,
             "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
             "vllm_dtype": args.vllm_dtype,
             "vllm_distributed_executor_backend": (
@@ -930,11 +945,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-output-tokens",
         type=int,
-        default=_env_int("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
+        default=_env_optional_int("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
         help=(
             "Bound each OpenHands model turn. Leaving this unbounded lets "
             "LiteLLM request the rest of the 128k context as output tokens, "
             "which is unstable with vLLM structured decoding."
+        ),
+    )
+    parser.add_argument(
+        "--no-max-output-tokens",
+        action="store_true",
+        help=(
+            "Ablation-only switch: omit max_output_tokens from the generated "
+            "OpenHands config."
         ),
     )
     parser.add_argument("--timeout", type=int, default=_env_int("LLM_TIMEOUT", 300))
@@ -952,7 +975,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=_env_int("MAX_ITERATIONS", PAPER_MAX_ITERATIONS),
     )
-    parser.add_argument("--num-workers", type=int, default=_env_int("NUM_WORKERS", 1))
+    default_workers = _env_int(
+        "NUM_WORKERS",
+        _env_int("VLLM_SERVER_COUNT", DEFAULT_VLLM_SERVER_COUNT)
+        * _env_int(
+            "VLLM_AGENT_TASKS_PER_SERVER", DEFAULT_VLLM_AGENT_TASKS_PER_SERVER
+        ),
+    )
+    parser.add_argument("--num-workers", type=int, default=default_workers)
     parser.add_argument(
         "--eval-note",
         default=_env("EVAL_NOTE", "swehero-qwen25-coder7b-pass1"),
@@ -1010,9 +1040,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "VLLM_TENSOR_PARALLEL_SIZE", DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
         ),
         help=(
-            "Tensor-parallel degree for the command record. Qwen2.5-Coder-7B "
-            "uses 4 by default because its 28 attention heads and 4 KV heads "
-            "do not divide by 8."
+            "Tensor-parallel degree for each vLLM server. The canonical pod "
+            "launcher keeps this at 1 and runs one vLLM replica per GPU."
         ),
     )
     parser.add_argument(
@@ -1022,9 +1051,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "VLLM_PIPELINE_PARALLEL_SIZE", DEFAULT_VLLM_PIPELINE_PARALLEL_SIZE
         ),
         help=(
-            "Pipeline-parallel degree for the command record. The pod launcher "
-            "defaults to TP=4, PP=2 so Qwen2.5-Coder-7B uses all 8 GPUs."
+            "Pipeline-parallel degree for each vLLM server. The canonical pod "
+            "launcher keeps this at 1 and runs one vLLM replica per GPU."
         ),
+    )
+    parser.add_argument(
+        "--vllm-server-count",
+        type=int,
+        default=_env_int("VLLM_SERVER_COUNT", DEFAULT_VLLM_SERVER_COUNT),
+    )
+    parser.add_argument(
+        "--vllm-agent-tasks-per-server",
+        type=int,
+        default=_env_int(
+            "VLLM_AGENT_TASKS_PER_SERVER", DEFAULT_VLLM_AGENT_TASKS_PER_SERVER
+        ),
+        help="Concurrent OpenHands workers allocated per vLLM replica.",
+    )
+    parser.add_argument(
+        "--vllm-router-port",
+        type=int,
+        default=_env_int("VLLM_ROUTER_PORT", DEFAULT_VLLM_ROUTER_PORT),
     )
     parser.add_argument(
         "--vllm-gpu-memory-utilization",
@@ -1069,6 +1116,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.served_model_name = args.model_id
     if not args.litellm_model:
         args.litellm_model = None
+    if args.no_max_output_tokens:
+        args.max_output_tokens = None
     if args.eval_limit is not None and args.eval_limit <= 0:
         raise ValueError("--eval-limit must be positive when provided")
     if not args.base_url and not args.dry_run:
