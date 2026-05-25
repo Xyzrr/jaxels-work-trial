@@ -5,6 +5,8 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # shellcheck source=scripts/pod_git_guard.sh
 source "$ROOT_DIR/scripts/pod_git_guard.sh"
+# shellcheck source=scripts/openhands_eval_worker_selection.sh
+source "$ROOT_DIR/scripts/openhands_eval_worker_selection.sh"
 
 usage() {
   cat <<'USAGE'
@@ -909,22 +911,14 @@ if [[ "$VLLM_USE_ROUTER" == "1" || "$VLLM_USE_ROUTER" == "true" ]]; then
 else
   LLM_BASE_URL="http://${POD_IP}:${VLLM_PORT}/v1"
 fi
-if [[ -n "$EVAL_LIMIT" && "$EVAL_LIMIT" -gt 0 && "$EVAL_LIMIT" -lt "$TOTAL_AGENT_WORKERS" ]]; then
-  EVAL_NUM_WORKERS="$EVAL_LIMIT"
-elif [[ -n "$EVAL_IDS" ]]; then
-  EVAL_ID_COUNT="$(tr ',' '\n' <<<"$EVAL_IDS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
-  if [[ "$EVAL_ID_COUNT" -gt 0 && "$EVAL_ID_COUNT" -lt "$TOTAL_AGENT_WORKERS" ]]; then
-    EVAL_NUM_WORKERS="$EVAL_ID_COUNT"
-  elif [[ "$CONFIG_NUM_WORKERS" -gt 0 ]]; then
-    EVAL_NUM_WORKERS="$CONFIG_NUM_WORKERS"
-  else
-    EVAL_NUM_WORKERS="$TOTAL_AGENT_WORKERS"
-  fi
-elif [[ "$CONFIG_NUM_WORKERS" -gt 0 ]]; then
-  EVAL_NUM_WORKERS="$CONFIG_NUM_WORKERS"
-else
-  EVAL_NUM_WORKERS="$TOTAL_AGENT_WORKERS"
-fi
+EVAL_NUM_WORKERS="$(
+  select_openhands_eval_num_workers \
+    "$EVAL_STACK" \
+    "$EVAL_LIMIT" \
+    "$EVAL_IDS" \
+    "$CONFIG_NUM_WORKERS" \
+    "$TOTAL_AGENT_WORKERS"
+)"
 
 eval_args=(
   "@$CONFIG_PRESET_PATH"

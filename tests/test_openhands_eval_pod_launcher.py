@@ -1,9 +1,11 @@
+import subprocess
 import unittest
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "run_openhands_swebench_eval_pod.sh"
+WORKER_SELECTION_SCRIPT = REPO_ROOT / "scripts" / "openhands_eval_worker_selection.sh"
 
 
 class OpenHandsEvalPodLauncherTests(unittest.TestCase):
@@ -93,12 +95,43 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn('vllm_nccl_env=(NCCL_CUMEM_ENABLE="$nccl_cumem_enable")', script)
         self.assertIn("rm -f /dev/shm/psm_* /dev/shm/sem.mp-* /dev/shm/nccl-*", script)
 
+    def test_worker_selection_preserves_swe_lego_num_workers_contract(self):
+        self.assertEqual(
+            self._select_workers("swe-lego", "", "a,b,c", 24, 24),
+            "24",
+        )
+
+    def test_worker_selection_still_clamps_current_eval_id_smokes(self):
+        self.assertEqual(
+            self._select_workers("openhands", "", "a,b,c", 192, 192),
+            "3",
+        )
+
     def test_vllm_requirement_is_pinned(self):
         requirements = REPO_ROOT / "requirements" / "openhands-vllm.txt"
 
         text = requirements.read_text()
         self.assertIn("vllm==0.9.2", text)
         self.assertIn("transformers==4.53.3", text)
+
+    def _select_workers(
+        self,
+        eval_stack: str,
+        eval_limit: str,
+        eval_ids: str,
+        config_num_workers: int,
+        total_agent_workers: int,
+    ) -> str:
+        command = (
+            f"source {WORKER_SELECTION_SCRIPT}; "
+            "select_openhands_eval_num_workers "
+            f"{eval_stack!r} {eval_limit!r} {eval_ids!r} "
+            f"{config_num_workers} {total_agent_workers}"
+        )
+        return subprocess.check_output(
+            ["bash", "-lc", command],
+            text=True,
+        ).strip()
 
 
 if __name__ == "__main__":
