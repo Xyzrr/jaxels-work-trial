@@ -55,8 +55,14 @@ PAPER_MAX_ITERATIONS = 100
 PAPER_TEMPERATURE = 0.7
 PAPER_TOP_P = 0.8
 PAPER_TOP_K = 20
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_TOOL_CHOICE = "required"
 DEFAULT_DOCKER_SMOKE_IMAGE = "hello-world:latest"
+DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 4
+DEFAULT_VLLM_PIPELINE_PARALLEL_SIZE = 2
+DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.90
+DEFAULT_VLLM_DTYPE = "bfloat16"
+DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND = "mp"
 TOOL_CALL_PREFLIGHT_NAME = "report_eval_preflight"
 TOOL_CALL_PREFLIGHT_TOOL = {
     "type": "function",
@@ -306,10 +312,28 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
         serve_vllm.extend(
             ["--tensor-parallel-size", str(args.vllm_tensor_parallel_size)]
         )
+    if args.vllm_pipeline_parallel_size:
+        serve_vllm.extend(
+            ["--pipeline-parallel-size", str(args.vllm_pipeline_parallel_size)]
+        )
+    serve_vllm.extend(
+        ["--gpu-memory-utilization", str(args.vllm_gpu_memory_utilization)]
+    )
+    if args.vllm_dtype:
+        serve_vllm.extend(["--dtype", args.vllm_dtype])
     if args.native_tool_calling and args.vllm_enable_auto_tool_choice:
         serve_vllm.append("--enable-auto-tool-choice")
         if args.vllm_tool_call_parser:
             serve_vllm.extend(["--tool-call-parser", args.vllm_tool_call_parser])
+    if args.vllm_distributed_executor_backend:
+        serve_vllm.extend(
+            [
+                "--distributed-executor-backend",
+                args.vllm_distributed_executor_backend,
+            ]
+        )
+    if args.vllm_enforce_eager:
+        serve_vllm.append("--enforce-eager")
 
     return EvalCommands(
         prepare_openhands=prepare_openhands,
@@ -350,6 +374,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "top_p": args.top_p,
             "top_k": args.top_k,
             "max_input_tokens": args.max_input_tokens,
+            "max_output_tokens": args.max_output_tokens,
             "max_interaction_rounds": args.max_iterations,
             "tts": "disabled",
             "n_runs": 1,
@@ -385,6 +410,14 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "docker_smoke_image": args.docker_smoke_image,
             "skip_docker_run_check": args.skip_docker_run_check,
             "skip_docker_buildx_check": args.skip_docker_buildx_check,
+            "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+            "vllm_pipeline_parallel_size": args.vllm_pipeline_parallel_size,
+            "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+            "vllm_dtype": args.vllm_dtype,
+            "vllm_distributed_executor_backend": (
+                args.vllm_distributed_executor_backend
+            ),
+            "vllm_enforce_eager": args.vllm_enforce_eager,
         },
         "paths": {
             "config": str(paths.config_path),
@@ -894,7 +927,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=_env_int("MAX_INPUT_TOKENS", PAPER_CONTEXT_LENGTH),
     )
-    parser.add_argument("--max-output-tokens", type=int, default=None)
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=_env_int("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
+        help=(
+            "Bound each OpenHands model turn. Leaving this unbounded lets "
+            "LiteLLM request the rest of the 128k context as output tokens, "
+            "which is unstable with vLLM structured decoding."
+        ),
+    )
     parser.add_argument("--timeout", type=int, default=_env_int("LLM_TIMEOUT", 300))
     parser.add_argument("--dataset", default=_env("DATASET", DEFAULT_DATASET))
     parser.add_argument("--split", default=_env("SPLIT", DEFAULT_SPLIT))
@@ -964,7 +1006,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vllm-tensor-parallel-size",
         type=int,
-        default=_env_int("VLLM_TENSOR_PARALLEL_SIZE", 1),
+        default=_env_int(
+            "VLLM_TENSOR_PARALLEL_SIZE", DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
+        ),
+        help=(
+            "Tensor-parallel degree for the command record. Qwen2.5-Coder-7B "
+            "uses 4 by default because its 28 attention heads and 4 KV heads "
+            "do not divide by 8."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-pipeline-parallel-size",
+        type=int,
+        default=_env_int(
+            "VLLM_PIPELINE_PARALLEL_SIZE", DEFAULT_VLLM_PIPELINE_PARALLEL_SIZE
+        ),
+        help=(
+            "Pipeline-parallel degree for the command record. The pod launcher "
+            "defaults to TP=4, PP=2 so Qwen2.5-Coder-7B uses all 8 GPUs."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=_env_float(
+            "VLLM_GPU_MEMORY_UTILIZATION", DEFAULT_VLLM_GPU_MEMORY_UTILIZATION
+        ),
+    )
+    parser.add_argument(
+        "--vllm-dtype",
+        default=_env("VLLM_DTYPE", DEFAULT_VLLM_DTYPE),
     )
     parser.add_argument(
         "--vllm-enable-auto-tool-choice",
@@ -974,6 +1045,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vllm-tool-call-parser",
         default=_env("VLLM_TOOL_CALL_PARSER", "hermes"),
+    )
+    parser.add_argument(
+        "--vllm-distributed-executor-backend",
+        default=_env(
+            "VLLM_DISTRIBUTED_EXECUTOR_BACKEND",
+            DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND,
+        ),
+    )
+    parser.add_argument(
+        "--vllm-enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("VLLM_ENFORCE_EAGER", True),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")

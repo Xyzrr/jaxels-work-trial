@@ -27,9 +27,16 @@ Environment overrides:
   LITELLM_MODEL           Default: openai/Qwen/Qwen2.5-Coder-7B-Instruct
   LLM_API_KEY             Default: local-llm
   VLLM_VENV               Default: /workspace/venvs/openhands-vllm
+  VLLM_TENSOR_PARALLEL_SIZE
+                          Default: 4
+  VLLM_PIPELINE_PARALLEL_SIZE
+                          Default: 2
+  VLLM_DTYPE              Default: bfloat16
+  VLLM_FORCE_RESTART      Set to 1 to replace an already-running vLLM server.
   EVAL_VENV               Default: /workspace/venvs/openhands-eval-pod-py312
   OPENHANDS_DIR           Default: /workspace/eval-runs/OpenHands
   OPENHANDS_REF           Default: 0.62.0
+  REQUIRED_GPU_COUNT      Default: 8
   OPENHANDS_EVAL_TMUX_SESSION
   OPENHANDS_EVAL_ATTACH   Default: 1 for interactive shells, otherwise 0
 USAGE
@@ -41,6 +48,7 @@ die() {
 }
 
 quote_args() {
+  (($#)) || return 0
   printf "%q " "$@"
 }
 
@@ -51,7 +59,14 @@ LITELLM_MODEL="${LITELLM_MODEL:-openai/Qwen/Qwen2.5-Coder-7B-Instruct}"
 LLM_API_KEY="${LLM_API_KEY:-local-llm}"
 VLLM_VENV="${VLLM_VENV:-/workspace/venvs/openhands-vllm}"
 VLLM_PORT="${VLLM_PORT:-8000}"
-VLLM_GPU="${VLLM_GPU:-0}"
+VLLM_VISIBLE_DEVICES="${VLLM_VISIBLE_DEVICES:-${VLLM_GPU:-}}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
+VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-4}"
+VLLM_PIPELINE_PARALLEL_SIZE="${VLLM_PIPELINE_PARALLEL_SIZE:-2}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+VLLM_DTYPE="${VLLM_DTYPE:-bfloat16}"
+VLLM_FORCE_RESTART="${VLLM_FORCE_RESTART:-0}"
+VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
 VLLM_TMUX_SESSION="${VLLM_TMUX_SESSION:-openhands-vllm-7b}"
 EVAL_VENV="${EVAL_VENV:-/workspace/venvs/openhands-eval-pod-py312}"
 OPENHANDS_DIR="${OPENHANDS_DIR:-/workspace/eval-runs/OpenHands}"
@@ -59,6 +74,7 @@ OPENHANDS_REF="${OPENHANDS_REF:-0.62.0}"
 OPENHANDS_REPO="${OPENHANDS_REPO:-https://github.com/OpenHands/OpenHands.git}"
 DOCKER_TMUX_SESSION="${DOCKER_TMUX_SESSION:-openhands-dockerd}"
 DOCKER_SMOKE_IMAGE="${DOCKER_SMOKE_IMAGE:-hello-world:latest}"
+REQUIRED_GPU_COUNT="${REQUIRED_GPU_COUNT:-8}"
 RUN_ID="${OPENHANDS_EVAL_RUN_ID:-$(date -u +%Y%m%d_%H%M%S)}"
 if [[ -n "${OUTPUT_DIR:-}" ]]; then
   OUTPUT_DIR_EXPLICIT=1
@@ -179,6 +195,9 @@ command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found; run from the
 command -v docker >/dev/null 2>&1 || die "docker not found; recreate the pod with manifests/midtraining-hostpath.yaml"
 command -v curl >/dev/null 2>&1 || die "curl not found; recreate the pod with manifests/midtraining-hostpath.yaml"
 command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
+VISIBLE_GPU_COUNT="$(nvidia-smi --list-gpus | wc -l | tr -d ' ')"
+(( VISIBLE_GPU_COUNT >= REQUIRED_GPU_COUNT )) || die "expected at least ${REQUIRED_GPU_COUNT} visible GPUs, found ${VISIBLE_GPU_COUNT}"
+(( VLLM_TENSOR_PARALLEL_SIZE * VLLM_PIPELINE_PARALLEL_SIZE <= VISIBLE_GPU_COUNT )) || die "vLLM TP*PP exceeds visible GPUs: ${VLLM_TENSOR_PARALLEL_SIZE}*${VLLM_PIPELINE_PARALLEL_SIZE} > ${VISIBLE_GPU_COUNT}"
 
 cd "$WORKSPACE_ROOT"
 mkdir -p /workspace/runlogs "$OUTPUT_DIR"
@@ -200,7 +219,9 @@ ensure_docker() {
 }
 
 ensure_eval_python() {
-  /workspace/uv/uv-0.11.16/uv venv "$EVAL_VENV" --python 3.12
+  if [[ ! -x "$EVAL_VENV/bin/python" ]]; then
+    /workspace/uv/uv-0.11.16/uv venv "$EVAL_VENV" --python 3.12
+  fi
   /workspace/uv/uv-0.11.16/uv pip install \
     --python "$EVAL_VENV/bin/python" \
     pip poetry
@@ -237,14 +258,29 @@ pod_ip() {
 ensure_vllm() {
   local ip="$1"
   local base_url="http://${ip}:${VLLM_PORT}/v1"
+  if [[ "$VLLM_FORCE_RESTART" == "1" || "$VLLM_FORCE_RESTART" == "true" ]]; then
+    tmux kill-session -t "$VLLM_TMUX_SESSION" 2>/dev/null || true
+  fi
   if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1; then
     return
   fi
 
   [[ -x "$VLLM_VENV/bin/vllm" ]] || die "missing vLLM binary: $VLLM_VENV/bin/vllm"
   tmux kill-session -t "$VLLM_TMUX_SESSION" 2>/dev/null || true
+  local vllm_eager_arg=()
+  local vllm_distributed_arg=()
+  local cuda_visible_arg=()
+  if [[ "$VLLM_ENFORCE_EAGER" == "1" || "$VLLM_ENFORCE_EAGER" == "true" ]]; then
+    vllm_eager_arg=(--enforce-eager)
+  fi
+  if [[ -n "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND" ]]; then
+    vllm_distributed_arg=(--distributed-executor-backend "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND")
+  fi
+  if [[ -n "$VLLM_VISIBLE_DEVICES" && "$VLLM_VISIBLE_DEVICES" != "all" ]]; then
+    cuda_visible_arg=(CUDA_VISIBLE_DEVICES="$VLLM_VISIBLE_DEVICES")
+  fi
   tmux new-session -d -s "$VLLM_TMUX_SESSION" \
-    "cd $(quote_args "$WORKSPACE_ROOT") && CUDA_VISIBLE_DEVICES=$(quote_args "$VLLM_GPU") VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host 0.0.0.0 --port $(quote_args "$VLLM_PORT") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len 131072 --tensor-parallel-size 1 --gpu-memory-utilization 0.90 --dtype bfloat16 --enable-auto-tool-choice --tool-call-parser hermes > /workspace/runlogs/${VLLM_TMUX_SESSION}.log 2>&1"
+    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host 0.0.0.0 --port $(quote_args "$VLLM_PORT") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len 131072 --tensor-parallel-size $(quote_args "$VLLM_TENSOR_PARALLEL_SIZE") --pipeline-parallel-size $(quote_args "$VLLM_PIPELINE_PARALLEL_SIZE") --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") --enable-auto-tool-choice --tool-call-parser hermes $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${VLLM_TMUX_SESSION}.log 2>&1"
 
   for _ in $(seq 1 240); do
     curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1 && return
@@ -267,7 +303,17 @@ eval_args=(
   --output-dir "$OUTPUT_DIR"
   --openhands-dir "$OPENHANDS_DIR"
   --openhands-ref "$OPENHANDS_REF"
+  --vllm-tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
+  --vllm-pipeline-parallel-size "$VLLM_PIPELINE_PARALLEL_SIZE"
+  --vllm-gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
+  --vllm-dtype "$VLLM_DTYPE"
+  --vllm-distributed-executor-backend "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND"
 )
+if [[ "$VLLM_ENFORCE_EAGER" == "1" || "$VLLM_ENFORCE_EAGER" == "true" ]]; then
+  eval_args+=(--vllm-enforce-eager)
+else
+  eval_args+=(--no-vllm-enforce-eager)
+fi
 
 if [[ -n "$EVAL_LIMIT" ]]; then
   eval_args+=(--eval-limit "$EVAL_LIMIT")

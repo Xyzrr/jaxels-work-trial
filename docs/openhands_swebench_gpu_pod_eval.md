@@ -2,7 +2,7 @@
 
 The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
 
-- vLLM serving Qwen2.5-Coder-7B on GPU 0;
+- vLLM serving Qwen2.5-Coder-7B across all 8 pod GPUs;
 - OpenHands inference;
 - Dockerized SWE-bench grading.
 
@@ -96,7 +96,19 @@ VLLM_VENV=/workspace/venvs/openhands-vllm
 EVAL_VENV=/workspace/venvs/openhands-eval-pod-py312
 OPENHANDS_DIR=/workspace/eval-runs/OpenHands
 OPENHANDS_REF=0.62.0
+MAX_OUTPUT_TOKENS=4096
+VLLM_ENFORCE_EAGER=1
+VLLM_TENSOR_PARALLEL_SIZE=4
+VLLM_PIPELINE_PARALLEL_SIZE=2
+VLLM_GPU_MEMORY_UTILIZATION=0.90
+VLLM_DTYPE=bfloat16
+VLLM_DISTRIBUTED_EXECUTOR_BACKEND=mp
+REQUIRED_GPU_COUNT=8
 ```
+
+Qwen2.5-Coder-7B cannot use tensor parallel size 8 directly because its 28
+attention heads and 4 KV heads are not divisible by 8. The default TP=4, PP=2
+layout is the valid 8-GPU model-parallel layout for the pod.
 
 Output defaults to:
 
@@ -113,10 +125,14 @@ Override with `--output-dir PATH` when a stable path is needed.
 3. Verifies Docker by running a real container and checking Buildx.
 4. Creates the Python 3.12 eval environment with the pinned `uv` binary.
 5. Starts vLLM in a pod tmux session if the model endpoint is not already up.
+   The default uses eager execution for eval stability with structured tool
+   calls and uses TP=4, PP=2 so the 7B server spans all 8 pod GPUs.
 6. Installs the OpenHands evaluation dependencies.
 7. Runs `scripts/openhands_swebench_eval.py` with the pod IP as the model
-   endpoint and `tool_choice=required`.
+   endpoint, `tool_choice=required`, and bounded per-turn output.
 8. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
 
 For the 7B smoke, a healthy run should show `used_real_tools: true` and
-`loop_errors: 0` before reporting pass@1.
+structured `tool_calls` in the preflight before reporting pass@1. `loop_errors`
+then describes the model trajectory quality for the sampled SWE-bench task; it
+is not, by itself, evidence that vLLM returned plain text instead of tool calls.

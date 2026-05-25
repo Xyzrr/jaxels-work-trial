@@ -39,6 +39,7 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(args.temperature, 0.7)
         self.assertEqual(args.top_p, 0.8)
         self.assertEqual(args.top_k, 20)
+        self.assertEqual(args.max_output_tokens, 4096)
         self.assertIsNone(args.eval_limit)
         self.assertTrue(args.native_tool_calling)
         self.assertEqual(args.tool_choice, "required")
@@ -46,6 +47,12 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(args.docker_smoke_image, "hello-world:latest")
         self.assertFalse(args.skip_docker_run_check)
         self.assertFalse(args.skip_docker_buildx_check)
+        self.assertEqual(args.vllm_tensor_parallel_size, 4)
+        self.assertEqual(args.vllm_pipeline_parallel_size, 2)
+        self.assertEqual(args.vllm_gpu_memory_utilization, 0.90)
+        self.assertEqual(args.vllm_dtype, "bfloat16")
+        self.assertEqual(args.vllm_distributed_executor_backend, "mp")
+        self.assertTrue(args.vllm_enforce_eager)
 
     def test_base_url_is_required_for_non_dry_run(self):
         with self.assertRaisesRegex(ValueError, "--base-url is required"):
@@ -81,6 +88,7 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("top_p = 0.8", config)
         self.assertIn("top_k = 20", config)
         self.assertIn("max_input_tokens = 131072", config)
+        self.assertIn("max_output_tokens = 4096", config)
         self.assertIn("native_tool_calling = true", config)
         self.assertIn('completion_kwargs = { tool_choice = "required" }', config)
         self.assertIn("[agent.swehero_openhands]", config)
@@ -115,6 +123,17 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("--enable-auto-tool-choice", commands.serve_vllm)
         self.assertIn("--tool-call-parser", commands.serve_vllm)
         self.assertIn("hermes", commands.serve_vllm)
+        self.assertIn("--tensor-parallel-size", commands.serve_vllm)
+        self.assertIn("4", commands.serve_vllm)
+        self.assertIn("--pipeline-parallel-size", commands.serve_vllm)
+        self.assertIn("2", commands.serve_vllm)
+        self.assertIn("--gpu-memory-utilization", commands.serve_vllm)
+        self.assertIn("0.9", commands.serve_vllm)
+        self.assertIn("--dtype", commands.serve_vllm)
+        self.assertIn("bfloat16", commands.serve_vllm)
+        self.assertIn("--distributed-executor-backend", commands.serve_vllm)
+        self.assertIn("mp", commands.serve_vllm)
+        self.assertIn("--enforce-eager", commands.serve_vllm)
 
     def test_summarize_report_computes_pass_at_1_from_resolved_ids(self):
         report_path = Path(self.tempdir.name) / "report.json"
