@@ -52,6 +52,52 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
         self.assertIn('tmux kill-session -t "$TMUX_SESSION"', script)
         self.assertIn("--replace-session only applies to tmux-supervised launches", script)
 
+    def test_launcher_stores_and_compares_tmux_launch_context(self):
+        script = SCRIPT.read_text()
+
+        self.assertIn('TMUX_CONTEXT_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.context.json"', script)
+        self.assertIn("write_tmux_context()", script)
+        self.assertIn("compare_tmux_context()", script)
+        self.assertIn('compare_tmux_context "$TMUX_CONTEXT_PATH" "$script_path" "$command"', script)
+        self.assertIn('write_tmux_context "$TMUX_CONTEXT_PATH" "$script_path" "$command"', script)
+        self.assertIn('@swehero_launch_context "$TMUX_CONTEXT_PATH"', script)
+        self.assertIn('echo "context: $TMUX_CONTEXT_PATH"', script)
+        launch_block = script[
+            script.index('if [[ "$LAUNCH_SESSION" == "1" ]]') :
+            script.index('if ! tmux new-session')
+        ]
+        self.assertLess(
+            launch_block.index("ensure_pod_git_checkout"),
+            launch_block.index('eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"'),
+        )
+        self.assertLess(
+            launch_block.index('eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"'),
+            launch_block.index('write_tmux_context "$TMUX_CONTEXT_PATH" "$script_path" "$command"'),
+        )
+
+    def test_launcher_context_compares_normalized_fields(self):
+        script = SCRIPT.read_text()
+        context_helper = script[
+            script.index("tmux_launch_context()") : script.index("ensure_docker()")
+        ]
+
+        self.assertIn('"kind": "openhands_swebench_image_prebuild"', context_helper)
+        self.assertIn('"requested": {', context_helper)
+        self.assertIn('"parallel_builds": int(parallel_builds)', context_helper)
+        self.assertIn('"resolved_eval_config": {', context_helper)
+        self.assertIn('def comparable_context(context: dict[str, Any])', context_helper)
+        self.assertIn('"created_at_utc": now_utc()', context_helper)
+        self.assertIn('"foreground_command": foreground_command', context_helper)
+        self.assertNotIn("LLM_API_KEY", context_helper)
+
+    def test_existing_session_without_matching_context_fails_clearly(self):
+        script = SCRIPT.read_text()
+
+        self.assertIn("launch context is missing", script)
+        self.assertIn("different launch context", script)
+        self.assertIn("Use --replace-session to restart it with the requested context", script)
+        self.assertIn("or --tmux-session NAME to launch a separate prebuild", script)
+
     def test_launcher_is_pod_only_and_enforces_pod_git_checkout(self):
         script = SCRIPT.read_text()
 
@@ -113,6 +159,7 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
         self.assertIn("rerun attaches", doc)
         self.assertIn("--replace-session", doc)
         self.assertIn("--parallel-builds N", doc)
+        self.assertIn(".context.json", doc)
         self.assertIn("already-built images are skipped", doc)
 
 

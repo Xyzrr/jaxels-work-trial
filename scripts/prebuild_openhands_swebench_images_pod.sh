@@ -99,6 +99,234 @@ for key, value in values.items():
 PY
 }
 
+tmux_launch_context() {
+  local mode="$1"
+  local context_path="$2"
+  local script_path="$3"
+  local foreground_command="$4"
+  local git_branch
+  local git_commit
+  git_branch="$(git -C "$ROOT_DIR" branch --show-current 2>/dev/null || true)"
+  git_commit="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
+
+  python3 - \
+    "$mode" \
+    "$context_path" \
+    "$ROOT_DIR" \
+    "$script_path" \
+    "$TMUX_SESSION" \
+    "$CONFIG_PRESET_PATH" \
+    "${EVAL_LIMIT:-}" \
+    "$PARALLEL_BUILDS" \
+    "$EVAL_VENV" \
+    "$DATASET" \
+    "$SPLIT" \
+    "$RUNTIME" \
+    "$OPENHANDS_REPO" \
+    "$OPENHANDS_REF" \
+    "$OPENHANDS_DIR" \
+    "$DOCKER_SMOKE_IMAGE" \
+    "$git_branch" \
+    "$git_commit" \
+    "$foreground_command" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+(
+    mode,
+    context_path_raw,
+    workspace_root,
+    script_path,
+    tmux_session,
+    config_path,
+    eval_limit,
+    parallel_builds,
+    eval_venv,
+    dataset,
+    split,
+    runtime,
+    openhands_repo,
+    openhands_ref,
+    openhands_dir,
+    docker_smoke_image,
+    git_branch,
+    git_commit,
+    foreground_command,
+) = sys.argv[1:]
+
+context_path = Path(context_path_raw)
+
+
+def optional_int(raw: str) -> int | None:
+    return None if raw == "" else int(raw)
+
+
+def now_utc() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def build_context() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "openhands_swebench_image_prebuild",
+        "tmux_session": tmux_session,
+        "created_at_utc": now_utc(),
+        "workspace_root": workspace_root,
+        "script_path": script_path,
+        "foreground_command": foreground_command,
+        "requested": {
+            "config": config_path,
+            "eval_limit": optional_int(eval_limit),
+            "parallel_builds": int(parallel_builds),
+            "eval_venv": eval_venv,
+        },
+        "resolved_eval_config": {
+            "dataset": dataset,
+            "split": split,
+            "runtime": runtime,
+            "openhands_repo": openhands_repo,
+            "openhands_ref": openhands_ref,
+            "openhands_dir": openhands_dir,
+            "docker_smoke_image": docker_smoke_image,
+        },
+        "git": {
+            "branch": git_branch or None,
+            "commit": git_commit or None,
+        },
+    }
+
+
+def comparable_context(context: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": context["schema_version"],
+        "kind": context["kind"],
+        "tmux_session": context["tmux_session"],
+        "workspace_root": context["workspace_root"],
+        "script_path": context["script_path"],
+        "requested": context["requested"],
+        "resolved_eval_config": context["resolved_eval_config"],
+    }
+
+
+def flatten(value: Any, prefix: str = "") -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {prefix: value}
+    flattened: dict[str, Any] = {}
+    for key, child in value.items():
+        child_prefix = f"{prefix}.{key}" if prefix else str(key)
+        flattened.update(flatten(child, child_prefix))
+    return flattened
+
+
+def format_value(value: Any) -> str:
+    return json.dumps(value, sort_keys=True)
+
+
+def write_context(context: dict[str, Any]) -> None:
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{context_path.name}.",
+        suffix=".tmp",
+        dir=str(context_path.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(context, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, context_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+requested_context = build_context()
+if mode == "write":
+    write_context(requested_context)
+elif mode == "compare":
+    if not context_path.is_file():
+        print(
+            f"error: tmux session already exists but launch context is missing: {context_path}",
+            file=sys.stderr,
+        )
+        print(
+            "Use --replace-session to restart it with the requested context, "
+            "or --tmux-session NAME to launch a separate prebuild.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    try:
+        existing_context = json.loads(context_path.read_text())
+        existing = comparable_context(existing_context)
+    except Exception as exc:
+        print(
+            f"error: tmux session launch context is unreadable or unsupported: {context_path}",
+            file=sys.stderr,
+        )
+        print(f"reason: {exc}", file=sys.stderr)
+        print(
+            "Use --replace-session to restart it with a fresh context, "
+            "or --tmux-session NAME to launch a separate prebuild.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    requested = comparable_context(requested_context)
+    if existing != requested:
+        existing_flat = flatten(existing)
+        requested_flat = flatten(requested)
+        paths = sorted(set(existing_flat) | set(requested_flat))
+        print(
+            f"error: tmux session already exists with different launch context: {tmux_session}",
+            file=sys.stderr,
+        )
+        print(f"context: {context_path}", file=sys.stderr)
+        print("", file=sys.stderr)
+        for path in paths:
+            existing_value = existing_flat.get(path, "<missing>")
+            requested_value = requested_flat.get(path, "<missing>")
+            if existing_value == requested_value:
+                continue
+            print(f"{path}:", file=sys.stderr)
+            print(f"  existing:  {format_value(existing_value)}", file=sys.stderr)
+            print(f"  requested: {format_value(requested_value)}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "Use --replace-session to restart it with the requested context, "
+            "or --tmux-session NAME to launch a separate prebuild.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+else:
+    raise SystemExit(f"unknown context mode: {mode}")
+PY
+}
+
+write_tmux_context() {
+  tmux_launch_context write "$@"
+}
+
+compare_tmux_context() {
+  tmux_launch_context compare "$@"
+}
+
 ensure_docker() {
   if ! docker info >/dev/null 2>&1; then
     tmux kill-session -t openhands-dockerd 2>/dev/null || true
@@ -462,34 +690,44 @@ CONFIG_PRESET_PATH="$(resolve_path "$CONFIG_PRESET")"
 eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
 [[ "$RUNTIME" == "docker" ]] || die "prebuild only applies to --runtime docker configs"
 TMUX_LOG_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.log"
+TMUX_CONTEXT_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.context.json"
 
 if [[ "$FOREGROUND" != "1" ]]; then
   [[ "$(uname -s)" != "Darwin" ]] || die "this launcher is pod-only; run it from the Kubernetes GPU pod"
   [[ -d /workspace ]] || die "expected /workspace hostPath; run from the GPU pod"
   command -v tmux >/dev/null 2>&1 || die "tmux is required for pod prebuilds"
   mkdir -p "$TMUX_LOG_DIR"
+  script_path="$(realpath "$0")"
+  command="cd $(quote_args "$ROOT_DIR") && SWEHERO_POD_GIT_BRANCH=$(quote_args "${SWEHERO_POD_GIT_BRANCH:-}") EVAL_VENV=$(quote_args "$EVAL_VENV") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION") --parallel-builds $(quote_args "$PARALLEL_BUILDS")"
+  if [[ -n "$EVAL_LIMIT" ]]; then
+    command+=" --eval-limit $(quote_args "$EVAL_LIMIT")"
+  fi
   LAUNCH_SESSION=1
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     if [[ "$REPLACE_SESSION" == "1" ]]; then
       echo "replacing tmux session: $TMUX_SESSION"
     else
+      compare_tmux_context "$TMUX_CONTEXT_PATH" "$script_path" "$command"
       echo "tmux session already exists: $TMUX_SESSION"
       LAUNCH_SESSION=0
     fi
   fi
   if [[ "$LAUNCH_SESSION" == "1" ]]; then
     ensure_pod_git_checkout
+    eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
+    [[ "$RUNTIME" == "docker" ]] || die "prebuild only applies to --runtime docker configs"
     if [[ "$REPLACE_SESSION" == "1" ]]; then
       tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
     fi
-    script_path="$(realpath "$0")"
-    command="cd $(quote_args "$ROOT_DIR") && SWEHERO_POD_GIT_BRANCH=$(quote_args "$SWEHERO_POD_GIT_BRANCH") EVAL_VENV=$(quote_args "$EVAL_VENV") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION") --parallel-builds $(quote_args "$PARALLEL_BUILDS")"
-    if [[ -n "$EVAL_LIMIT" ]]; then
-      command+=" --eval-limit $(quote_args "$EVAL_LIMIT")"
+    write_tmux_context "$TMUX_CONTEXT_PATH" "$script_path" "$command"
+    if ! tmux new-session -d -s "$TMUX_SESSION" "set -euo pipefail; $command 2>&1 | tee -a $(quote_args "$TMUX_LOG_PATH")"; then
+      rm -f "$TMUX_CONTEXT_PATH"
+      die "failed to launch tmux session: $TMUX_SESSION"
     fi
-    tmux new-session -d -s "$TMUX_SESSION" "set -euo pipefail; $command 2>&1 | tee -a $(quote_args "$TMUX_LOG_PATH")"
+    tmux set-option -t "$TMUX_SESSION" @swehero_launch_context "$TMUX_CONTEXT_PATH" >/dev/null 2>&1 || true
     echo "launched tmux session: $TMUX_SESSION"
   fi
+  echo "context: $TMUX_CONTEXT_PATH"
   echo "log: $TMUX_LOG_PATH"
   if [[ "$ATTACH" == "1" ]]; then
     exec tmux attach-session -t "$TMUX_SESSION"

@@ -88,7 +88,10 @@ launch a fresh prebuild instead. It inspects the final OpenHands runtime image
 tag before every build, so already-built images are skipped. Missing runtime
 images build in parallel; use `--parallel-builds N` to tune concurrency, or
 `--parallel-builds 1` to force the old serial behavior. Use `--eval-limit N`
-only for a small prebuild smoke.
+only for a small prebuild smoke. The launcher also writes
+`/workspace/runlogs/openhands-swebench-image-prebuild.context.json`; reruns with
+the same session name must match that stored launch context unless
+`--replace-session` is set.
 
 ## Smoke Command
 
