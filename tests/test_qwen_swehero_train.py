@@ -572,9 +572,8 @@ class TestQwenSweHeroTorchTitanLauncher:
 
     def _require_real_materialization_dependencies(self):
         try:
-            import pyarrow  # noqa: F401
-
             import datasets  # noqa: F401
+            import pyarrow  # noqa: F401
         except ImportError as exc:
             pytest.skip(f"real SWE-HERO materialization deps unavailable: {exc}")
 

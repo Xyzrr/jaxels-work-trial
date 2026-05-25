@@ -189,6 +189,7 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["scripts"]
+known-third-party = ["datasets", "pyarrow", "torch", "transformers"]
 
 [tool.ruff.format]
 line-ending = "lf"

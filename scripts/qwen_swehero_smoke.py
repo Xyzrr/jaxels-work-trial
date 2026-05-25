@@ -270,6 +270,7 @@ def maybe_enable_yarn(
 
 def main() -> None:
     import torch
+    from datasets import load_dataset
     from transformers import (
         AutoConfig,
         AutoModelForCausalLM,
@@ -277,8 +278,6 @@ def main() -> None:
         Trainer,
         TrainingArguments,
     )
-
-    from datasets import load_dataset
 
     load_env_file()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
