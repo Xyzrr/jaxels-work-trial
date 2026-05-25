@@ -476,7 +476,7 @@ from openhands.runtime.utils.runtime_build import (
     get_hash_for_source_files,
     get_runtime_image_repo,
 )
-from openhands.version import get_version
+from openhands import __version__ as openhands_version
 
 
 def parse_args() -> argparse.Namespace:
@@ -502,7 +502,7 @@ def local_image_exists(client: docker.DockerClient, image_name: str) -> bool:
 
 
 def runtime_target_image(base_image: str, source_hash: str) -> str:
-    lock_tag = f"oh_v{get_version()}_{get_hash_for_lock_files(base_image, False)}"
+    lock_tag = f"oh_v{openhands_version}_{get_hash_for_lock_files(base_image, False)}"
     return f"{get_runtime_image_repo()}:{lock_tag}_{source_hash}"
 
 

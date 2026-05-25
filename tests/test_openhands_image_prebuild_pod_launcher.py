@@ -121,6 +121,8 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
         self.assertIn("swebench_official_image=True", script)
         self.assertIn("platform=\"linux/amd64\"", script)
         self.assertIn("enable_browser=False", script)
+        self.assertIn("from openhands import __version__ as openhands_version", script)
+        self.assertNotIn("from openhands.version import get_version", script)
 
     def test_launcher_supports_swe_lego_vendored_openhands_checkout(self):
         script = SCRIPT.read_text()
