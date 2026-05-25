@@ -19,11 +19,12 @@ Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HE
 
 - `torchtitan/`: fully vendored TorchTitan base for distributed training.
 - `manifests/midtraining-hostpath.yaml`: GPU pod manifest.
-- `tmp/pod-creds/`: local credentials; never commit.
+- `tmp/pod-creds/kubeconfig.yaml`: kubeconfig for the GPU pod. Use this file for Kubernetes access, for example with `KUBECONFIG=tmp/pod-creds/kubeconfig.yaml` or `kubectl --kubeconfig tmp/pod-creds/kubeconfig.yaml ...`. Never commit anything under `tmp/pod-creds/`.
 
 # Working Rules
 
 - Re-read the paper before changing pipeline assumptions.
+- Use `tmp/pod-creds/kubeconfig.yaml` whenever running `kubectl`, `helm`, or other Kubernetes tools for this project.
 - Prefer TorchTitan's existing extension points and scripts over ad-hoc training code.
 - Keep secrets, pod credentials, `.env`, checkpoints, datasets, and generated run artifacts out of git.
 - Preserve enough metadata to reproduce each run: model, dataset revision, tokenizer/chat template, sequence length, loss masking, LR schedule, batch size, hardware, commit, and eval harness revision.
