@@ -94,9 +94,11 @@ SERVED_MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct
 LITELLM_MODEL=openai/Qwen/Qwen2.5-Coder-7B-Instruct
 LLM_API_KEY=local-llm
 VLLM_VENV=/workspace/venvs/openhands-vllm
+VLLM_REQUIREMENTS_PATH=/workspace/jaxels-work-trial/requirements/openhands-vllm.txt
 EVAL_VENV=/workspace/venvs/openhands-eval-pod-py312
 OPENHANDS_DIR=/workspace/eval-runs/OpenHands
 OPENHANDS_REF=0.62.0
+OPENHANDS_EVAL_POETRY_VERSION=2.1.3
 MAX_OUTPUT_TOKENS=8192
 VLLM_ENFORCE_EAGER=1
 VLLM_TENSOR_PARALLEL_SIZE=1
@@ -129,19 +131,25 @@ Override with `--output-dir PATH` when a stable path is needed.
 ## What the Launcher Does
 
 1. Refuses to run on macOS or outside `/workspace`.
-2. Starts `dockerd` in a pod tmux session if needed.
-3. Verifies Docker by running a real container and checking Buildx.
-4. Creates the Python 3.12 eval environment with the pinned `uv` binary.
-5. Starts one vLLM tmux session per GPU if the endpoints are not already up.
+2. Bootstraps and verifies the pinned `uv 0.11.16` binary if the pod does not
+   already have it.
+3. Starts `dockerd` in a pod tmux session if needed.
+4. Verifies Docker by running a real container and checking Buildx.
+5. Creates or repairs the Python 3.12 eval environment, including
+   `poetry==2.1.3`.
+6. Creates or repairs the Python 3.12 vLLM environment from
+   `requirements/openhands-vllm.txt` before starting any missing vLLM server.
+7. Starts one vLLM tmux session per GPU if the endpoints are not already up.
    The default uses eager execution plus the 8192-token output cap for
    structured tool-call decoding stability.
-6. Starts `scripts/openai_vllm_router.py` in a pod tmux session, routing to the
+8. Starts `scripts/openai_vllm_router.py` in a pod tmux session, routing to the
    per-GPU vLLM replicas with the configured per-replica concurrency limit.
-7. Installs the OpenHands evaluation dependencies.
-8. Runs `scripts/openhands_swebench_eval.py` with the router as the model
+9. Syncs the OpenHands evaluation dependencies from the `OPENHANDS_REF`
+   checkout's lockfile.
+10. Runs `scripts/openhands_swebench_eval.py` with the router as the model
    endpoint, `tool_choice=required`, bounded per-turn output, and
    `VLLM_SERVER_COUNT * VLLM_AGENT_TASKS_PER_SERVER` workers for full runs.
-9. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
+11. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
 
 For the 7B smoke, a healthy run should show `used_real_tools: true` and
 structured `tool_calls` in the preflight before reporting pass@1. `loop_errors`

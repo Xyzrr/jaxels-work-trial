@@ -1,0 +1,6 @@
+# Canonical vLLM runtime for scripts/run_openhands_swebench_eval_pod.sh.
+#
+# Keep this pinned. The eval launcher syncs /workspace/venvs/openhands-vllm
+# from this file whenever it needs to start a vLLM server, so an existing pod
+# with stale or incompatible packages is repaired before serving.
+vllm==0.9.2

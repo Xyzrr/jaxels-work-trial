@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
 usage() {
   cat <<'USAGE'
 Usage: scripts/run_openhands_swebench_eval_pod.sh [options]
@@ -27,6 +29,7 @@ Environment overrides:
   LITELLM_MODEL           Default: openai/Qwen/Qwen2.5-Coder-7B-Instruct
   LLM_API_KEY             Default: local-llm
   VLLM_VENV               Default: /workspace/venvs/openhands-vllm
+  VLLM_REQUIREMENTS_PATH  Default: requirements/openhands-vllm.txt
   VLLM_TENSOR_PARALLEL_SIZE
                           Default: 1
   VLLM_PIPELINE_PARALLEL_SIZE
@@ -38,6 +41,8 @@ Environment overrides:
   VLLM_DTYPE              Default: bfloat16
   VLLM_FORCE_RESTART      Set to 1 to replace an already-running vLLM server.
   EVAL_VENV               Default: /workspace/venvs/openhands-eval-pod-py312
+  OPENHANDS_EVAL_POETRY_VERSION
+                          Default: 2.1.3
   OPENHANDS_DIR           Default: /workspace/eval-runs/OpenHands
   OPENHANDS_REF           Default: 0.62.0
   MAX_OUTPUT_TOKENS       Default: 8192. Set to none only for ablations.
@@ -52,6 +57,13 @@ die() {
   exit 1
 }
 
+readonly OPENHANDS_EVAL_UV_VERSION="0.11.16"
+readonly UV_X86_64_UNKNOWN_LINUX_GNU_SHA256="74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
+if [[ -n "${UV_VERSION:-}" && "$UV_VERSION" != "$OPENHANDS_EVAL_UV_VERSION" ]]; then
+  die "UV_VERSION override is not supported; expected uv ${OPENHANDS_EVAL_UV_VERSION}, got ${UV_VERSION}"
+fi
+readonly UV_VERSION="$OPENHANDS_EVAL_UV_VERSION"
+
 quote_args() {
   (($#)) || return 0
   printf "%q " "$@"
@@ -63,6 +75,8 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen2.5-Coder-7B-Instruct}"
 LITELLM_MODEL="${LITELLM_MODEL:-openai/Qwen/Qwen2.5-Coder-7B-Instruct}"
 LLM_API_KEY="${LLM_API_KEY:-local-llm}"
 VLLM_VENV="${VLLM_VENV:-/workspace/venvs/openhands-vllm}"
+VLLM_REQUIREMENTS_PATH="${VLLM_REQUIREMENTS_PATH:-$ROOT_DIR/requirements/openhands-vllm.txt}"
+VLLM_PYTHON_VERSION="${VLLM_PYTHON_VERSION:-3.12}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_VISIBLE_DEVICES="${VLLM_VISIBLE_DEVICES:-${VLLM_GPU:-}}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
@@ -79,6 +93,10 @@ VLLM_TMUX_SESSION="${VLLM_TMUX_SESSION:-openhands-vllm-7b}"
 VLLM_TMUX_SESSION_PREFIX="${VLLM_TMUX_SESSION_PREFIX:-openhands-vllm-7b-gpu}"
 VLLM_ROUTER_TMUX_SESSION="${VLLM_ROUTER_TMUX_SESSION:-openhands-vllm-router}"
 EVAL_VENV="${EVAL_VENV:-/workspace/venvs/openhands-eval-pod-py312}"
+OPENHANDS_EVAL_PYTHON_VERSION="${OPENHANDS_EVAL_PYTHON_VERSION:-3.12}"
+# OpenHands 0.62.0 locks Poetry to 2.1.3; keep the launcher tool version in
+# step with that checkout instead of floating to the newest Poetry release.
+OPENHANDS_EVAL_POETRY_VERSION="${OPENHANDS_EVAL_POETRY_VERSION:-2.1.3}"
 OPENHANDS_DIR="${OPENHANDS_DIR:-/workspace/eval-runs/OpenHands}"
 OPENHANDS_REF="${OPENHANDS_REF:-0.62.0}"
 OPENHANDS_REPO="${OPENHANDS_REPO:-https://github.com/OpenHands/OpenHands.git}"
@@ -95,6 +113,12 @@ OUTPUT_DIR="${OUTPUT_DIR:-/workspace/eval-runs/openhands-swebench-verified-pass1
 TMUX_SESSION="${OPENHANDS_EVAL_TMUX_SESSION:-openhands-swebench-eval-${RUN_ID}}"
 TMUX_LOG_DIR="${OPENHANDS_EVAL_TMUX_LOG_DIR:-/workspace/runlogs}"
 TMUX_LOG_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.log"
+UV_TOOL_DIR="${UV_TOOL_DIR:-/workspace/uv}"
+UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.cache/uv}"
+UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/workspace/python}"
+BOOTSTRAP_PYTHON="${PYTHON:-}"
+EVAL_PYTHON_READY=0
+VLLM_PYTHON_READY=0
 
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 PREFLIGHT_ONLY=0
@@ -195,16 +219,244 @@ if [[ "$FOREGROUND" != "1" ]]; then
   exit 0
 fi
 
+uv_version_matches() {
+  local uv_bin="$1"
+  local actual
+  actual="$("$uv_bin" --version 2>/dev/null || true)"
+  [[ "$actual" == "uv $UV_VERSION"* ]]
+}
+
+require_uv_version() {
+  local uv_bin="$1"
+  local actual
+  actual="$("$uv_bin" --version)"
+  if [[ "$actual" != "uv $UV_VERSION"* ]]; then
+    echo "Wrong uv binary at $uv_bin: expected uv $UV_VERSION, found: $actual" >&2
+    return 1
+  fi
+  echo "$actual" >&2
+}
+
+ensure_uv() {
+  local uv_bin="${UV_BIN:-}"
+  if [[ -n "$uv_bin" ]]; then
+    [[ -x "$uv_bin" ]] || die "UV_BIN is not executable: $uv_bin"
+    require_uv_version "$uv_bin"
+    printf "%s\n" "$uv_bin"
+    return
+  fi
+
+  local managed_dir="$UV_TOOL_DIR/uv-$UV_VERSION"
+  uv_bin="$managed_dir/uv"
+  if [[ -x "$uv_bin" ]]; then
+    if uv_version_matches "$uv_bin"; then
+      require_uv_version "$uv_bin"
+      printf "%s\n" "$uv_bin"
+      return
+    fi
+    echo "Removing wrong uv binary from pinned tool directory: $uv_bin" >&2
+    rm -rf "$managed_dir"
+  fi
+
+  if command -v uv >/dev/null 2>&1; then
+    local system_uv
+    system_uv="$(command -v uv)"
+    if uv_version_matches "$system_uv"; then
+      require_uv_version "$system_uv"
+      printf "%s\n" "$system_uv"
+      return
+    fi
+  fi
+
+  [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] || \
+    die "uv $UV_VERSION is required. Install it or set UV_BIN=/path/to/uv."
+
+  local bootstrap_python="${BOOTSTRAP_PYTHON:-python3}"
+  command -v "$bootstrap_python" >/dev/null 2>&1 || \
+    die "pinned uv is missing and no bootstrap Python is available"
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  mkdir -p "$managed_dir"
+  "$bootstrap_python" - "$UV_VERSION" "$UV_X86_64_UNKNOWN_LINUX_GNU_SHA256" "$tmp_dir/uv.tar.gz" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import shutil
+import sys
+import urllib.request
+
+version, expected_sha256, output_path = sys.argv[1], sys.argv[2], sys.argv[3]
+url = (
+    "https://github.com/astral-sh/uv/releases/download/"
+    f"{version}/uv-x86_64-unknown-linux-gnu.tar.gz"
+)
+with urllib.request.urlopen(url, timeout=120) as response, open(output_path, "wb") as out:
+    shutil.copyfileobj(response, out)
+actual_sha256 = hashlib.sha256(open(output_path, "rb").read()).hexdigest()
+if actual_sha256 != expected_sha256:
+    raise SystemExit(
+        f"uv archive checksum mismatch: expected {expected_sha256}, found {actual_sha256}"
+    )
+PY
+  tar -xzf "$tmp_dir/uv.tar.gz" -C "$tmp_dir"
+  cp "$tmp_dir/uv-x86_64-unknown-linux-gnu/uv" "$managed_dir/uv"
+  cp "$tmp_dir/uv-x86_64-unknown-linux-gnu/uvx" "$managed_dir/uvx"
+  chmod 0755 "$managed_dir/uv" "$managed_dir/uvx"
+  rm -rf "$tmp_dir"
+  require_uv_version "$uv_bin"
+  printf "%s\n" "$uv_bin"
+}
+
+venv_python_matches() {
+  local venv_path="$1"
+  local expected_version="$2"
+  [[ -x "$venv_path/bin/python" ]] || return 1
+  "$venv_path/bin/python" - "$expected_version" <<'PY'
+from __future__ import annotations
+
+import sys
+
+expected = tuple(int(part) for part in sys.argv[1].split("."))
+actual = sys.version_info[: len(expected)]
+raise SystemExit(0 if actual == expected else 1)
+PY
+}
+
+ensure_python_venv() {
+  local venv_path="$1"
+  local python_version="$2"
+
+  if ! venv_python_matches "$venv_path" "$python_version"; then
+    rm -rf "$venv_path"
+    mkdir -p "$(dirname "$venv_path")" "$UV_PYTHON_INSTALL_DIR"
+    UV_PYTHON_DOWNLOADS=automatic "$PINNED_UV_BIN" python install "$python_version" \
+      --install-dir "$UV_PYTHON_INSTALL_DIR" \
+      --no-bin
+    UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" \
+      "$PINNED_UV_BIN" venv --no-project --python "$python_version" --seed "$venv_path"
+  fi
+}
+
+ensure_eval_python() {
+  if [[ "$EVAL_PYTHON_READY" == "1" ]]; then
+    return
+  fi
+  ensure_python_venv "$EVAL_VENV" "$OPENHANDS_EVAL_PYTHON_VERSION"
+  "$PINNED_UV_BIN" pip install \
+    --python "$EVAL_VENV/bin/python" \
+    "poetry==${OPENHANDS_EVAL_POETRY_VERSION}"
+  "$PINNED_UV_BIN" pip check --python "$EVAL_VENV/bin/python"
+  "$EVAL_VENV/bin/python" - "$EVAL_VENV" "$OPENHANDS_EVAL_POETRY_VERSION" "$PINNED_UV_BIN" <<'PY'
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+from importlib.metadata import version
+from pathlib import Path
+
+venv = Path(sys.argv[1])
+expected_poetry = sys.argv[2]
+uv_bin = Path(sys.argv[3])
+actual_poetry = version("poetry")
+if actual_poetry != expected_poetry:
+    raise SystemExit(
+        f"poetry version mismatch: expected {expected_poetry}, found {actual_poetry}"
+    )
+record = {
+    "created_at_unix": time.time(),
+    "python": sys.version,
+    "venv": str(venv),
+    "uv": subprocess.check_output([str(uv_bin), "--version"], text=True).strip(),
+    "poetry": actual_poetry,
+}
+(venv / "openhands-eval-runtime.json").write_text(json.dumps(record, indent=2))
+PY
+  EVAL_PYTHON_READY=1
+}
+
+ensure_vllm_python() {
+  if [[ "$VLLM_PYTHON_READY" == "1" ]]; then
+    return
+  fi
+  [[ -f "$VLLM_REQUIREMENTS_PATH" ]] || die "vLLM requirements file not found: $VLLM_REQUIREMENTS_PATH"
+  ensure_python_venv "$VLLM_VENV" "$VLLM_PYTHON_VERSION"
+  "$PINNED_UV_BIN" pip sync --python "$VLLM_VENV/bin/python" "$VLLM_REQUIREMENTS_PATH"
+  "$PINNED_UV_BIN" pip check --python "$VLLM_VENV/bin/python"
+  "$VLLM_VENV/bin/python" - "$VLLM_VENV" "$VLLM_REQUIREMENTS_PATH" "$PINNED_UV_BIN" <<'PY'
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+import time
+from importlib.metadata import version
+from pathlib import Path
+
+venv = Path(sys.argv[1])
+requirements = Path(sys.argv[2])
+uv_bin = Path(sys.argv[3])
+expected_vllm = None
+for line in requirements.read_text().splitlines():
+    match = re.match(r"^vllm==(.+)$", line.strip())
+    if match:
+        expected_vllm = match.group(1)
+        break
+if expected_vllm is None:
+    raise SystemExit(f"{requirements} must pin vllm with vllm==...")
+actual_vllm = version("vllm")
+if actual_vllm != expected_vllm:
+    raise SystemExit(
+        f"vllm version mismatch: expected {expected_vllm}, found {actual_vllm}"
+    )
+vllm_bin = venv / "bin" / "vllm"
+if not vllm_bin.exists():
+    raise SystemExit(f"vLLM CLI missing: {vllm_bin}")
+record = {
+    "created_at_unix": time.time(),
+    "python": sys.version,
+    "venv": str(venv),
+    "requirements": str(requirements),
+    "uv": subprocess.check_output([str(uv_bin), "--version"], text=True).strip(),
+    "packages": {
+        package: version(package)
+        for package in ("vllm", "torch", "transformers", "tokenizers")
+    },
+}
+(venv / "openhands-vllm-runtime.json").write_text(json.dumps(record, indent=2))
+PY
+  VLLM_PYTHON_READY=1
+}
+
+poetry_install_openhands_dependencies() {
+  local poetry_env=(
+    PATH="$EVAL_VENV/bin:$PATH"
+    POETRY_VIRTUALENVS_PATH=/workspace/venvs/poetry-pod
+    POETRY_CACHE_DIR=/workspace/.cache/poetry-pod
+  )
+  env "${poetry_env[@]}" poetry -C "$OPENHANDS_DIR" env use "$EVAL_VENV/bin/python"
+  if env "${poetry_env[@]}" poetry -C "$OPENHANDS_DIR" sync --help >/dev/null 2>&1; then
+    env "${poetry_env[@]}" poetry -C "$OPENHANDS_DIR" sync --with evaluation,test --no-root
+  else
+    env "${poetry_env[@]}" poetry -C "$OPENHANDS_DIR" install --sync --with evaluation,test --no-root
+  fi
+}
+
 if [[ "$(uname -s)" == "Darwin" ]]; then
   die "this launcher is pod-only; run it from the Kubernetes GPU pod"
 fi
 [[ -d /workspace ]] || die "expected /workspace hostPath; run from the GPU pod"
 [[ -d "$WORKSPACE_ROOT" ]] || die "workspace not found: $WORKSPACE_ROOT"
-[[ -x /workspace/uv/uv-0.11.16/uv ]] || die "missing pinned uv at /workspace/uv/uv-0.11.16/uv"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found; run from the GPU pod"
 command -v docker >/dev/null 2>&1 || die "docker not found; recreate the pod with manifests/midtraining-hostpath.yaml"
 command -v curl >/dev/null 2>&1 || die "curl not found; recreate the pod with manifests/midtraining-hostpath.yaml"
 command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
+export UV_CACHE_DIR
+export UV_PYTHON_INSTALL_DIR
+PINNED_UV_BIN="$(ensure_uv)"
 VISIBLE_GPU_COUNT="$(nvidia-smi --list-gpus | wc -l | tr -d ' ')"
 (( VISIBLE_GPU_COUNT >= REQUIRED_GPU_COUNT )) || die "expected at least ${REQUIRED_GPU_COUNT} visible GPUs, found ${VISIBLE_GPU_COUNT}"
 (( VLLM_SERVER_COUNT <= VISIBLE_GPU_COUNT )) || die "vLLM server count exceeds visible GPUs: ${VLLM_SERVER_COUNT} > ${VISIBLE_GPU_COUNT}"
@@ -232,15 +484,6 @@ ensure_docker() {
   docker buildx version >/dev/null
 }
 
-ensure_eval_python() {
-  if [[ ! -x "$EVAL_VENV/bin/python" ]]; then
-    /workspace/uv/uv-0.11.16/uv venv "$EVAL_VENV" --python 3.12
-  fi
-  /workspace/uv/uv-0.11.16/uv pip install \
-    --python "$EVAL_VENV/bin/python" \
-    pip poetry
-}
-
 ensure_openhands_checkout() {
   if [[ ! -d "$OPENHANDS_DIR/.git" ]]; then
     mkdir -p "$(dirname "$OPENHANDS_DIR")"
@@ -255,14 +498,7 @@ ensure_openhands_checkout() {
 
 ensure_openhands_dependencies() {
   ensure_openhands_checkout
-  PATH="$EVAL_VENV/bin:$PATH" \
-    POETRY_VIRTUALENVS_PATH=/workspace/venvs/poetry-pod \
-    POETRY_CACHE_DIR=/workspace/.cache/poetry-pod \
-    poetry -C "$OPENHANDS_DIR" env use "$EVAL_VENV/bin/python"
-  PATH="$EVAL_VENV/bin:$PATH" \
-    POETRY_VIRTUALENVS_PATH=/workspace/venvs/poetry-pod \
-    POETRY_CACHE_DIR=/workspace/.cache/poetry-pod \
-    poetry -C "$OPENHANDS_DIR" install --with evaluation,test --no-root
+  poetry_install_openhands_dependencies
 }
 
 pod_ip() {
@@ -287,6 +523,7 @@ ensure_vllm_server() {
     return
   fi
 
+  ensure_vllm_python
   [[ -x "$VLLM_VENV/bin/vllm" ]] || die "missing vLLM binary: $VLLM_VENV/bin/vllm"
   tmux kill-session -t "$session" 2>/dev/null || true
   local vllm_eager_arg=()

@@ -11,8 +11,28 @@ shell_quote() {
   printf "%q" "$1"
 }
 
+python_for_arg_parsing() {
+  if [[ -x "$VENV_PATH/bin/python" ]]; then
+    printf "%s\n" "$VENV_PATH/bin/python"
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return
+  fi
+  cat >&2 <<'EOF'
+python3 is required to parse launcher argument files before the pod venv exists.
+The canonical pod manifest installs python3 at container startup.
+EOF
+  exit 1
+}
+
 resolved_out_dir() {
-  "$VENV_PATH/bin/python" - "$ROOT_DIR" "$DEFAULT_OUT_DIR" "$@" <<'PY'
+  "$(python_for_arg_parsing)" - "$ROOT_DIR" "$DEFAULT_OUT_DIR" "$@" <<'PY'
 import os
 import shlex
 import sys
@@ -223,22 +243,11 @@ EOF
   exit 0
 }
 
-if [[ ! -x "$VENV_PATH/bin/python" ]]; then
-  cat >&2 <<EOF
-Canonical TorchTitan venv is missing:
-  $VENV_PATH
-
-Create it first:
-  $SETUP_SCRIPT --recreate
-EOF
-  exit 1
-fi
-
 if should_use_tmux_supervisor "$@"; then
   attach_or_create_tmux_session "$@"
 fi
 
-"$SETUP_SCRIPT" --verify-only --venv "$VENV_PATH" >/dev/null
+"$SETUP_SCRIPT" --venv "$VENV_PATH"
 
 export PATH="$VENV_PATH/bin:$PATH"
 export TORCHRUN_BIN="${TORCHRUN_BIN:-$VENV_PATH/bin/torchrun}"

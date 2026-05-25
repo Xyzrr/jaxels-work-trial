@@ -1,4 +1,5 @@
 import os
+import shutil
 import shlex
 import subprocess
 import sys
@@ -26,10 +27,10 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
         runtime_log = tmp / "runtime.log"
         tmux_log = tmp / "tmux.log"
         setup_log = tmp / "setup.log"
+        python_template = tmp / "python-template"
+        torchrun_template = tmp / "torchrun-template"
 
-        write_executable(
-            venv_bin / "python",
-            f"""
+        python_shim = f"""
             #!/usr/bin/env bash
             set -euo pipefail
             if [[ "${{1:-}}" == "-" ]]; then
@@ -38,15 +39,15 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
             printf 'python' >> "$FAKE_RUNTIME_LOG"
             printf ' %q' "$@" >> "$FAKE_RUNTIME_LOG"
             printf '\\n' >> "$FAKE_RUNTIME_LOG"
-            """,
-        )
-        write_executable(
-            venv_bin / "torchrun",
             """
+        torchrun_shim = """
             #!/usr/bin/env bash
             exit 0
-            """,
-        )
+            """
+        write_executable(venv_bin / "python", python_shim)
+        write_executable(venv_bin / "torchrun", torchrun_shim)
+        write_executable(python_template, python_shim)
+        write_executable(torchrun_template, torchrun_shim)
         write_executable(
             tmp / "setup.sh",
             """
@@ -55,6 +56,11 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
             printf 'setup' >> "$FAKE_SETUP_LOG"
             printf ' %q' "$@" >> "$FAKE_SETUP_LOG"
             printf '\\n' >> "$FAKE_SETUP_LOG"
+            if [[ "${FAKE_SETUP_INSTALL_VENV:-0}" == "1" ]]; then
+              mkdir -p "$TORCHTITAN_POD_VENV/bin"
+              cp "$FAKE_PYTHON_TEMPLATE" "$TORCHTITAN_POD_VENV/bin/python"
+              cp "$FAKE_TORCHRUN_TEMPLATE" "$TORCHTITAN_POD_VENV/bin/torchrun"
+            fi
             """,
         )
         write_executable(
@@ -85,6 +91,8 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
             "FAKE_RUNTIME_LOG": str(runtime_log),
             "FAKE_TMUX_LOG": str(tmux_log),
             "FAKE_SETUP_LOG": str(setup_log),
+            "FAKE_PYTHON_TEMPLATE": str(python_template),
+            "FAKE_TORCHRUN_TEMPLATE": str(torchrun_template),
         }
 
     def run_wrapper(
@@ -93,9 +101,12 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
         args: list[str],
         *,
         env_overrides: dict[str, str] | None = None,
+        remove_venv: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         env = self.make_fake_runtime(tmp)
         env.update(env_overrides or {})
+        if remove_venv:
+            shutil.rmtree(tmp / "venv")
         return subprocess.run(
             [str(WRAPPER), *args],
             cwd=REPO_ROOT,
@@ -204,6 +215,25 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
         self.assertIn("has-session -t swehero-from-arg-file", tmux_log)
         self.assertIn("new-session -d -s swehero-from-arg-file", tmux_log)
 
+    def test_supervisor_can_start_before_pod_venv_exists(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            result = self.run_wrapper(
+                tmp,
+                ["--out-dir", "/workspace/runs/fresh-pod", "--dry-run"],
+                env_overrides={
+                    "SWEHERO_POD_SUPERVISOR": "1",
+                    "SWEHERO_POD_TMUX_ATTACH": "0",
+                },
+                remove_venv=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tmux_log = (tmp / "tmux.log").read_text()
+
+        self.assertIn("new-session -d -s swehero-fresh-pod", tmux_log)
+        self.assertNotIn("Canonical TorchTitan venv is missing", result.stderr)
+
     def test_supervisor_child_runs_existing_launcher_path_directly(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -221,10 +251,30 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
             runtime_log = (tmp / "runtime.log").read_text()
             tmux_log_exists = (tmp / "tmux.log").exists()
 
-        self.assertIn("--verify-only --venv", setup_log)
+        self.assertIn("--venv", setup_log)
+        self.assertNotIn("--verify-only", setup_log)
         self.assertIn("scripts/qwen_swehero_train.py", runtime_log)
         self.assertIn("--out-dir /workspace/runs/direct-child --dry-run", runtime_log)
         self.assertFalse(tmux_log_exists)
+
+    def test_direct_launch_repairs_missing_venv_before_training_entrypoint(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            result = self.run_wrapper(
+                tmp,
+                ["--out-dir", "/workspace/runs/fresh-direct", "--dry-run"],
+                env_overrides={"FAKE_SETUP_INSTALL_VENV": "1"},
+                remove_venv=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            setup_log = (tmp / "setup.log").read_text()
+            runtime_log = (tmp / "runtime.log").read_text()
+
+        self.assertIn("--venv", setup_log)
+        self.assertNotIn("--verify-only", setup_log)
+        self.assertIn("scripts/qwen_swehero_train.py", runtime_log)
+        self.assertIn("--out-dir /workspace/runs/fresh-direct --dry-run", runtime_log)
 
     def test_default_noninteractive_launch_keeps_existing_direct_behavior(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -239,7 +289,8 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
             runtime_log = (tmp / "runtime.log").read_text()
             tmux_log_exists = (tmp / "tmux.log").exists()
 
-        self.assertIn("--verify-only --venv", setup_log)
+        self.assertIn("--venv", setup_log)
+        self.assertNotIn("--verify-only", setup_log)
         self.assertIn("scripts/qwen_swehero_train.py", runtime_log)
         self.assertIn("--out-dir /workspace/runs/noninteractive --dry-run", runtime_log)
         self.assertFalse(tmux_log_exists)

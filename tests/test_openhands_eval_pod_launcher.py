@@ -25,6 +25,18 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn("docker buildx version", script)
         self.assertIn("dockerd --host=unix:///var/run/docker.sock", script)
 
+    def test_launcher_bootstraps_and_repairs_pinned_python_envs(self):
+        script = SCRIPT.read_text()
+
+        self.assertIn('readonly OPENHANDS_EVAL_UV_VERSION="0.11.16"', script)
+        self.assertIn("UV_X86_64_UNKNOWN_LINUX_GNU_SHA256", script)
+        self.assertIn('PINNED_UV_BIN="$(ensure_uv)"', script)
+        self.assertIn('OPENHANDS_EVAL_POETRY_VERSION="${OPENHANDS_EVAL_POETRY_VERSION:-2.1.3}"', script)
+        self.assertIn('"poetry==${OPENHANDS_EVAL_POETRY_VERSION}"', script)
+        self.assertIn('VLLM_REQUIREMENTS_PATH="${VLLM_REQUIREMENTS_PATH:-$ROOT_DIR/requirements/openhands-vllm.txt}"', script)
+        self.assertIn('"$PINNED_UV_BIN" pip sync --python "$VLLM_VENV/bin/python" "$VLLM_REQUIREMENTS_PATH"', script)
+        self.assertIn("ensure_vllm_python", script)
+
     def test_launcher_starts_vllm_and_scaffold_in_same_pod_flow(self):
         script = SCRIPT.read_text()
 
@@ -36,6 +48,11 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn("--tool-call-parser hermes", script)
         self.assertIn('"$EVAL_VENV/bin/python" scripts/openhands_swebench_eval.py', script)
         self.assertIn("--preflight-only", script)
+
+    def test_vllm_requirement_is_pinned(self):
+        requirements = REPO_ROOT / "requirements" / "openhands-vllm.txt"
+
+        self.assertIn("vllm==0.9.2", requirements.read_text())
 
 
 if __name__ == "__main__":

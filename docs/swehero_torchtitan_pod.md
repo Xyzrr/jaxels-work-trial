@@ -8,10 +8,19 @@ The canonical pod runtime is:
 
 ```bash
 cd /workspace/jaxels-work-trial
-scripts/setup_torchtitan_pod_venv.sh --recreate
 scripts/run_qwen_swehero_torchtitan_pod.sh \
   --out-dir /workspace/qwen25-coder7b-swehero-torchtitan \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
+```
+
+The launcher runs `scripts/setup_torchtitan_pod_venv.sh` itself before the
+training entrypoint starts. On a fresh pod it creates the canonical venv; on a
+pod with stale or incompatible Python packages it syncs the same pinned lock
+back into place. Run the setup script directly only when you intentionally want
+to prewarm or recreate the venv:
+
+```bash
+scripts/setup_torchtitan_pod_venv.sh --recreate
 ```
 
 When this wrapper is run from an interactive pod terminal, it creates or
@@ -74,8 +83,9 @@ for non-production local tests; `--production-mode` rejects any root other than
 the canonical pod path.
 
 Do not launch this job with bare `python`, bare `torchrun`, or
-`/workspace/venv`. The run wrapper verifies the canonical venv first, prepends
-that venv to `PATH`, and points `TORCHRUN_BIN` at the venv's `torchrun`.
+`/workspace/venv`. The run wrapper creates or repairs the canonical venv first,
+prepends that venv to `PATH`, and points `TORCHRUN_BIN` at the venv's
+`torchrun`.
 
 ## Locked Runtime
 
