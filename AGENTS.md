@@ -25,6 +25,7 @@ Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HE
 
 - Re-read the paper before changing pipeline assumptions.
 - Use `tmp/pod-creds/kubeconfig.yaml` whenever running `kubectl`, `helm`, or other Kubernetes tools for this project.
+- Run both training and eval workloads on the GPU pod, not on the local machine. Local execution is only for editing, lightweight inspection, tests that do not require the training/eval stack, and Kubernetes orchestration.
 - Prefer TorchTitan's existing extension points and scripts over ad-hoc training code.
 - Keep secrets, pod credentials, `.env`, checkpoints, datasets, and generated run artifacts out of git.
 - Preserve enough metadata to reproduce each run: model, dataset revision, tokenizer/chat template, sequence length, loss masking, LR schedule, batch size, hardware, commit, and eval harness revision.
