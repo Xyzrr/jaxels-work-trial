@@ -775,7 +775,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "set -euo pipefail",
             "",
             "# Generated command record. The supported launcher is:",
-            "# scripts/run_openhands_swebench_eval_pod.sh",
+            "# scripts/run_midtraining_pod.sh eval",
             "",
             "# 1. Serve the requested model from the GPU pod.",
             "# " + _shell_join(commands.serve_vllm),
@@ -1656,8 +1656,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("--swebench-max-workers must be positive")
     if not args.base_url and not args.dry_run:
         raise ValueError(
-            "--base-url is required; use scripts/run_openhands_swebench_eval_pod.sh "
-            "to launch the eval from the GPU pod."
+            "--base-url is required; use scripts/run_midtraining_pod.sh eval "
+            "to launch the eval on the GPU pod."
         )
     args.output_dir = args.output_dir.resolve()
     args.openhands_dir = args.openhands_dir.resolve()

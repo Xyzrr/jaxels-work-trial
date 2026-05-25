@@ -71,7 +71,7 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
             script.index('if ! tmux new-session')
         ]
         self.assertLess(
-            launch_block.index("ensure_pod_git_checkout"),
+            launch_block.index("midtraining_prepare_pod_checkout"),
             launch_block.index('eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"'),
         )
         self.assertLess(
@@ -118,11 +118,15 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
 
     def test_launcher_is_pod_only_and_enforces_pod_git_checkout(self):
         script = SCRIPT.read_text()
+        common = (REPO_ROOT / "scripts" / "pod_startup_common.sh").read_text()
 
-        self.assertIn('die "this launcher is pod-only', script)
-        self.assertIn('[[ -d /workspace ]]', script)
-        self.assertIn('source "$ROOT_DIR/scripts/pod_git_guard.sh"', script)
-        self.assertIn("swehero_require_pod_git_checkout", script)
+        self.assertIn('source "$ROOT_DIR/scripts/pod_startup_common.sh"', script)
+        self.assertIn('midtraining_require_pod_runtime "$ROOT_DIR"', script)
+        self.assertIn('this launcher is pod-only', common)
+        self.assertIn('[[ -d /workspace ]]', common)
+        self.assertIn('source "$repo_dir/scripts/pod_git_guard.sh"', common)
+        self.assertIn("swehero_require_pod_git_checkout", common)
+        self.assertIn("midtraining_prepare_pod_checkout", script)
         self.assertIn("SWEHERO_POD_GIT_BRANCH", script)
 
     def test_launcher_derives_images_from_eval_preset_and_openhands_code(self):
@@ -191,7 +195,7 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
     def test_docs_explain_concise_usage_and_idempotence(self):
         doc = DOC.read_text()
 
-        self.assertIn("scripts/prebuild_openhands_swebench_images_pod.sh", doc)
+        self.assertIn("scripts/run_midtraining_pod.sh prebuild", doc)
         self.assertIn("openhands-swebench-image-prebuild", doc)
         self.assertIn("rerun attaches", doc)
         self.assertIn("--replace-session", doc)

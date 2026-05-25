@@ -3,14 +3,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# shellcheck source=scripts/pod_git_guard.sh
-source "$ROOT_DIR/scripts/pod_git_guard.sh"
+# shellcheck source=scripts/pod_startup_common.sh
+source "$ROOT_DIR/scripts/pod_startup_common.sh"
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/prebuild_openhands_swebench_images_pod.sh [options]
 
 Prebuild OpenHands runtime Docker images for SWE-bench tasks on the GPU pod.
+For workstation launches, use: scripts/run_midtraining_pod.sh prebuild [options]
 
 Options:
   --config PATH           Argparse eval preset. Defaults to the 7B 128k preset.
@@ -24,7 +25,9 @@ Options:
   --help                  Show this help.
 
 Environment:
-  SWEHERO_POD_GIT_BRANCH  Required when launching a new tmux job.
+  SWEHERO_POD_GIT_BRANCH  Required when launching a new tmux job. Set by
+                          scripts/run_midtraining_pod.sh from the selected
+                          local branch.
   EVAL_VENV               Default: /workspace/venvs/openhands-eval-pod-py312
   OPENHANDS_EVAL_POETRY_VERSION
                           Default: 2.1.3, or the preset's
@@ -40,14 +43,6 @@ die() {
 quote_args() {
   (($#)) || return 0
   printf "%q " "$@"
-}
-
-ensure_pod_git_checkout() {
-  command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
-  swehero_require_pod_git_checkout \
-    "$ROOT_DIR" \
-    "${SWEHERO_POD_GIT_BRANCH:-}" \
-    "OpenHands image prebuild pod execution directory"
 }
 
 resolve_path() {
@@ -872,9 +867,7 @@ TMUX_LOG_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.log"
 TMUX_CONTEXT_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.context.json"
 
 if [[ "$FOREGROUND" != "1" ]]; then
-  [[ "$(uname -s)" != "Darwin" ]] || die "this launcher is pod-only; run it from the Kubernetes GPU pod"
-  [[ -d /workspace ]] || die "expected /workspace hostPath; run from the GPU pod"
-  command -v tmux >/dev/null 2>&1 || die "tmux is required for pod prebuilds"
+  midtraining_require_pod_runtime "$ROOT_DIR" tmux
   mkdir -p "$TMUX_LOG_DIR"
   script_path="$(realpath "$0")"
   command="cd $(quote_args "$ROOT_DIR") && exec env SWEHERO_POD_GIT_BRANCH=$(quote_args "${SWEHERO_POD_GIT_BRANCH:-}") EVAL_VENV=$(quote_args "$EVAL_VENV") OPENHANDS_EVAL_POETRY_VERSION=$(quote_args "$OPENHANDS_EVAL_POETRY_VERSION") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION") --parallel-builds $(quote_args "$PARALLEL_BUILDS")"
@@ -892,7 +885,9 @@ if [[ "$FOREGROUND" != "1" ]]; then
     fi
   fi
   if [[ "$LAUNCH_SESSION" == "1" ]]; then
-    ensure_pod_git_checkout
+    midtraining_prepare_pod_checkout \
+      "$ROOT_DIR" \
+      "OpenHands image prebuild pod execution directory"
     eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
     if [[ -n "${OPENHANDS_POETRY_VERSION_FROM_CONFIG:-}" ]]; then
       OPENHANDS_EVAL_POETRY_VERSION="$OPENHANDS_POETRY_VERSION_FROM_CONFIG"
@@ -920,19 +915,16 @@ if [[ "$FOREGROUND" != "1" ]]; then
   exit 0
 fi
 
-[[ "$(uname -s)" != "Darwin" ]] || die "this launcher is pod-only; run it from the Kubernetes GPU pod"
-[[ -d /workspace ]] || die "expected /workspace hostPath; run from the GPU pod"
-command -v docker >/dev/null 2>&1 || die "docker not found; recreate the pod with manifests/midtraining-hostpath.yaml"
-command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
-command -v python3 >/dev/null 2>&1 || die "python3 not found; recreate the pod with manifests/midtraining-hostpath.yaml"
-command -v tmux >/dev/null 2>&1 || die "tmux not found; recreate the pod with manifests/midtraining-hostpath.yaml"
+midtraining_require_pod_runtime "$ROOT_DIR" docker git python3 tmux
 
 if [[ "$FOREGROUND_WORKER" != "1" ]]; then
   run_supervised_foreground_worker
 fi
 
 mkdir -p "$TMUX_LOG_DIR" /workspace/runlogs
-ensure_pod_git_checkout
+midtraining_prepare_pod_checkout \
+  "$ROOT_DIR" \
+  "OpenHands image prebuild pod execution directory"
 ensure_docker
 ensure_eval_python
 ensure_openhands_checkout

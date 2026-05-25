@@ -14,8 +14,13 @@ The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
 - Dockerized SWE-bench grading through either OpenHands' bundled grader path
   or SWE-Lego's vendored `SWE-bench-4.0.4` checkout.
 
-Use `scripts/run_openhands_swebench_eval_pod.sh` from inside that pod. Do not
-run OpenHands or SWE-bench from the laptop.
+Use `scripts/run_midtraining_pod.sh eval` and
+`scripts/run_midtraining_pod.sh prebuild` from the workstation checkout. The
+meta-wrapper pushes the current clean branch, enters `midtraining-dev` with
+`tmp/pod-creds/kubeconfig.yaml`, sets the legacy `SWEHERO_POD_GIT_BRANCH`
+runtime variable inside the pod, and starts the lower-level pod wrapper from
+`/workspace/jaxels-work-trial`. Do not run OpenHands or SWE-bench from the
+laptop.
 
 ## Configuration Presets
 
@@ -61,12 +66,12 @@ Environment variables are reserved for secrets and pod/runtime plumbing:
 `LLM_API_KEY`, `WORKSPACE_ROOT`, `VLLM_VENV`, `VLLM_REQUIREMENTS_PATH`,
 `VLLM_FORCE_RESTART`, `VLLM_VISIBLE_DEVICES`, `EVAL_VENV`,
 `VLLM_NCCL_CUMEM_ENABLE`, `OPENHANDS_EVAL_POETRY_VERSION`,
-`REQUIRED_GPU_COUNT`,
-`SWEHERO_POD_GIT_BRANCH`, and tmux/uv path controls. The API key is env-only;
-set `LLM_API_KEY` when the default `local-llm` key is not appropriate.
-`SWEHERO_POD_GIT_BRANCH` is a legacy compatibility name for the branch that the
-pod checkout must fast-forward to before launch; do not add new
-SWE-Hero-prefixed env vars for general eval controls.
+`REQUIRED_GPU_COUNT`, and tmux/uv path controls. The API key is env-only; set
+`LLM_API_KEY` when the default `local-llm` key is not appropriate. The
+meta-wrapper owns the branch synchronization contract and forwards selected
+runtime environment variables to the pod. `SWEHERO_POD_GIT_BRANCH` remains a
+pod-side legacy compatibility name; do not add new SWE-Hero-prefixed env vars
+for general eval controls.
 
 ## Pod Requirement
 
@@ -78,9 +83,12 @@ Pod security settings are immutable. If an older `midtraining-dev` pod is
 already running without privilege, recreate it before launching this eval:
 
 ```bash
-kubectl delete pod -n midtraining midtraining-dev
-kubectl apply -f manifests/midtraining-hostpath.yaml
-kubectl wait -n midtraining --for=condition=Ready pod/midtraining-dev --timeout=600s
+KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
+  kubectl delete pod -n midtraining midtraining-dev
+KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
+  kubectl apply -f manifests/midtraining-hostpath.yaml
+KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
+  kubectl wait -n midtraining --for=condition=Ready pod/midtraining-dev --timeout=600s
 ```
 
 The launcher intentionally runs both:
@@ -98,25 +106,15 @@ can report a reachable daemon while still failing container execution.
 Prebuild the per-task OpenHands runtime images before eval:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/prebuild_openhands_swebench_images_pod.sh
-'
+scripts/run_midtraining_pod.sh prebuild
 ```
 
 For the SWE-Lego stack, prebuild against its vendored `OpenHands-0.53.0` by
 passing the SWE-Lego preset:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/prebuild_openhands_swebench_images_pod.sh \
+scripts/run_midtraining_pod.sh prebuild \
   --config configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args
-'
 ```
 
 The script runs in tmux session `openhands-swebench-image-prebuild`, logs to
@@ -136,23 +134,13 @@ the same session name must match that stored launch context unless
 Run a one-instance smoke:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --eval-limit 1
-'
+scripts/run_midtraining_pod.sh eval --eval-limit 1
 ```
 
 For a non-attached launch:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-kubectl exec -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --eval-limit 1 --no-attach
-'
+scripts/run_midtraining_pod.sh --no-tty eval --eval-limit 1 --no-attach
 ```
 
 The launcher creates a tmux session named
@@ -164,12 +152,7 @@ The launcher creates a tmux session named
 Run the full SWE-bench Verified split:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh
-'
+scripts/run_midtraining_pod.sh eval
 ```
 
 ## SWE-Lego Eval
@@ -222,16 +205,11 @@ not as global defaults for future evals.
 Run SWE-Lego-Qwen3-8B on the 16-task infrastructure check set with:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
 eval_ids="django__django-13670,django__django-12663,scikit-learn__scikit-learn-14983,django__django-13279,sphinx-doc__sphinx-7757,django__django-14434,django__django-11999,scikit-learn__scikit-learn-25232,sympy__sympy-15599,astropy__astropy-14309,scikit-learn__scikit-learn-25973,sphinx-doc__sphinx-8551,django__django-12155,sphinx-doc__sphinx-11510,scikit-learn__scikit-learn-13439,django__django-15503"
-kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh \
+scripts/run_midtraining_pod.sh eval \
   --config configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args \
-  --eval-ids '"$eval_ids"' \
+  --eval-ids "$eval_ids" \
   --run-id swe-lego-qwen3-8b-16task
-'
 ```
 
 After OpenHands finishes, the wrapper converts its `output.jsonl` with the
@@ -253,25 +231,15 @@ For a full base-model comparison against an SFT checkpoint, run both base
 context modes with explicit run IDs:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh \
+scripts/run_midtraining_pod.sh eval \
   --config configs/eval/openhands-swebench-verified-qwen25-coder-7b-base-native-32k.args \
   --run-id qwen25-coder7b-base-native32k-pass1
-'
 ```
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh \
+scripts/run_midtraining_pod.sh eval \
   --config configs/eval/openhands-swebench-verified-qwen25-coder-7b-base-paper-yarn-128k.args \
   --run-id qwen25-coder7b-base-yarn128k-pass1
-'
 ```
 
 The preset's `--context-mode` controls the eval context contract:
@@ -306,12 +274,7 @@ silently reusing it.
 Check the pod runtime, Docker, vLLM, and structured tool calling:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
-cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --preflight-only --foreground
-'
+scripts/run_midtraining_pod.sh eval --preflight-only --foreground
 ```
 
 The tool-call preflight must return structured `message.tool_calls` for
@@ -368,31 +331,36 @@ Override with `--output-dir PATH` when a stable path is needed.
 
 ## What the Launcher Does
 
-1. Refuses to run on macOS or outside `/workspace`.
-2. Refuses to launch a new run unless `SWEHERO_POD_GIT_BRANCH` names the
-   current local worktree branch and `/workspace/jaxels-work-trial` is clean,
+1. `scripts/run_midtraining_pod.sh` refuses to push if the local checkout has
+   uncommitted changes, pushes the selected branch, and enters
+   `midtraining-dev` through `kubectl exec`.
+2. The lower-level pod wrappers call the shared startup guard before actual
+   job launch. The guard refuses to launch unless `SWEHERO_POD_GIT_BRANCH`
+   names the selected branch and `/workspace/jaxels-work-trial` is clean,
    checked out to that branch, and fast-forwarded to `origin/<branch>`.
-3. Bootstraps and verifies the pinned `uv 0.11.16` binary if the pod does not
+3. The lower-level pod wrappers refuse to run on macOS or outside `/workspace`
+   for runtime work.
+4. Bootstraps and verifies the pinned `uv 0.11.16` binary if the pod does not
    already have it.
-4. Starts `dockerd` in a pod tmux session if needed.
-5. Verifies Docker by running a real container and checking Buildx.
-6. Creates or repairs the Python 3.12 eval environment, including the Poetry
+5. Starts `dockerd` in a pod tmux session if needed.
+6. Verifies Docker by running a real container and checking Buildx.
+7. Creates or repairs the Python 3.12 eval environment, including the Poetry
    version requested by the preset (`2.1.3` for the current OpenHands preset,
    `2.1.4` for the SWE-Lego checkout).
-7. Creates or repairs the Python 3.12 vLLM environment from
+8. Creates or repairs the Python 3.12 vLLM environment from
    `requirements/openhands-vllm.txt` before starting any missing vLLM server.
-8. Starts the vLLM topology requested by the preset. Current Qwen2.5 presets
+9. Starts the vLLM topology requested by the preset. Current Qwen2.5 presets
    start one replica per GPU. The SWE-Lego Qwen3 preset starts one vLLM process
    with `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` and tensor parallel size 8.
-9. Starts `scripts/openai_vllm_router.py` only when `--vllm-use-router` is set.
-10. Syncs the preset-selected OpenHands evaluation dependencies. For SWE-Lego,
+10. Starts `scripts/openai_vllm_router.py` only when `--vllm-use-router` is set.
+11. Syncs the preset-selected OpenHands evaluation dependencies. For SWE-Lego,
     this means the nested `OpenHands-0.53.0`; for current presets, this means
     the configured upstream OpenHands checkout.
-11. Runs `scripts/openhands_swebench_eval.py` with the selected endpoint and
+12. Runs `scripts/openhands_swebench_eval.py` with the selected endpoint and
     preset-defined OpenHands config. Exact subsets should use `--eval-ids`; the
     wrapper also writes OpenHands' benchmark-local `selected_ids` filter so old
     OpenHands versions run the requested IDs exactly.
-12. Prints `agent_tool_use` and the SWE-bench pass@1 summary. For SWE-Lego, the
+13. Prints `agent_tool_use` and the SWE-bench pass@1 summary. For SWE-Lego, the
     summary comes from the vendored `SWE-bench-4.0.4` grader report.
 
 For the 7B smoke, a healthy run should show `used_real_tools: true` and

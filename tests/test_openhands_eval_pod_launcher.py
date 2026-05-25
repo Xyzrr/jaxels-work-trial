@@ -12,10 +12,13 @@ WORKER_SELECTION_SCRIPT = REPO_ROOT / "scripts" / "openhands_eval_worker_selecti
 class OpenHandsEvalPodLauncherTests(unittest.TestCase):
     def test_launcher_is_pod_only_and_uses_gpu_pod_endpoint(self):
         script = SCRIPT.read_text()
+        common = (REPO_ROOT / "scripts" / "pod_startup_common.sh").read_text()
 
-        self.assertIn('die "this launcher is pod-only', script)
-        self.assertIn('[[ -d /workspace ]]', script)
-        self.assertIn("command -v nvidia-smi", script)
+        self.assertIn('source "$ROOT_DIR/scripts/pod_startup_common.sh"', script)
+        self.assertIn('midtraining_require_pod_runtime "$WORKSPACE_ROOT"', script)
+        self.assertIn('this launcher is pod-only', common)
+        self.assertIn('[[ -d /workspace ]]', common)
+        self.assertIn('midtraining_require_pod_runtime "$WORKSPACE_ROOT" nvidia-smi docker curl git', script)
         self.assertIn('POD_IP="${POD_IP:-$(pod_ip)}"', script)
         self.assertIn('LLM_BASE_URL="http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"', script)
         self.assertIn('--base-url "$LLM_BASE_URL"', script)
@@ -24,9 +27,12 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
 
     def test_launcher_enforces_pushed_clean_pod_git_checkout(self):
         script = SCRIPT.read_text()
+        common = (REPO_ROOT / "scripts" / "pod_startup_common.sh").read_text()
 
-        self.assertIn('source "$ROOT_DIR/scripts/pod_git_guard.sh"', script)
-        self.assertIn("swehero_require_pod_git_checkout", script)
+        self.assertIn('source "$ROOT_DIR/scripts/pod_startup_common.sh"', script)
+        self.assertIn("midtraining_prepare_pod_checkout", script)
+        self.assertIn('source "$repo_dir/scripts/pod_git_guard.sh"', common)
+        self.assertIn("swehero_require_pod_git_checkout", common)
         self.assertIn("SWEHERO_POD_GIT_BRANCH", script)
         self.assertIn("OpenHands eval pod execution directory", script)
         self.assertIn("supervised_env_args", script)

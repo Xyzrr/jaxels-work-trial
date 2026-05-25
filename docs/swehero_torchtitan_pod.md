@@ -15,13 +15,17 @@ SWE-Hero reproduction.
 The canonical pod runtime is:
 
 ```bash
-cd /workspace/jaxels-work-trial
-export SWEHERO_POD_GIT_BRANCH=your-local-branch
-scripts/run_qwen_swehero_torchtitan_pod.sh \
+scripts/run_midtraining_pod.sh train \
   @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-torchtitan \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
 ```
+
+Run that command from the workstation checkout. The meta-wrapper pushes the
+current clean branch, enters `midtraining-dev` with
+`tmp/pod-creds/kubeconfig.yaml`, sets the legacy `SWEHERO_POD_GIT_BRANCH`
+runtime variable inside the pod, and starts the lower-level TorchTitan pod
+wrapper from `/workspace/jaxels-work-trial`.
 
 The `@configs/training/qwen25-coder-7b-direct-to-hero.args` file is the
 canonical experiment preset for the Qwen2.5-Coder-7B direct-to-hero run. It
@@ -35,11 +39,12 @@ For a different training experiment, copy that preset, edit the copied file,
 and swap the `@...` argument. Use CLI flags after the preset for one-off
 overrides; later flags win through normal argparse ordering. Keep secrets and
 pod/runtime plumbing as environment only: `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
-`WANDB_API_KEY`, `SWEHERO_POD_GIT_BRANCH`, `TORCHTITAN_POD_VENV`,
-`TORCHTITAN_POD_SUPERVISOR`, and tmux-related controls are not experiment
-settings and do not belong in presets. `SWEHERO_POD_GIT_BRANCH` is a legacy
-compatibility name for the branch synchronization contract; new shared controls
-should use neutral names.
+`WANDB_API_KEY`, `TORCHTITAN_POD_VENV`, `TORCHTITAN_POD_SUPERVISOR`, and
+tmux-related controls are not experiment settings and do not belong in presets.
+The meta-wrapper owns the branch synchronization contract and forwards selected
+runtime environment variables to the pod. `SWEHERO_POD_GIT_BRANCH` remains a
+pod-side legacy compatibility name; new shared controls should use neutral
+names.
 
 The launcher runs `scripts/setup_torchtitan_pod_venv.sh` itself before the
 training entrypoint starts. On a fresh pod it creates the canonical venv; on a
@@ -69,19 +74,19 @@ tmux attach-session -t swehero-qwen25-coder7b-swehero-torchtitan
 
 # Override the derived session name for a launch.
 SWEHERO_POD_TMUX_SESSION=swehero-7b-prod \
-  scripts/run_qwen_swehero_torchtitan_pod.sh \
+  scripts/run_midtraining_pod.sh train \
     @configs/training/qwen25-coder-7b-direct-to-hero.args \
     --production-mode --enable-wandb
 
 # Force a supervised detached launch from a non-interactive exec.
 SWEHERO_POD_SUPERVISOR=1 SWEHERO_POD_TMUX_ATTACH=0 \
-  scripts/run_qwen_swehero_torchtitan_pod.sh \
+  scripts/run_midtraining_pod.sh train \
     @configs/training/qwen25-coder-7b-direct-to-hero.args \
     --production-mode --enable-wandb
 
 # Bypass tmux intentionally for non-interactive automation.
 SWEHERO_POD_SUPERVISOR=0 \
-  scripts/run_qwen_swehero_torchtitan_pod.sh \
+  scripts/run_midtraining_pod.sh train \
     @configs/training/qwen25-coder-7b-direct-to-hero.args \
     --dry-run
 ```
@@ -133,28 +138,25 @@ KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
     bash -lc 'ssh -T git@github.com || true; git -C /workspace/jaxels-work-trial pull --ff-only'
 ```
 
-Before launching a new canonical training session from the workstation, pass the
-current local worktree branch into the pod:
+Before launching a new canonical training session from the workstation, use the
+meta-wrapper:
 
 ```bash
-branch="$(git branch --show-current)"
-git push -u origin "$branch"
-KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
-  kubectl exec -it -n midtraining midtraining-dev -- \
-    env SWEHERO_POD_GIT_BRANCH="$branch" bash -lc '
-cd /workspace/jaxels-work-trial
-scripts/run_qwen_swehero_torchtitan_pod.sh \
+scripts/run_midtraining_pod.sh train \
   @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --production-mode \
   --enable-wandb
-'
 ```
 
-For a new launch, the wrapper refuses to run unless
+For a new launch, `scripts/run_midtraining_pod.sh` refuses to push if the local
+checkout has uncommitted changes, then pushes the selected branch and enters the
+pod. The pod-side shared startup guard refuses to launch unless
 `/workspace/jaxels-work-trial` is clean, checked out to that branch, and
 fast-forwardable to the current `origin/<branch>` head. It fails instead of
-discarding dirty files or pod-local commits that have not been pushed. Reruns
-that only reconnect to an existing tmux session do not mutate the checkout.
+discarding dirty files or pod-local commits that have not been pushed. Lower
+level wrappers call the shared startup guard only at actual job-launch points,
+so reruns that only reconnect to an existing tmux session do not mutate the
+checkout.
 
 The CUDA base image does not include Python. The pod entrypoint uses the pinned
 `/workspace/uv/uv-0.11.16/uv` binary to install CPython 3.10.12 under
@@ -344,8 +346,7 @@ tiny synthetic tokenized records only; it is not a training dataset and should
 not be used for the paper-aligned run.
 
 ```bash
-cd /workspace/jaxels-work-trial
-scripts/run_qwen_swehero_torchtitan_pod.sh \
+scripts/run_midtraining_pod.sh train \
   @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-all-bucket-cp-smoke \
   --overwrite-output \
@@ -545,8 +546,7 @@ run spec.
 To collect TorchTitan profiler traces during a short soak, add flags such as:
 
 ```bash
-cd /workspace/jaxels-work-trial
-scripts/run_qwen_swehero_torchtitan_pod.sh \
+scripts/run_midtraining_pod.sh train \
   @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-profiler-soak \
   --overwrite-output \

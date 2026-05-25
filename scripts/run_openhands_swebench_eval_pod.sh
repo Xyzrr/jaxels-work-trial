@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# shellcheck source=scripts/pod_git_guard.sh
-source "$ROOT_DIR/scripts/pod_git_guard.sh"
+# shellcheck source=scripts/pod_startup_common.sh
+source "$ROOT_DIR/scripts/pod_startup_common.sh"
 # shellcheck source=scripts/openhands_eval_launcher_defaults.sh
 source "$ROOT_DIR/scripts/openhands_eval_launcher_defaults.sh"
 # shellcheck source=scripts/openhands_eval_worker_selection.sh
@@ -15,6 +15,7 @@ usage() {
 Usage: scripts/run_openhands_swebench_eval_pod.sh [options]
 
 Launch the canonical OpenHands SWE-bench Verified pass@1 eval from the GPU pod.
+For workstation launches, use: scripts/run_midtraining_pod.sh eval [options]
 
 Options:
   --config PATH           Argparse preset file. Defaults to the 7B 128k preset.
@@ -44,8 +45,10 @@ Environment overrides:
   OPENHANDS_EVAL_POETRY_VERSION
                           Default: 2.1.3
   REQUIRED_GPU_COUNT      Default: 8
-  SWEHERO_POD_GIT_BRANCH  Required. Current local worktree branch expected on
-                          the pod; the launcher fast-forwards it from origin.
+  SWEHERO_POD_GIT_BRANCH  Required for new pod-side launches. Set by
+                          scripts/run_midtraining_pod.sh from the selected
+                          local branch; the pod startup guard fast-forwards it
+                          from origin.
   OPENHANDS_EVAL_TMUX_SESSION
   OPENHANDS_EVAL_ATTACH   Default: 1 for interactive shells, otherwise 0
 USAGE
@@ -90,15 +93,6 @@ supervised_env_args() {
     "UV_TOOL_DIR=$UV_TOOL_DIR" \
     "UV_CACHE_DIR=$UV_CACHE_DIR" \
     "UV_PYTHON_INSTALL_DIR=$UV_PYTHON_INSTALL_DIR"
-}
-
-ensure_pod_git_checkout() {
-  [[ -d "$WORKSPACE_ROOT" ]] || die "workspace not found: $WORKSPACE_ROOT"
-  command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
-  swehero_require_pod_git_checkout \
-    "$WORKSPACE_ROOT" \
-    "${SWEHERO_POD_GIT_BRANCH:-}" \
-    "OpenHands eval pod execution directory"
 }
 
 readonly QWEN_NATIVE_CONTEXT_LENGTH=32768
@@ -331,7 +325,9 @@ if [[ "$FOREGROUND" != "1" ]]; then
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     echo "tmux session already exists: $TMUX_SESSION"
   else
-    ensure_pod_git_checkout
+    midtraining_prepare_pod_checkout \
+      "$WORKSPACE_ROOT" \
+      "OpenHands eval pod execution directory"
     script_path="$(realpath "$0")"
     command="cd $(quote_args "$WORKSPACE_ROOT") && env $(supervised_env_args)$(quote_args "$script_path") --foreground"
     if [[ -n "$EVAL_LIMIT" ]]; then
@@ -589,16 +585,10 @@ poetry_install_openhands_dependencies() {
   fi
 }
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  die "this launcher is pod-only; run it from the Kubernetes GPU pod"
-fi
-[[ -d /workspace ]] || die "expected /workspace hostPath; run from the GPU pod"
-[[ -d "$WORKSPACE_ROOT" ]] || die "workspace not found: $WORKSPACE_ROOT"
-command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found; run from the GPU pod"
-command -v docker >/dev/null 2>&1 || die "docker not found; recreate the pod with manifests/midtraining-hostpath.yaml"
-command -v curl >/dev/null 2>&1 || die "curl not found; recreate the pod with manifests/midtraining-hostpath.yaml"
-command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
-ensure_pod_git_checkout
+midtraining_require_pod_runtime "$WORKSPACE_ROOT" nvidia-smi docker curl git
+midtraining_prepare_pod_checkout \
+  "$WORKSPACE_ROOT" \
+  "OpenHands eval pod execution directory"
 export UV_CACHE_DIR
 export UV_PYTHON_INSTALL_DIR
 PINNED_UV_BIN="$(ensure_uv)"
