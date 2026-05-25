@@ -15,7 +15,9 @@ Prebuild OpenHands runtime Docker images for SWE-bench tasks on the GPU pod.
 Options:
   --config PATH           Argparse eval preset. Defaults to the 7B 128k preset.
   --eval-limit N          Prebuild N instances. Omit for the full split.
+  --parallel-builds N     Concurrent Docker runtime image builds. Default: 4.
   --tmux-session NAME     Default: openhands-swebench-image-prebuild
+  --replace-session       Kill and restart an existing tmux session.
   --foreground            Run in this shell. The normal entrypoint uses tmux.
   --attach                Attach to the tmux session after launch.
   --no-attach             Do not attach to the tmux session after launch.
@@ -173,6 +175,7 @@ prebuild_images() {
   local args=(
     --dataset "$DATASET"
     --split "$SPLIT"
+    --parallel-builds "$PARALLEL_BUILDS"
   )
   if [[ -n "$EVAL_LIMIT" ]]; then
     args+=(--eval-limit "$EVAL_LIMIT")
@@ -187,6 +190,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import docker
 from datasets import load_dataset
@@ -210,9 +214,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--split", required=True)
     parser.add_argument("--eval-limit", type=int, default=None)
+    parser.add_argument("--parallel-builds", type=int, default=1)
     args = parser.parse_args()
     if args.eval_limit is not None and args.eval_limit <= 0:
         raise ValueError("--eval-limit must be positive when provided")
+    if args.parallel_builds <= 0:
+        raise ValueError("--parallel-builds must be positive")
     return args
 
 
@@ -227,6 +234,32 @@ def local_image_exists(client: docker.DockerClient, image_name: str) -> bool:
 def runtime_target_image(base_image: str, source_hash: str) -> str:
     lock_tag = f"oh_v{get_version()}_{get_hash_for_lock_files(base_image, False)}"
     return f"{get_runtime_image_repo()}:{lock_tag}_{source_hash}"
+
+
+def build_runtime_job(job: dict[str, str]) -> str:
+    client = docker.from_env()
+    try:
+        if local_image_exists(client, job["target_image"]):
+            return "skipped"
+
+        builder = DockerRuntimeBuilder(client)
+        image_name = build_runtime_image(
+            job["base_image"],
+            builder,
+            platform="linux/amd64",
+            enable_browser=False,
+        )
+        if image_name != job["target_image"]:
+            raise RuntimeError(
+                f"unexpected image tag: expected {job['target_image']}, got {image_name}"
+            )
+        if not local_image_exists(client, job["target_image"]):
+            raise RuntimeError(
+                f"image build finished but target is missing: {job['target_image']}"
+            )
+        return "built"
+    finally:
+        client.close()
 
 
 def main() -> None:
@@ -257,8 +290,6 @@ def main() -> None:
             }
         )
 
-    client = docker.from_env()
-    builder = DockerRuntimeBuilder(client)
     built = 0
     skipped = 0
     started_at = time.time()
@@ -269,37 +300,76 @@ def main() -> None:
                 "split": args.split,
                 "instances": len(dataset),
                 "unique_runtime_images": len(jobs),
+                "parallel_builds": args.parallel_builds,
             },
             sort_keys=True,
         ),
         flush=True,
     )
 
-    for index, job in enumerate(jobs, start=1):
-        target_image = job["target_image"]
-        if local_image_exists(client, target_image):
-            skipped += 1
+    probe_client = docker.from_env()
+    build_jobs: list[dict[str, str]] = []
+    try:
+        for index, job in enumerate(jobs, start=1):
+            target_image = job["target_image"]
+            if local_image_exists(probe_client, target_image):
+                skipped += 1
+                print(
+                    f"[{index}/{len(jobs)}] skip {target_image} ({job['instance_id']})",
+                    flush=True,
+                )
+                continue
+
+            queued_job = dict(job)
+            queued_job["index"] = str(index)
+            build_jobs.append(queued_job)
             print(
-                f"[{index}/{len(jobs)}] skip {target_image} ({job['instance_id']})",
+                f"[{index}/{len(jobs)}] queue build {target_image} from {job['base_image']} ({job['instance_id']})",
                 flush=True,
             )
-            continue
+    finally:
+        probe_client.close()
 
+    if build_jobs:
+        active_workers = min(args.parallel_builds, len(build_jobs))
         print(
-            f"[{index}/{len(jobs)}] build {target_image} from {job['base_image']} ({job['instance_id']})",
+            json.dumps(
+                {
+                    "scheduled_builds": len(build_jobs),
+                    "active_workers": active_workers,
+                },
+                sort_keys=True,
+            ),
             flush=True,
         )
-        image_name = build_runtime_image(
-            job["base_image"],
-            builder,
-            platform="linux/amd64",
-            enable_browser=False,
-        )
-        if image_name != target_image:
-            raise RuntimeError(f"unexpected image tag: expected {target_image}, got {image_name}")
-        if not local_image_exists(client, target_image):
-            raise RuntimeError(f"image build finished but target is missing: {target_image}")
-        built += 1
+        with ThreadPoolExecutor(max_workers=active_workers) as executor:
+            future_to_job = {
+                executor.submit(build_runtime_job, job): job for job in build_jobs
+            }
+            for future in as_completed(future_to_job):
+                job = future_to_job[future]
+                target_image = job["target_image"]
+                try:
+                    status = future.result()
+                except Exception as exc:
+                    for pending in future_to_job:
+                        pending.cancel()
+                    raise RuntimeError(
+                        f"failed to build {target_image} ({job['instance_id']})"
+                    ) from exc
+
+                if status == "skipped":
+                    skipped += 1
+                    print(
+                        f"[{job['index']}/{len(jobs)}] skip {target_image} ({job['instance_id']})",
+                        flush=True,
+                    )
+                else:
+                    built += 1
+                    print(
+                        f"[{job['index']}/{len(jobs)}] built {target_image} ({job['instance_id']})",
+                        flush=True,
+                    )
 
     print(
         json.dumps(
@@ -322,9 +392,11 @@ PY
 
 CONFIG_PRESET="$ROOT_DIR/configs/eval/openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args"
 EVAL_LIMIT=""
+PARALLEL_BUILDS=4
 TMUX_SESSION="openhands-swebench-image-prebuild"
 TMUX_LOG_DIR="/workspace/runlogs"
 FOREGROUND=0
+REPLACE_SESSION=0
 EVAL_VENV="${EVAL_VENV:-/workspace/venvs/openhands-eval-pod-py312}"
 if [[ -t 1 ]]; then
   ATTACH=1
@@ -345,10 +417,20 @@ while (($#)); do
       [[ "$EVAL_LIMIT" =~ ^[0-9]+$ && "$EVAL_LIMIT" -gt 0 ]] || die "--eval-limit must be positive"
       shift 2
       ;;
+    --parallel-builds)
+      [[ $# -ge 2 ]] || die "--parallel-builds requires a value"
+      PARALLEL_BUILDS="$2"
+      [[ "$PARALLEL_BUILDS" =~ ^[0-9]+$ && "$PARALLEL_BUILDS" -gt 0 ]] || die "--parallel-builds must be positive"
+      shift 2
+      ;;
     --tmux-session)
       [[ $# -ge 2 ]] || die "--tmux-session requires a value"
       TMUX_SESSION="$2"
       shift 2
+      ;;
+    --replace-session)
+      REPLACE_SESSION=1
+      shift
       ;;
     --foreground)
       FOREGROUND=1
@@ -372,6 +454,10 @@ while (($#)); do
   esac
 done
 
+if [[ "$FOREGROUND" == "1" && "$REPLACE_SESSION" == "1" ]]; then
+  die "--replace-session only applies to tmux-supervised launches"
+fi
+
 CONFIG_PRESET_PATH="$(resolve_path "$CONFIG_PRESET")"
 eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
 [[ "$RUNTIME" == "docker" ]] || die "prebuild only applies to --runtime docker configs"
@@ -382,12 +468,22 @@ if [[ "$FOREGROUND" != "1" ]]; then
   [[ -d /workspace ]] || die "expected /workspace hostPath; run from the GPU pod"
   command -v tmux >/dev/null 2>&1 || die "tmux is required for pod prebuilds"
   mkdir -p "$TMUX_LOG_DIR"
+  LAUNCH_SESSION=1
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    echo "tmux session already exists: $TMUX_SESSION"
-  else
+    if [[ "$REPLACE_SESSION" == "1" ]]; then
+      echo "replacing tmux session: $TMUX_SESSION"
+    else
+      echo "tmux session already exists: $TMUX_SESSION"
+      LAUNCH_SESSION=0
+    fi
+  fi
+  if [[ "$LAUNCH_SESSION" == "1" ]]; then
     ensure_pod_git_checkout
+    if [[ "$REPLACE_SESSION" == "1" ]]; then
+      tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    fi
     script_path="$(realpath "$0")"
-    command="cd $(quote_args "$ROOT_DIR") && SWEHERO_POD_GIT_BRANCH=$(quote_args "$SWEHERO_POD_GIT_BRANCH") EVAL_VENV=$(quote_args "$EVAL_VENV") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION")"
+    command="cd $(quote_args "$ROOT_DIR") && SWEHERO_POD_GIT_BRANCH=$(quote_args "$SWEHERO_POD_GIT_BRANCH") EVAL_VENV=$(quote_args "$EVAL_VENV") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION") --parallel-builds $(quote_args "$PARALLEL_BUILDS")"
     if [[ -n "$EVAL_LIMIT" ]]; then
       command+=" --eval-limit $(quote_args "$EVAL_LIMIT")"
     fi

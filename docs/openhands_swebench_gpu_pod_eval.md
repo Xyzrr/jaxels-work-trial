@@ -82,9 +82,12 @@ SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/prebuild_openhands_swebench_images_po
 
 The script runs in tmux session `openhands-swebench-image-prebuild`, logs to
 `/workspace/runlogs/openhands-swebench-image-prebuild.log`, and a rerun attaches
-to the existing session. It inspects the final OpenHands runtime image tag before
-every build, so already-built images are skipped. Use `--eval-limit N` only for a
-small prebuild smoke.
+to the existing session. Pass `--replace-session` to kill that tmux session and
+launch a fresh prebuild instead. It inspects the final OpenHands runtime image
+tag before every build, so already-built images are skipped. Missing runtime
+images build in parallel; use `--parallel-builds N` to tune concurrency, or
+`--parallel-builds 1` to force the old serial behavior. Use `--eval-limit N`
+only for a small prebuild smoke.
 
 ## Smoke Command
 
