@@ -106,6 +106,19 @@ SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/prebuild_openhands_swebench_images_po
 '
 ```
 
+For the SWE-Lego stack, prebuild against its vendored `OpenHands-0.53.0` by
+passing the SWE-Lego preset:
+
+```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
+kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
+cd /workspace/jaxels-work-trial
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/prebuild_openhands_swebench_images_pod.sh \
+  --config configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args
+'
+```
+
 The script runs in tmux session `openhands-swebench-image-prebuild`, logs to
 `/workspace/runlogs/openhands-swebench-image-prebuild.log`, and a rerun attaches
 to the existing session. Pass `--replace-session` to kill that tmux session and

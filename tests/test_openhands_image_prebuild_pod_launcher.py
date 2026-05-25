@@ -111,14 +111,31 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
         script = SCRIPT.read_text()
 
         self.assertIn("from scripts import openhands_swebench_eval as eval_script", script)
+        self.assertIn('"EVAL_STACK": args.eval_stack', script)
         self.assertIn('"DATASET": args.dataset', script)
         self.assertIn('"SPLIT": args.split', script)
         self.assertIn('"OPENHANDS_REF": args.openhands_ref', script)
+        self.assertIn('"OPENHANDS_DIR": eval_script.effective_openhands_dir(args)', script)
         self.assertIn("set_dataset_type(args.dataset)", script)
         self.assertIn("get_instance_docker_image(", script)
         self.assertIn("swebench_official_image=True", script)
         self.assertIn("platform=\"linux/amd64\"", script)
         self.assertIn("enable_browser=False", script)
+
+    def test_launcher_supports_swe_lego_vendored_openhands_checkout(self):
+        script = SCRIPT.read_text()
+
+        self.assertIn('"SWE_LEGO_REPO": args.swe_lego_repo', script)
+        self.assertIn('"SWE_LEGO_REF": args.swe_lego_ref', script)
+        self.assertIn(
+            '"SWE_LEGO_SWEBENCH_DIR": eval_script.effective_swebench_dir(args) or ""',
+            script,
+        )
+        self.assertIn('if [[ "$EVAL_STACK" == "swe-lego" ]]; then', script)
+        self.assertIn('git clone "$SWE_LEGO_REPO" "$SWE_LEGO_DIR"', script)
+        self.assertIn('git -C "$SWE_LEGO_DIR" checkout --detach "$SWE_LEGO_REF"', script)
+        self.assertIn('SWE-Lego OpenHands directory missing: $OPENHANDS_DIR', script)
+        self.assertIn('SWE-Lego SWE-bench directory missing: $SWE_LEGO_SWEBENCH_DIR', script)
 
     def test_launcher_parallelizes_missing_runtime_image_builds(self):
         script = SCRIPT.read_text()

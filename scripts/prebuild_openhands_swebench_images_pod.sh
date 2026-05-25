@@ -26,6 +26,9 @@ Options:
 Environment:
   SWEHERO_POD_GIT_BRANCH  Required when launching a new tmux job.
   EVAL_VENV               Default: /workspace/venvs/openhands-eval-pod-py312
+  OPENHANDS_EVAL_POETRY_VERSION
+                          Default: 2.1.3, or the preset's
+                          --openhands-poetry-version when set.
 USAGE
 }
 
@@ -86,12 +89,18 @@ args = eval_script.parse_args(
 )
 values = {
     "CONFIG_PRESET_PATH": config_path,
+    "EVAL_STACK": args.eval_stack,
     "DATASET": args.dataset,
     "SPLIT": args.split,
     "RUNTIME": args.runtime,
     "OPENHANDS_REPO": args.openhands_repo,
     "OPENHANDS_REF": args.openhands_ref,
-    "OPENHANDS_DIR": args.openhands_dir,
+    "OPENHANDS_DIR": eval_script.effective_openhands_dir(args),
+    "OPENHANDS_POETRY_VERSION_FROM_CONFIG": args.openhands_poetry_version,
+    "SWE_LEGO_REPO": args.swe_lego_repo,
+    "SWE_LEGO_REF": args.swe_lego_ref,
+    "SWE_LEGO_DIR": args.swe_lego_dir,
+    "SWE_LEGO_SWEBENCH_DIR": eval_script.effective_swebench_dir(args) or "",
     "DOCKER_SMOKE_IMAGE": args.docker_smoke_image,
 }
 for key, value in values.items():
@@ -122,9 +131,15 @@ tmux_launch_context() {
     "$DATASET" \
     "$SPLIT" \
     "$RUNTIME" \
+    "$EVAL_STACK" \
     "$OPENHANDS_REPO" \
     "$OPENHANDS_REF" \
     "$OPENHANDS_DIR" \
+    "$OPENHANDS_EVAL_POETRY_VERSION" \
+    "$SWE_LEGO_REPO" \
+    "$SWE_LEGO_REF" \
+    "$SWE_LEGO_DIR" \
+    "$SWE_LEGO_SWEBENCH_DIR" \
     "$DOCKER_SMOKE_IMAGE" \
     "$git_branch" \
     "$git_commit" \
@@ -153,9 +168,15 @@ from typing import Any
     dataset,
     split,
     runtime,
+    eval_stack,
     openhands_repo,
     openhands_ref,
     openhands_dir,
+    openhands_eval_poetry_version,
+    swe_lego_repo,
+    swe_lego_ref,
+    swe_lego_dir,
+    swe_lego_swebench_dir,
     docker_smoke_image,
     git_branch,
     git_commit,
@@ -192,14 +213,20 @@ def build_context() -> dict[str, Any]:
             "eval_limit": optional_int(eval_limit),
             "parallel_builds": int(parallel_builds),
             "eval_venv": eval_venv,
+            "openhands_eval_poetry_version": openhands_eval_poetry_version,
         },
         "resolved_eval_config": {
+            "eval_stack": eval_stack,
             "dataset": dataset,
             "split": split,
             "runtime": runtime,
             "openhands_repo": openhands_repo,
             "openhands_ref": openhands_ref,
             "openhands_dir": openhands_dir,
+            "swe_lego_repo": swe_lego_repo,
+            "swe_lego_ref": swe_lego_ref,
+            "swe_lego_dir": swe_lego_dir,
+            "swe_lego_swebench_dir": swe_lego_swebench_dir,
             "docker_smoke_image": docker_smoke_image,
         },
         "git": {
@@ -344,6 +371,21 @@ ensure_docker() {
 }
 
 ensure_openhands_checkout() {
+  if [[ "$EVAL_STACK" == "swe-lego" ]]; then
+    if [[ ! -d "$SWE_LEGO_DIR/.git" ]]; then
+      mkdir -p "$(dirname "$SWE_LEGO_DIR")"
+      git clone "$SWE_LEGO_REPO" "$SWE_LEGO_DIR"
+    fi
+    if [[ -n "$(git -C "$SWE_LEGO_DIR" status --porcelain)" ]]; then
+      die "$SWE_LEGO_DIR has local changes; clean it before prebuilding images"
+    fi
+    git -C "$SWE_LEGO_DIR" fetch --depth 1 origin "$SWE_LEGO_REF"
+    git -C "$SWE_LEGO_DIR" checkout --detach "$SWE_LEGO_REF"
+    [[ -d "$OPENHANDS_DIR" ]] || die "SWE-Lego OpenHands directory missing: $OPENHANDS_DIR"
+    [[ -d "$SWE_LEGO_SWEBENCH_DIR" ]] || die "SWE-Lego SWE-bench directory missing: $SWE_LEGO_SWEBENCH_DIR"
+    return
+  fi
+
   if [[ ! -d "$OPENHANDS_DIR/.git" ]]; then
     mkdir -p "$(dirname "$OPENHANDS_DIR")"
     git clone --branch "$OPENHANDS_REF" --depth 1 "$OPENHANDS_REPO" "$OPENHANDS_DIR"
@@ -382,7 +424,7 @@ ensure_eval_python() {
     UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" \
       "$uv_bin" venv --no-project --python 3.12 --seed "$EVAL_VENV"
   fi
-  "$uv_bin" pip install --python "$EVAL_VENV/bin/python" "poetry==2.1.3"
+  "$uv_bin" pip install --python "$EVAL_VENV/bin/python" "poetry==${OPENHANDS_EVAL_POETRY_VERSION}"
 }
 
 ensure_openhands_dependencies() {
@@ -626,6 +668,7 @@ TMUX_LOG_DIR="/workspace/runlogs"
 FOREGROUND=0
 REPLACE_SESSION=0
 EVAL_VENV="${EVAL_VENV:-/workspace/venvs/openhands-eval-pod-py312}"
+OPENHANDS_EVAL_POETRY_VERSION="${OPENHANDS_EVAL_POETRY_VERSION:-2.1.3}"
 if [[ -t 1 ]]; then
   ATTACH=1
 else
@@ -688,6 +731,9 @@ fi
 
 CONFIG_PRESET_PATH="$(resolve_path "$CONFIG_PRESET")"
 eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
+if [[ -n "${OPENHANDS_POETRY_VERSION_FROM_CONFIG:-}" ]]; then
+  OPENHANDS_EVAL_POETRY_VERSION="$OPENHANDS_POETRY_VERSION_FROM_CONFIG"
+fi
 [[ "$RUNTIME" == "docker" ]] || die "prebuild only applies to --runtime docker configs"
 TMUX_LOG_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.log"
 TMUX_CONTEXT_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.context.json"
@@ -698,7 +744,7 @@ if [[ "$FOREGROUND" != "1" ]]; then
   command -v tmux >/dev/null 2>&1 || die "tmux is required for pod prebuilds"
   mkdir -p "$TMUX_LOG_DIR"
   script_path="$(realpath "$0")"
-  command="cd $(quote_args "$ROOT_DIR") && SWEHERO_POD_GIT_BRANCH=$(quote_args "${SWEHERO_POD_GIT_BRANCH:-}") EVAL_VENV=$(quote_args "$EVAL_VENV") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION") --parallel-builds $(quote_args "$PARALLEL_BUILDS")"
+  command="cd $(quote_args "$ROOT_DIR") && SWEHERO_POD_GIT_BRANCH=$(quote_args "${SWEHERO_POD_GIT_BRANCH:-}") EVAL_VENV=$(quote_args "$EVAL_VENV") OPENHANDS_EVAL_POETRY_VERSION=$(quote_args "$OPENHANDS_EVAL_POETRY_VERSION") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION") --parallel-builds $(quote_args "$PARALLEL_BUILDS")"
   if [[ -n "$EVAL_LIMIT" ]]; then
     command+=" --eval-limit $(quote_args "$EVAL_LIMIT")"
   fi
@@ -715,6 +761,9 @@ if [[ "$FOREGROUND" != "1" ]]; then
   if [[ "$LAUNCH_SESSION" == "1" ]]; then
     ensure_pod_git_checkout
     eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
+    if [[ -n "${OPENHANDS_POETRY_VERSION_FROM_CONFIG:-}" ]]; then
+      OPENHANDS_EVAL_POETRY_VERSION="$OPENHANDS_POETRY_VERSION_FROM_CONFIG"
+    fi
     [[ "$RUNTIME" == "docker" ]] || die "prebuild only applies to --runtime docker configs"
     if [[ "$REPLACE_SESSION" == "1" ]]; then
       tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
