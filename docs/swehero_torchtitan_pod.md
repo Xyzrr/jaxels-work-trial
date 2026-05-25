@@ -42,11 +42,11 @@ tmux attach-session -t swehero-qwen25-coder7b-swehero-torchtitan
 
 # Override the derived session name for a launch.
 SWEHERO_POD_TMUX_SESSION=swehero-7b-prod \
-  scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
+  scripts/run_qwen_swehero_torchtitan_pod.sh --production-mode --enable-wandb
 
 # Force a supervised detached launch from a non-interactive exec.
 SWEHERO_POD_SUPERVISOR=1 SWEHERO_POD_TMUX_ATTACH=0 \
-  scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
+  scripts/run_qwen_swehero_torchtitan_pod.sh --production-mode --enable-wandb
 
 # Bypass tmux intentionally for non-interactive automation.
 SWEHERO_POD_SUPERVISOR=0 \
@@ -110,7 +110,9 @@ KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
   kubectl exec -it -n midtraining midtraining-dev -- \
     env SWEHERO_POD_GIT_BRANCH="$branch" bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
+scripts/run_qwen_swehero_torchtitan_pod.sh \
+  --production-mode \
+  --enable-wandb
 '
 ```
 
@@ -420,25 +422,6 @@ The defaults are conservative launch gates and are recorded in `run_spec.json`:
 --write-throughput-probe-mb 64
 ```
 
-## Launch Argument Files
-
-Long production launch commands can be placed in a reviewed argument file and
-passed with argparse's `@file` syntax:
-
-```bash
-scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
-```
-
-Each non-empty line in the argument file is parsed like shell input, and lines
-starting with `#` are ignored. Flags written after `@configs/swehero-7b.args`
-on the command line override earlier values from the file.
-
-Reviewed argument files for the actual direct-to-hero run should include
-`--production-mode` and `--enable-wandb`. Leave production mode out for smoke,
-profiler, and bounded soak commands because those intentionally use prototype
-settings, except for the explicit final acceptance path that also includes
-`--production-acceptance-smoke`.
-
 ## Output Launch Lock
 
 Every launcher invocation acquires an atomic sidecar lock before reading,
@@ -489,8 +472,8 @@ The currently explicit controls are:
 ```
 
 These defaults match the existing direct-to-hero TorchTitan config path. Change
-them only for an intentional experiment or debugging run, and keep the reviewed
-argument file as the source of truth.
+them only for an intentional experiment or debugging run; otherwise leave the
+launcher defaults in place.
 
 With `--validate-first-step-checkpoint` enabled, TorchTitan writes a full DCP
 checkpoint at optimizer step 1, validates its metadata and payload files before
