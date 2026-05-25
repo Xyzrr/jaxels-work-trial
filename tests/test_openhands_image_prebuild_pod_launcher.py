@@ -50,6 +50,8 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
         self.assertIn('REPLACE_SESSION=0', script)
         self.assertIn('replacing tmux session: $TMUX_SESSION', script)
         self.assertIn('tmux kill-session -t "$TMUX_SESSION"', script)
+        self.assertIn("kill_foreground_prebuilds()", script)
+        self.assertIn("terminating foreground prebuild process groups", script)
         self.assertIn("--replace-session only applies to tmux-supervised launches", script)
 
     def test_launcher_stores_and_compares_tmux_launch_context(self):
@@ -97,6 +99,8 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
         self.assertIn("different launch context", script)
         self.assertIn("Use --replace-session to restart it with the requested context", script)
         self.assertIn("or --tmux-session NAME to launch a separate prebuild", script)
+        self.assertIn("foreground prebuild process already exists", script)
+        self.assertIn("ensure_no_foreground_prebuild", script)
 
     def test_launcher_is_pod_only_and_enforces_pod_git_checkout(self):
         script = SCRIPT.read_text()

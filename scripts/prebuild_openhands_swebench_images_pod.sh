@@ -354,6 +354,81 @@ compare_tmux_context() {
   tmux_launch_context compare "$@"
 }
 
+foreground_prebuild_pids() {
+  python3 - "$TMUX_SESSION" <<'PY'
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+session = sys.argv[1]
+current_pid = os.getpid()
+try:
+    output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
+except subprocess.CalledProcessError:
+    raise SystemExit(0)
+
+for line in output.splitlines():
+    stripped = line.strip()
+    if not stripped:
+        continue
+    raw_pid, _, args = stripped.partition(" ")
+    try:
+        pid = int(raw_pid)
+    except ValueError:
+        continue
+    if pid == current_pid:
+        continue
+    tokens = args.split()
+    if "prebuild_openhands_swebench_images_pod.sh" not in args:
+        continue
+    if "--foreground" not in tokens:
+        continue
+    try:
+        session_index = tokens.index("--tmux-session")
+    except ValueError:
+        continue
+    if session_index + 1 >= len(tokens) or tokens[session_index + 1] != session:
+        continue
+    print(pid)
+PY
+}
+
+ensure_no_foreground_prebuild() {
+  local pids
+  pids="$(foreground_prebuild_pids)"
+  if [[ -n "$pids" ]]; then
+    echo "error: foreground prebuild process already exists for tmux session: $TMUX_SESSION" >&2
+    printf "%s\n" "$pids" | sed "s/^/  pid: /" >&2
+    echo "Use --replace-session to terminate it before launching a new prebuild." >&2
+    return 1
+  fi
+}
+
+kill_foreground_prebuilds() {
+  local pids
+  pids="$(foreground_prebuild_pids)"
+  [[ -n "$pids" ]] || return 0
+
+  local pgids
+  pgids="$(ps -o pgid= -p $pids | tr -d " " | sort -u)"
+  [[ -n "$pgids" ]] || return 0
+
+  echo "terminating foreground prebuild process groups for $TMUX_SESSION: $pgids"
+  local pgid
+  for pgid in $pgids; do
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+  done
+  sleep 5
+  pids="$(foreground_prebuild_pids)"
+  [[ -n "$pids" ]] || return 0
+  pgids="$(ps -o pgid= -p $pids | tr -d " " | sort -u)"
+  for pgid in $pgids; do
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+  done
+}
+
 ensure_docker() {
   if ! docker info >/dev/null 2>&1; then
     tmux kill-session -t openhands-dockerd 2>/dev/null || true
@@ -767,6 +842,9 @@ if [[ "$FOREGROUND" != "1" ]]; then
     [[ "$RUNTIME" == "docker" ]] || die "prebuild only applies to --runtime docker configs"
     if [[ "$REPLACE_SESSION" == "1" ]]; then
       tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+      kill_foreground_prebuilds
+    else
+      ensure_no_foreground_prebuild
     fi
     write_tmux_context "$TMUX_CONTEXT_PATH" "$script_path" "$command"
     if ! tmux new-session -d -s "$TMUX_SESSION" "set -euo pipefail; $command 2>&1 | tee -a $(quote_args "$TMUX_LOG_PATH")"; then
