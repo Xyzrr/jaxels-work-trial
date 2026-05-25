@@ -26,6 +26,9 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn("swehero_require_pod_git_checkout", script)
         self.assertIn("SWEHERO_POD_GIT_BRANCH", script)
         self.assertIn("OpenHands eval pod execution directory", script)
+        self.assertIn("supervised_env_args", script)
+        self.assertIn('"VLLM_FORCE_RESTART=$VLLM_FORCE_RESTART"', script)
+        self.assertIn('env $(supervised_env_args)', script)
 
     def test_launcher_verifies_docker_and_buildx(self):
         script = SCRIPT.read_text()
@@ -82,6 +85,9 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn('-e "$SWE_LEGO_SWEBENCH_DIR"', script)
         self.assertIn("for stale_gpu in $(seq 0 $((VISIBLE_GPU_COUNT - 1)))", script)
         self.assertIn('tmux kill-session -t "$(vllm_session_name "$stale_gpu")"', script)
+        self.assertIn("cleanup_vllm_runtime", script)
+        self.assertIn('kill_process_pattern "$VLLM_VENV/bin/vllm"', script)
+        self.assertIn('kill_process_pattern "$VLLM_VENV/bin/python -c from multiprocessing"', script)
 
     def test_vllm_requirement_is_pinned(self):
         requirements = REPO_ROOT / "requirements" / "openhands-vllm.txt"

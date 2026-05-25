@@ -59,6 +59,29 @@ quote_args() {
   printf "%q " "$@"
 }
 
+supervised_env_args() {
+  quote_args \
+    "SWEHERO_POD_GIT_BRANCH=${SWEHERO_POD_GIT_BRANCH:-}" \
+    "LLM_API_KEY=$LLM_API_KEY" \
+    "VLLM_VENV=$VLLM_VENV" \
+    "VLLM_REQUIREMENTS_PATH=$VLLM_REQUIREMENTS_PATH" \
+    "VLLM_PYTHON_VERSION=$VLLM_PYTHON_VERSION" \
+    "VLLM_VISIBLE_DEVICES=$VLLM_VISIBLE_DEVICES" \
+    "VLLM_FORCE_RESTART=$VLLM_FORCE_RESTART" \
+    "VLLM_TMUX_SESSION=$VLLM_TMUX_SESSION" \
+    "VLLM_TMUX_SESSION_PREFIX=$VLLM_TMUX_SESSION_PREFIX" \
+    "VLLM_ROUTER_TMUX_SESSION=$VLLM_ROUTER_TMUX_SESSION" \
+    "EVAL_VENV=$EVAL_VENV" \
+    "OPENHANDS_EVAL_PYTHON_VERSION=$OPENHANDS_EVAL_PYTHON_VERSION" \
+    "OPENHANDS_EVAL_POETRY_VERSION=$OPENHANDS_EVAL_POETRY_VERSION" \
+    "DOCKER_TMUX_SESSION=$DOCKER_TMUX_SESSION" \
+    "REQUIRED_GPU_COUNT=$REQUIRED_GPU_COUNT" \
+    "OPENHANDS_EVAL_TMUX_LOG_DIR=$TMUX_LOG_DIR" \
+    "UV_TOOL_DIR=$UV_TOOL_DIR" \
+    "UV_CACHE_DIR=$UV_CACHE_DIR" \
+    "UV_PYTHON_INSTALL_DIR=$UV_PYTHON_INSTALL_DIR"
+}
+
 ensure_pod_git_checkout() {
   [[ -d "$WORKSPACE_ROOT" ]] || die "workspace not found: $WORKSPACE_ROOT"
   command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
@@ -288,7 +311,7 @@ if [[ "$FOREGROUND" != "1" ]]; then
   else
     ensure_pod_git_checkout
     script_path="$(realpath "$0")"
-    command="cd $(quote_args "$WORKSPACE_ROOT") && SWEHERO_POD_GIT_BRANCH=$(quote_args "$SWEHERO_POD_GIT_BRANCH") $(quote_args "$script_path") --foreground"
+    command="cd $(quote_args "$WORKSPACE_ROOT") && env $(supervised_env_args)$(quote_args "$script_path") --foreground"
     if [[ -n "$EVAL_LIMIT" ]]; then
       command+=" --eval-limit $(quote_args "$EVAL_LIMIT")"
     fi
@@ -664,6 +687,27 @@ PORT=$port
 EOF
 }
 
+kill_process_pattern() {
+  local pattern="$1"
+  if ! pgrep -f "$pattern" >/dev/null 2>&1; then
+    return
+  fi
+
+  pkill -TERM -f "$pattern" 2>/dev/null || true
+  for _ in $(seq 1 15); do
+    if ! pgrep -f "$pattern" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 1
+  done
+  pkill -KILL -f "$pattern" 2>/dev/null || true
+}
+
+cleanup_vllm_runtime() {
+  kill_process_pattern "$VLLM_VENV/bin/vllm"
+  kill_process_pattern "$VLLM_VENV/bin/python -c from multiprocessing"
+}
+
 ensure_vllm_server() {
   local ip="$1"
   local gpu="$2"
@@ -815,6 +859,7 @@ ensure_vllm_stack() {
     if [[ "$VLLM_USE_ROUTER" != "1" && "$VLLM_USE_ROUTER" != "true" ]]; then
       tmux kill-session -t "$VLLM_ROUTER_TMUX_SESSION" 2>/dev/null || true
     fi
+    cleanup_vllm_runtime
   fi
 
   local backend_args=()
