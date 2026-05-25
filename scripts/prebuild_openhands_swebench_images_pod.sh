@@ -383,7 +383,7 @@ for line in output.splitlines():
     tokens = args.split()
     if "prebuild_openhands_swebench_images_pod.sh" not in args:
         continue
-    if "--foreground" not in tokens:
+    if "--foreground" not in tokens and "--foreground-worker" not in tokens:
         continue
     try:
         session_index = tokens.index("--tmux-session")
@@ -427,6 +427,58 @@ kill_foreground_prebuilds() {
   for pgid in $pgids; do
     kill -KILL -- "-$pgid" 2>/dev/null || true
   done
+}
+
+FOREGROUND_WORKER_PID=""
+
+cleanup_foreground_worker() {
+  local status=$?
+  trap - HUP INT TERM EXIT
+  if [[ -n "$FOREGROUND_WORKER_PID" ]] && kill -0 "$FOREGROUND_WORKER_PID" 2>/dev/null; then
+    echo "foreground prebuild received termination; terminating child process group: $FOREGROUND_WORKER_PID" >&2
+    kill -TERM -- "-$FOREGROUND_WORKER_PID" 2>/dev/null || true
+    (
+      sleep 30
+      echo "foreground prebuild child process group did not exit after TERM; sending KILL: $FOREGROUND_WORKER_PID" >&2
+      kill -KILL -- "-$FOREGROUND_WORKER_PID" 2>/dev/null || true
+    ) &
+    local killer_pid="$!"
+    wait "$FOREGROUND_WORKER_PID" 2>/dev/null || true
+    kill "$killer_pid" 2>/dev/null || true
+    wait "$killer_pid" 2>/dev/null || true
+  fi
+  exit "$status"
+}
+
+run_supervised_foreground_worker() {
+  command -v setsid >/dev/null 2>&1 || die "setsid not found; recreate the pod with manifests/midtraining-hostpath.yaml"
+  local script_path
+  script_path="$(realpath "$0")"
+  local worker_command=(
+    env
+    "SWEHERO_POD_GIT_BRANCH=${SWEHERO_POD_GIT_BRANCH:-}"
+    "EVAL_VENV=$EVAL_VENV"
+    "OPENHANDS_EVAL_POETRY_VERSION=$OPENHANDS_EVAL_POETRY_VERSION"
+    "$script_path"
+    --foreground-worker
+    --config "$CONFIG_PRESET_PATH"
+    --tmux-session "$TMUX_SESSION"
+    --parallel-builds "$PARALLEL_BUILDS"
+  )
+  if [[ -n "$EVAL_LIMIT" ]]; then
+    worker_command+=(--eval-limit "$EVAL_LIMIT")
+  fi
+
+  setsid "${worker_command[@]}" &
+  FOREGROUND_WORKER_PID="$!"
+  trap cleanup_foreground_worker HUP INT TERM EXIT
+  set +e
+  wait "$FOREGROUND_WORKER_PID"
+  local status=$?
+  set -e
+  FOREGROUND_WORKER_PID=""
+  trap - HUP INT TERM EXIT
+  exit "$status"
 }
 
 ensure_docker() {
@@ -741,6 +793,7 @@ PARALLEL_BUILDS=4
 TMUX_SESSION="openhands-swebench-image-prebuild"
 TMUX_LOG_DIR="/workspace/runlogs"
 FOREGROUND=0
+FOREGROUND_WORKER=0
 REPLACE_SESSION=0
 EVAL_VENV="${EVAL_VENV:-/workspace/venvs/openhands-eval-pod-py312}"
 OPENHANDS_EVAL_POETRY_VERSION="${OPENHANDS_EVAL_POETRY_VERSION:-2.1.3}"
@@ -782,6 +835,11 @@ while (($#)); do
       FOREGROUND=1
       shift
       ;;
+    --foreground-worker)
+      FOREGROUND=1
+      FOREGROUND_WORKER=1
+      shift
+      ;;
     --attach)
       ATTACH=1
       shift
@@ -819,7 +877,7 @@ if [[ "$FOREGROUND" != "1" ]]; then
   command -v tmux >/dev/null 2>&1 || die "tmux is required for pod prebuilds"
   mkdir -p "$TMUX_LOG_DIR"
   script_path="$(realpath "$0")"
-  command="cd $(quote_args "$ROOT_DIR") && SWEHERO_POD_GIT_BRANCH=$(quote_args "${SWEHERO_POD_GIT_BRANCH:-}") EVAL_VENV=$(quote_args "$EVAL_VENV") OPENHANDS_EVAL_POETRY_VERSION=$(quote_args "$OPENHANDS_EVAL_POETRY_VERSION") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION") --parallel-builds $(quote_args "$PARALLEL_BUILDS")"
+  command="cd $(quote_args "$ROOT_DIR") && exec env SWEHERO_POD_GIT_BRANCH=$(quote_args "${SWEHERO_POD_GIT_BRANCH:-}") EVAL_VENV=$(quote_args "$EVAL_VENV") OPENHANDS_EVAL_POETRY_VERSION=$(quote_args "$OPENHANDS_EVAL_POETRY_VERSION") $(quote_args "$script_path") --foreground --config $(quote_args "$CONFIG_PRESET_PATH") --tmux-session $(quote_args "$TMUX_SESSION") --parallel-builds $(quote_args "$PARALLEL_BUILDS")"
   if [[ -n "$EVAL_LIMIT" ]]; then
     command+=" --eval-limit $(quote_args "$EVAL_LIMIT")"
   fi
@@ -847,7 +905,7 @@ if [[ "$FOREGROUND" != "1" ]]; then
       ensure_no_foreground_prebuild
     fi
     write_tmux_context "$TMUX_CONTEXT_PATH" "$script_path" "$command"
-    if ! tmux new-session -d -s "$TMUX_SESSION" "set -euo pipefail; $command 2>&1 | tee -a $(quote_args "$TMUX_LOG_PATH")"; then
+    if ! tmux new-session -d -s "$TMUX_SESSION" "set -euo pipefail; exec > >(tee -a $(quote_args "$TMUX_LOG_PATH")) 2>&1; $command"; then
       rm -f "$TMUX_CONTEXT_PATH"
       die "failed to launch tmux session: $TMUX_SESSION"
     fi
@@ -868,6 +926,10 @@ command -v docker >/dev/null 2>&1 || die "docker not found; recreate the pod wit
 command -v git >/dev/null 2>&1 || die "git not found; recreate the pod with manifests/midtraining-hostpath.yaml"
 command -v python3 >/dev/null 2>&1 || die "python3 not found; recreate the pod with manifests/midtraining-hostpath.yaml"
 command -v tmux >/dev/null 2>&1 || die "tmux not found; recreate the pod with manifests/midtraining-hostpath.yaml"
+
+if [[ "$FOREGROUND_WORKER" != "1" ]]; then
+  run_supervised_foreground_worker
+fi
 
 mkdir -p "$TMUX_LOG_DIR" /workspace/runlogs
 ensure_pod_git_checkout

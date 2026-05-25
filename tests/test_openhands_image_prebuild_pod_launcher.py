@@ -42,6 +42,8 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
         self.assertIn('tmux session already exists: $TMUX_SESSION', script)
         self.assertIn('exec tmux attach-session -t "$TMUX_SESSION"', script)
         self.assertIn('tmux new-session -d -s "$TMUX_SESSION"', script)
+        self.assertIn("exec > >(tee -a $(quote_args \"$TMUX_LOG_PATH\")) 2>&1", script)
+        self.assertNotIn("$command 2>&1 | tee", script)
 
     def test_launcher_can_replace_existing_tmux_session(self):
         script = SCRIPT.read_text()
@@ -101,6 +103,18 @@ class OpenHandsImagePrebuildPodLauncherTests(unittest.TestCase):
         self.assertIn("or --tmux-session NAME to launch a separate prebuild", script)
         self.assertIn("foreground prebuild process already exists", script)
         self.assertIn("ensure_no_foreground_prebuild", script)
+
+    def test_foreground_worker_cleans_up_child_process_group(self):
+        script = SCRIPT.read_text()
+
+        self.assertIn("--foreground-worker)", script)
+        self.assertIn("run_supervised_foreground_worker()", script)
+        self.assertIn("setsid \"${worker_command[@]}\" &", script)
+        self.assertIn("trap cleanup_foreground_worker HUP INT TERM EXIT", script)
+        self.assertIn("kill -TERM -- \"-$FOREGROUND_WORKER_PID\"", script)
+        self.assertIn("kill -KILL -- \"-$FOREGROUND_WORKER_PID\"", script)
+        self.assertIn("foreground prebuild received termination", script)
+        self.assertIn('"--foreground-worker" not in tokens', script)
 
     def test_launcher_is_pod_only_and_enforces_pod_git_checkout(self):
         script = SCRIPT.read_text()
