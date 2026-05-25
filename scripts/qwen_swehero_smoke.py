@@ -22,7 +22,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-Coder-7B-Instruct")
 DATASET_ID = os.environ.get("DATASET_ID", "nvidia/SWE-Hero-openhands-trajectories")
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/workspace/qwen25-coder7b-swehero-smoke"))
@@ -136,7 +135,9 @@ def turn_segments(turn: object) -> list[tuple[str, bool]]:
     tool_calls = turn.get("tool_calls")
     if tool_calls:
         segments.append(("<|tool_calls|>\n", False))
-        segments.append((json.dumps(tool_calls, ensure_ascii=False) + "\n", is_assistant))
+        segments.append(
+            (json.dumps(tool_calls, ensure_ascii=False) + "\n", is_assistant)
+        )
 
     return segments
 
@@ -269,7 +270,6 @@ def maybe_enable_yarn(
 
 def main() -> None:
     import torch
-    from datasets import load_dataset
     from transformers import (
         AutoConfig,
         AutoModelForCausalLM,
@@ -277,6 +277,8 @@ def main() -> None:
         Trainer,
         TrainingArguments,
     )
+
+    from datasets import load_dataset
 
     load_env_file()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -348,7 +350,9 @@ def main() -> None:
 
         for row, feature in enumerate(features):
             length = len(feature["input_ids"])
-            input_ids[row, :length] = torch.tensor(feature["input_ids"], dtype=torch.long)
+            input_ids[row, :length] = torch.tensor(
+                feature["input_ids"], dtype=torch.long
+            )
             attention_mask[row, :length] = 1
             labels[row, :length] = torch.tensor(feature["labels"], dtype=torch.long)
 
@@ -374,7 +378,9 @@ def main() -> None:
         items_per_epoch
         / (PER_DEVICE_TRAIN_BATCH_SIZE * WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS)
     )
-    total_steps = MAX_STEPS if MAX_STEPS > 0 else math.ceil(steps_per_epoch * NUM_TRAIN_EPOCHS)
+    total_steps = (
+        MAX_STEPS if MAX_STEPS > 0 else math.ceil(steps_per_epoch * NUM_TRAIN_EPOCHS)
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, build_cosine_with_min_lr_lambda(total_steps)

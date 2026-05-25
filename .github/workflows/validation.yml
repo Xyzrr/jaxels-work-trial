@@ -1,0 +1,29 @@
+name: Validation
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  validate:
+    name: Tests, lint, and format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.16"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12.13
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Validate
+        run: uv run scripts/validate.py

@@ -14,13 +14,17 @@ The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
 - Dockerized SWE-bench grading through either OpenHands' bundled grader path
   or SWE-Lego's vendored `SWE-bench-4.0.4` checkout.
 
-Use `scripts/run_midtraining_pod.sh eval` and
-`scripts/run_midtraining_pod.sh prebuild` from the workstation checkout. The
+Use `scripts/run_midtraining_pod.py eval` and
+`scripts/run_midtraining_pod.py prebuild` from the workstation checkout. The
 meta-wrapper pushes the current clean branch, enters `midtraining-dev` with
 `tmp/pod-creds/kubeconfig.yaml`, sets the legacy `SWEHERO_POD_GIT_BRANCH`
 runtime variable inside the pod, and starts the lower-level pod wrapper from
 `/workspace/jaxels-work-trial`. Do not run OpenHands or SWE-bench from the
 laptop.
+
+The workstation wrapper is a Python `uv` entrypoint. Run it directly as shown
+or through `uv run`; do not add shell launchers for new eval or prebuild
+workflows.
 
 ## Configuration Presets
 
@@ -106,14 +110,14 @@ can report a reachable daemon while still failing container execution.
 Prebuild the per-task OpenHands runtime images before eval:
 
 ```bash
-scripts/run_midtraining_pod.sh prebuild
+scripts/run_midtraining_pod.py prebuild
 ```
 
 For the SWE-Lego stack, prebuild against its vendored `OpenHands-0.53.0` by
 passing the SWE-Lego preset:
 
 ```bash
-scripts/run_midtraining_pod.sh prebuild \
+scripts/run_midtraining_pod.py prebuild \
   --config configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args
 ```
 
@@ -134,13 +138,13 @@ the same session name must match that stored launch context unless
 Run a one-instance smoke:
 
 ```bash
-scripts/run_midtraining_pod.sh eval --eval-limit 1
+scripts/run_midtraining_pod.py eval --eval-limit 1
 ```
 
 For a non-attached launch:
 
 ```bash
-scripts/run_midtraining_pod.sh --no-tty eval --eval-limit 1 --no-attach
+scripts/run_midtraining_pod.py --no-tty eval --eval-limit 1 --no-attach
 ```
 
 The launcher creates a tmux session named
@@ -152,7 +156,7 @@ The launcher creates a tmux session named
 Run the full SWE-bench Verified split:
 
 ```bash
-scripts/run_midtraining_pod.sh eval
+scripts/run_midtraining_pod.py eval
 ```
 
 ## SWE-Lego Eval
@@ -206,7 +210,7 @@ Run SWE-Lego-Qwen3-8B on the 16-task infrastructure check set with:
 
 ```bash
 eval_ids="django__django-13670,django__django-12663,scikit-learn__scikit-learn-14983,django__django-13279,sphinx-doc__sphinx-7757,django__django-14434,django__django-11999,scikit-learn__scikit-learn-25232,sympy__sympy-15599,astropy__astropy-14309,scikit-learn__scikit-learn-25973,sphinx-doc__sphinx-8551,django__django-12155,sphinx-doc__sphinx-11510,scikit-learn__scikit-learn-13439,django__django-15503"
-scripts/run_midtraining_pod.sh eval \
+scripts/run_midtraining_pod.py eval \
   --config configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args \
   --eval-ids "$eval_ids" \
   --run-id swe-lego-qwen3-8b-16task
@@ -231,13 +235,13 @@ For a full base-model comparison against an SFT checkpoint, run both base
 context modes with explicit run IDs:
 
 ```bash
-scripts/run_midtraining_pod.sh eval \
+scripts/run_midtraining_pod.py eval \
   --config configs/eval/openhands-swebench-verified-qwen25-coder-7b-base-native-32k.args \
   --run-id qwen25-coder7b-base-native32k-pass1
 ```
 
 ```bash
-scripts/run_midtraining_pod.sh eval \
+scripts/run_midtraining_pod.py eval \
   --config configs/eval/openhands-swebench-verified-qwen25-coder-7b-base-paper-yarn-128k.args \
   --run-id qwen25-coder7b-base-yarn128k-pass1
 ```
@@ -274,7 +278,7 @@ silently reusing it.
 Check the pod runtime, Docker, vLLM, and structured tool calling:
 
 ```bash
-scripts/run_midtraining_pod.sh eval --preflight-only --foreground
+scripts/run_midtraining_pod.py eval --preflight-only --foreground
 ```
 
 The tool-call preflight must return structured `message.tool_calls` for
@@ -331,7 +335,7 @@ Override with `--output-dir PATH` when a stable path is needed.
 
 ## What the Launcher Does
 
-1. `scripts/run_midtraining_pod.sh` refuses to push if the local checkout has
+1. `scripts/run_midtraining_pod.py` refuses to push if the local checkout has
    uncommitted changes, pushes the selected branch, and enters
    `midtraining-dev` through `kubectl exec`.
 2. The lower-level pod wrappers call the shared startup guard before actual

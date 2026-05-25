@@ -1,7 +1,6 @@
 import argparse
 import json
 import tempfile
-import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -146,7 +145,7 @@ def make_artifact(tmp_path, args, *, max_final=99, counts=None):
     return context_filter
 
 
-class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
+class TestRefreshSweHeroContextCappedOneRollout:
     def test_qwen_context_evaluation_uses_shifted_input_length(self):
         row = {
             "trajectory": [
@@ -174,9 +173,9 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
             max_shifted_context=uncapped.shifted_input_length - 1,
         )
 
-        self.assertEqual(uncapped.shifted_input_length, uncapped.token_count - 1)
-        self.assertTrue(exact_cap.fits_context)
-        self.assertFalse(under_cap.fits_context)
+        assert uncapped.shifted_input_length == uncapped.token_count - 1
+        assert exact_cap.fits_context
+        assert not under_cap.fits_context
 
     def test_replacement_selection_preserves_original_rank_order(self):
         current = selected_row("current", (1, 10, 5))
@@ -184,17 +183,19 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
         shorter = selected_row("shorter", (1, 5, 7))
         later_tie = selected_row("later-tie", (1, 10, 8))
 
-        self.assertEqual(
-            refresh.select_better_context_row(current, fewer_errors).selected.trajectory_id,
-            "fewer-errors",
+        assert (
+            refresh.select_better_context_row(
+                current, fewer_errors
+            ).selected.trajectory_id
+            == "fewer-errors"
         )
-        self.assertEqual(
-            refresh.select_better_context_row(current, shorter).selected.trajectory_id,
-            "shorter",
+        assert (
+            refresh.select_better_context_row(current, shorter).selected.trajectory_id
+            == "shorter"
         )
-        self.assertEqual(
-            refresh.select_better_context_row(current, later_tie).selected.trajectory_id,
-            "current",
+        assert (
+            refresh.select_better_context_row(current, later_tie).selected.trajectory_id
+            == "current"
         )
 
     def test_manifest_parser_restores_reject_reason_tuple(self):
@@ -217,8 +218,8 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
 
         selected = refresh.selected_row_from_json(payload)
 
-        self.assertEqual(selected.selection_rank, (0, 2, 42))
-        self.assertEqual(selected.evaluation.reject_reasons, ())
+        assert selected.selection_rank == (0, 2, 42)
+        assert selected.evaluation.reject_reasons == ()
 
     def test_current_artifact_metadata_short_circuits_exact_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,8 +235,8 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
             ):
                 summary = refresh.refresh_dataset(args)
 
-        self.assertEqual(summary.final_selected_rows, 2)
-        self.assertEqual(summary.replacement_rows, 1)
+        assert summary.final_selected_rows == 2
+        assert summary.replacement_rows == 1
 
     def test_current_artifact_rejects_stale_metadata_and_changed_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,7 +248,7 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
             status = refresh.current_artifact_status(
                 tmp_path, args, context_filter=context_filter
             )
-            self.assertTrue(status.is_current)
+            assert status.is_current
 
             changed_settings_args = make_args(
                 tmp_path, tokenizer_path, include_model_patch=True
@@ -257,10 +258,10 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
                 changed_settings_args,
                 context_filter=refresh.context_filter_contract(changed_settings_args),
             )
-            self.assertFalse(changed_settings_status.is_current)
-            self.assertIn(
-                "context_filter.include_model_patch changed",
-                changed_settings_status.reasons,
+            assert not changed_settings_status.is_current
+            assert (
+                "context_filter.include_model_patch changed"
+                in changed_settings_status.reasons
             )
 
             (tokenizer_path / "tokenizer.json").write_bytes(b"different tokenizer")
@@ -269,10 +270,10 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
                 args,
                 context_filter=refresh.context_filter_contract(args),
             )
-            self.assertFalse(changed_tokenizer_status.is_current)
-            self.assertIn(
-                "context_filter.tokenizer_json_sha256 changed",
-                changed_tokenizer_status.reasons,
+            assert not changed_tokenizer_status.is_current
+            assert (
+                "context_filter.tokenizer_json_sha256 changed"
+                in changed_tokenizer_status.reasons
             )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -283,10 +284,8 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
             stale_status = refresh.current_artifact_status(
                 tmp_path, args, context_filter=stale_context_filter
             )
-            self.assertFalse(stale_status.is_current)
-            self.assertIn(
-                "final context maximum exceeds requested cap", stale_status.reasons
-            )
+            assert not stale_status.is_current
+            assert "final context maximum exceeds requested cap" in stale_status.reasons
 
     def test_stale_metadata_falls_back_to_over_context_exact_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -327,17 +326,15 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
                             with mock.patch.object(refresh, "write_dataset") as write:
                                 summary = refresh.refresh_dataset(args)
 
-        self.assertEqual(summary.current_over_context_rows, 1)
-        self.assertEqual(summary.replacement_rows, 1)
-        self.assertEqual(summary.final_selected_rows, 1)
+        assert summary.current_over_context_rows == 1
+        assert summary.replacement_rows == 1
+        assert summary.final_selected_rows == 1
         write_kwargs = write.call_args.kwargs
-        self.assertEqual(
-            [row.selected.trajectory_id for row in write_kwargs["selected_rows"]],
-            ["new-fitting"],
-        )
-        self.assertEqual(
-            write_kwargs["report"]["replaced"][0]["new_trajectory_id"],
-            "new-fitting",
+        assert [
+            row.selected.trajectory_id for row in write_kwargs["selected_rows"]
+        ] == ["new-fitting"]
+        assert (
+            write_kwargs["report"]["replaced"][0]["new_trajectory_id"] == "new-fitting"
         )
 
     def test_optimized_fallback_matches_exact_refresh_outputs(self):
@@ -350,26 +347,32 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
             replacement = context_selected_row("issue-1", "new", (0, 2, 11), 80, True)
 
             def run_once(func):
-                with mock.patch.object(
-                    refresh, "QwenTokenizerAdapter", return_value=object()
-                ), mock.patch.object(
-                    refresh,
-                    "load_current_selected_rows",
-                    return_value=("schema", {"issue-1": current}),
-                ), mock.patch.object(
-                    refresh,
-                    "find_fit_replacements",
-                    return_value=(
-                        25,
-                        {"issue-1": replacement},
-                        {"issue-1": 2},
-                        {"issue-1": 1},
+                with (
+                    mock.patch.object(
+                        refresh, "QwenTokenizerAdapter", return_value=object()
                     ),
-                ), mock.patch.object(
-                    refresh.prep,
-                    "api_dataset_files",
-                    return_value=["data/source.parquet"],
-                ), mock.patch.object(refresh, "write_dataset") as write:
+                    mock.patch.object(
+                        refresh,
+                        "load_current_selected_rows",
+                        return_value=("schema", {"issue-1": current}),
+                    ),
+                    mock.patch.object(
+                        refresh,
+                        "find_fit_replacements",
+                        return_value=(
+                            25,
+                            {"issue-1": replacement},
+                            {"issue-1": 2},
+                            {"issue-1": 1},
+                        ),
+                    ),
+                    mock.patch.object(
+                        refresh.prep,
+                        "api_dataset_files",
+                        return_value=["data/source.parquet"],
+                    ),
+                    mock.patch.object(refresh, "write_dataset") as write,
+                ):
                     summary = func()
                     return summary, write.call_args.kwargs
 
@@ -382,13 +385,8 @@ class RefreshSweHeroContextCappedOneRolloutTests(unittest.TestCase):
                 lambda: refresh.refresh_dataset(args)
             )
 
-        self.assertEqual(exact_summary, optimized_summary)
-        self.assertEqual(exact_write["report"], optimized_write["report"])
-        self.assertEqual(
-            [row.selected.trajectory_id for row in exact_write["selected_rows"]],
-            [row.selected.trajectory_id for row in optimized_write["selected_rows"]],
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert exact_summary == optimized_summary
+        assert exact_write["report"] == optimized_write["report"]
+        assert [row.selected.trajectory_id for row in exact_write["selected_rows"]] == [
+            row.selected.trajectory_id for row in optimized_write["selected_rows"]
+        ]

@@ -28,13 +28,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from scripts import prepare_swehero_historical_one_rollout as prep
 from scripts import qwen_swehero_train as train
-
 
 DEFAULT_TOKENIZER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -255,8 +253,8 @@ def find_fit_replacements(
     include_model_patch: bool,
 ) -> tuple[int, dict[str, ContextSelectedRow], dict[str, int], dict[str, int]]:
     replacements: dict[str, ContextSelectedRow] = {}
-    accepted_candidates_by_instance = {instance_id: 0 for instance_id in instance_ids}
-    fit_candidates_by_instance = {instance_id: 0 for instance_id in instance_ids}
+    accepted_candidates_by_instance = dict.fromkeys(instance_ids, 0)
+    fit_candidates_by_instance = dict.fromkeys(instance_ids, 0)
     source_rows = 0
 
     files = prep.api_dataset_files(dataset_id, revision)
@@ -302,9 +300,7 @@ def find_fit_replacements(
                 selection_rank=prep.selection_rank(evaluation, source_row_index),
                 evaluation=evaluation,
             )
-            candidate = ContextSelectedRow(
-                row=row, selected=selected, context=context
-            )
+            candidate = ContextSelectedRow(row=row, selected=selected, context=context)
             replacements[instance_id] = select_better_context_row(
                 replacements.get(instance_id), candidate
             )
@@ -572,9 +568,12 @@ def write_dataset(
 
     try:
         shard_count = math.ceil(len(selected_rows) / rows_per_shard)
-        for shard_index, start in enumerate(range(0, len(selected_rows), rows_per_shard)):
+        for shard_index, start in enumerate(
+            range(0, len(selected_rows), rows_per_shard)
+        ):
             shard_rows = [
-                selected.row for selected in selected_rows[start : start + rows_per_shard]
+                selected.row
+                for selected in selected_rows[start : start + rows_per_shard]
             ]
             shard_path = data_dir / (
                 f"train-{shard_index:05d}-of-{shard_count:05d}.parquet"
@@ -802,13 +801,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-shifted-context", type=int, default=train.PAPER_CONTEXT_LENGTH
     )
-    parser.add_argument("--max-assistant-turns", type=int, default=prep.MAX_ASSISTANT_TURNS)
+    parser.add_argument(
+        "--max-assistant-turns", type=int, default=prep.MAX_ASSISTANT_TURNS
+    )
     parser.add_argument(
         "--max-str-replace-editor-errors",
         type=int,
         default=prep.MAX_STR_REPLACE_EDITOR_ERRORS,
     )
-    parser.add_argument("--rows-per-shard", type=int, default=prep.DEFAULT_ROWS_PER_SHARD)
+    parser.add_argument(
+        "--rows-per-shard", type=int, default=prep.DEFAULT_ROWS_PER_SHARD
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--include-model-patch", action="store_true")
     parser.add_argument("--overwrite", action="store_true")

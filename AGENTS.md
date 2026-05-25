@@ -18,13 +18,15 @@ The original training baseline is to replicate and extend the "direct-to-hero" b
 
 Current eval support includes both:
 
-- SWE-Hero/current OpenHands evals: upstream OpenHands through `scripts/run_openhands_swebench_eval_pod.sh`, with the Qwen2.5-Coder presets under `configs/eval/`.
+- SWE-Hero/current OpenHands evals: upstream OpenHands through `scripts/run_openhands_swebench_eval_pod.py`, with the Qwen2.5-Coder presets under `configs/eval/`.
 - SWE-Lego evals: `configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args` uses the vendored `SWE-Lego/SWE-Lego` stack at commit `94704b69aac886e003660e1e0f69f7de163b284e`, nested `OpenHands-0.53.0`, vendored `SWE-bench-4.0.4`, and the single 8-GPU tensor-parallel `SWE-Lego/SWE-Lego-Qwen3-8B` serving contract.
 
 # Primary Workflow Docs
 
 - Training jobs: `docs/swehero_torchtitan_pod.md`.
 - Evals: `docs/openhands_swebench_gpu_pod_eval.md`.
+- Local Python/uv development: `docs/python_uv_project.md`.
+- Shell-to-Python conversion proof: `docs/script_conversion_experiments.md`.
 
 # Local Resources
 
@@ -36,9 +38,14 @@ Current eval support includes both:
 # Working Rules
 
 - Re-read the relevant paper or source workflow before changing pipeline assumptions. For SWE-Hero-specific training assumptions, use the SWE-Hero paper. For SWE-Lego eval behavior, inspect the vendored SWE-Lego workflow and preset rather than assuming upstream OpenHands behavior.
+- This is a `uv` project. Use pinned `uv 0.11.16` and local Python `3.12.13` from `.python-version`; run project tools through `uv run`.
+- Create project automation as Python scripts, not bash scripts. Workstation/local scripts that rely on the project environment should use `#!/usr/bin/env -S uv run python` and be runnable as `uv run scripts/name.py`. Pod bootstrap scripts may use `#!/usr/bin/env python3` only when they bootstrap or repair `uv`/Python and therefore cannot assume the project venv exists yet.
+- Do not add new bash scripts outside vendored third-party trees or generated command-record artifacts. If a workflow needs shell-like orchestration, implement it in Python with explicit subprocess calls and tests.
+- Run `uv run scripts/validate.py` for local validation. It runs pytest, Ruff lint, and Ruff format checks in parallel while keeping each process's stdout/stderr grouped.
 - Use `tmp/pod-creds/kubeconfig.yaml` whenever running `kubectl`, `helm`, or other Kubernetes tools for this project.
 - Run both training and eval workloads on the GPU pod, not on the local machine. Local execution is only for editing, lightweight inspection, tests that do not require the training/eval stack, and Kubernetes orchestration.
 - Prefer TorchTitan's existing extension points and scripts over ad-hoc training code.
+- Do not touch `torchtitan/`. It is vendored and intentionally excluded from project `uv`, pytest, Ruff, and CI configuration.
 - Keep secrets, pod credentials, `.env`, checkpoints, datasets, and generated run artifacts out of git.
 - Preserve enough metadata to reproduce each run: model, dataset revision, tokenizer/chat template, sequence length, loss masking, LR schedule, batch size, hardware, commit, and eval harness revision.
 - Verify meaningful behavior with automated tests or a concrete dry run whenever feasible.

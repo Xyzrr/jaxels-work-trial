@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
-
 DATASET_ID = "nvidia/SWE-Hero-openhands-trajectories"
 HISTORICAL_REVISION = "5b2ed21270ad773a50163e2999c510f0cbb92cfa"
 DEFAULT_OUTPUT_DIR = (

@@ -1,12 +1,13 @@
 import json
 import tempfile
-import unittest
 from pathlib import Path
+
+import pytest
 
 from scripts import qwen_swehero_gpu_lifecycle_smoke as smoke
 
 
-class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
+class TestQwenSweHeroGpuLifecycleSmoke:
     def _flag_value(self, command: list[str], flag: str) -> str:
         index = command.index(flag)
         return command[index + 1]
@@ -36,26 +37,23 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
         fresh = smoke.fresh_launch_command(args)
         resume = smoke.resume_launch_command(args)
 
-        self.assertIn("--overwrite-output", fresh)
-        self.assertNotIn("--resume", fresh)
-        self.assertIn("--resume", resume)
-        self.assertNotIn("--overwrite-output", resume)
+        assert "--overwrite-output" in fresh
+        assert "--resume" not in fresh
+        assert "--resume" in resume
+        assert "--overwrite-output" not in resume
         for command in (fresh, resume):
-            self.assertIn("--smoke-synthetic-buckets", command)
-            self.assertIn("--validate-first-step-checkpoint", command)
-            self.assertIn("--no-compile", command)
-            self.assertIn("--no-enable-fp8", command)
-            self.assertEqual(self._flag_value(command, "--bucket-cp"), "2048:2")
-            self.assertEqual(self._flag_value(command, "--bucket-curriculum"), "single-bucket")
-            self.assertEqual(self._flag_value(command, "--checkpoint-interval"), "1")
-            self.assertEqual(
-                self._flag_value(command, "--checkpoint-async-mode"),
-                "disabled",
-            )
-            self.assertEqual(self._flag_value(command, "--global-batch-size"), "2")
-            self.assertEqual(
-                self._flag_value(command, "--smoke-synthetic-examples-per-bucket"),
-                "6",
+            assert "--smoke-synthetic-buckets" in command
+            assert "--validate-first-step-checkpoint" in command
+            assert "--no-compile" in command
+            assert "--no-enable-fp8" in command
+            assert self._flag_value(command, "--bucket-cp") == "2048:2"
+            assert self._flag_value(command, "--bucket-curriculum") == "single-bucket"
+            assert self._flag_value(command, "--checkpoint-interval") == "1"
+            assert self._flag_value(command, "--checkpoint-async-mode") == "disabled"
+            assert self._flag_value(command, "--global-batch-size") == "2"
+            assert (
+                self._flag_value(command, "--smoke-synthetic-examples-per-bucket")
+                == "6"
             )
 
     def test_production_acceptance_commands_use_real_data_and_production_gate(self):
@@ -87,26 +85,19 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
         resume = smoke.resume_launch_command(args)
 
         for command in (fresh, resume):
-            self.assertIn("--production-mode", command)
-            self.assertIn("--production-acceptance-smoke", command)
-            self.assertIn("--enable-wandb", command)
-            self.assertNotIn("--smoke-synthetic-buckets", command)
-            self.assertEqual(
-                self._flag_value(command, "--dataset-path"),
-                str(Path(tmp) / "dataset"),
+            assert "--production-mode" in command
+            assert "--production-acceptance-smoke" in command
+            assert "--enable-wandb" in command
+            assert "--smoke-synthetic-buckets" not in command
+            assert self._flag_value(command, "--dataset-path") == str(
+                Path(tmp) / "dataset"
             )
-            self.assertEqual(self._flag_value(command, "--num-examples"), "8")
-            self.assertEqual(
-                self._flag_value(command, "--max-streamed-examples"),
-                "64",
-            )
-            self.assertEqual(
-                self._flag_value(command, "--long-example-policy"),
-                "skip",
-            )
-            self.assertEqual(self._flag_value(command, "--shuffle-buffer"), "0")
-            self.assertEqual(self._flag_value(command, "--max-length"), "32768")
-            self.assertEqual(self._flag_value(command, "--wandb-mode"), "online")
+            assert self._flag_value(command, "--num-examples") == "8"
+            assert self._flag_value(command, "--max-streamed-examples") == "64"
+            assert self._flag_value(command, "--long-example-policy") == "skip"
+            assert self._flag_value(command, "--shuffle-buffer") == "0"
+            assert self._flag_value(command, "--max-length") == "32768"
+            assert self._flag_value(command, "--wandb-mode") == "online"
 
     def _write_minimal_smoke_outputs(self, out_dir: Path, *, step: int) -> None:
         checkpoint = out_dir / "torchtitan" / "checkpoint" / f"step-{step}"
@@ -167,9 +158,7 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
                     ],
                     "first_step_checkpoint_validation": {"status": "succeeded"},
                     "final_artifact_validation": {"status": "succeeded"},
-                    "summary": {
-                        "final_artifact_validation_status": "succeeded"
-                    },
+                    "summary": {"final_artifact_validation_status": "succeeded"},
                 }
             )
         )
@@ -181,10 +170,10 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
 
             summary = smoke.validate_smoke_outputs(out_dir, max_steps=1)
 
-        self.assertEqual(summary["first_step_validation"]["step"], 1)
-        self.assertEqual(summary["dcp_checkpoint"]["payload_count"], 1)
-        self.assertEqual(summary["final_export"]["shard_count"], 1)
-        self.assertEqual(summary["stage_status"]["attempt_count"], 1)
+        assert summary["first_step_validation"]["step"] == 1
+        assert summary["dcp_checkpoint"]["payload_count"] == 1
+        assert summary["final_export"]["shard_count"] == 1
+        assert summary["stage_status"]["attempt_count"] == 1
 
     def test_validate_smoke_outputs_accepts_production_acceptance_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,14 +237,8 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
                 require_production_acceptance=True,
             )
 
-        self.assertEqual(
-            summary["production_acceptance"]["data_manifest"]["included_count"],
-            8,
-        )
-        self.assertEqual(
-            summary["production_acceptance"]["structured_logs"]["count"],
-            1,
-        )
+        assert summary["production_acceptance"]["data_manifest"]["included_count"] == 8
+        assert summary["production_acceptance"]["structured_logs"]["count"] == 1
 
     def test_validate_smoke_outputs_rejects_missing_first_step_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,12 +246,7 @@ class QwenSweHeroGpuLifecycleSmokeTests(unittest.TestCase):
             self._write_minimal_smoke_outputs(out_dir, step=1)
             (out_dir / "first_step_checkpoint_validation.json").unlink()
 
-            with self.assertRaisesRegex(
-                smoke.SmokeValidationError,
-                "first-step checkpoint validation",
+            with pytest.raises(
+                smoke.SmokeValidationError, match="first-step checkpoint validation"
             ):
                 smoke.validate_smoke_outputs(out_dir, max_steps=1)
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -1,16 +1,14 @@
 import os
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
-import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = REPO_ROOT / "scripts" / "run_qwen_swehero_torchtitan_pod.sh"
+WRAPPER = REPO_ROOT / "scripts" / "run_qwen_swehero_torchtitan_pod.py"
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -18,7 +16,7 @@ def write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-class QwenSweHeroPodWrapperTests(unittest.TestCase):
+class TestQwenSweHeroPodWrapper:
     def make_fake_runtime(self, tmp: Path) -> dict[str, str]:
         fake_bin = tmp / "fake-bin"
         fake_bin.mkdir()
@@ -109,7 +107,7 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
         if remove_venv:
             shutil.rmtree(tmp / "venv")
         return subprocess.run(
-            [str(WRAPPER), *args],
+            [sys.executable, str(WRAPPER), *args],
             cwd=REPO_ROOT,
             env=env,
             text=True,
@@ -129,18 +127,18 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             tmux_log = (tmp / "tmux.log").read_text()
             setup_log_exists = (tmp / "setup.log").exists()
             runtime_log_exists = (tmp / "runtime.log").exists()
 
-        self.assertIn("has-session -t swehero-qwen-smoke", tmux_log)
-        self.assertIn("new-session -d -s swehero-qwen-smoke", tmux_log)
-        self.assertIn("pipe-pane -o -t swehero-qwen-smoke:0.0", tmux_log)
-        self.assertIn("attach-session -t swehero-qwen-smoke", tmux_log)
-        self.assertIn("Started supervised SWE-HERO session", result.stdout)
-        self.assertFalse(setup_log_exists)
-        self.assertFalse(runtime_log_exists)
+        assert "has-session -t swehero-qwen-smoke" in tmux_log
+        assert "new-session -d -s swehero-qwen-smoke" in tmux_log
+        assert "pipe-pane -o -t swehero-qwen-smoke:0.0" in tmux_log
+        assert "attach-session -t swehero-qwen-smoke" in tmux_log
+        assert "Started supervised SWE-HERO session" in result.stdout
+        assert not setup_log_exists
+        assert not runtime_log_exists
 
     def test_existing_supervised_session_reconnects_without_starting_new_job(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -155,18 +153,18 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             tmux_log = (tmp / "tmux.log").read_text()
             setup_log_exists = (tmp / "setup.log").exists()
             runtime_log_exists = (tmp / "runtime.log").exists()
 
-        self.assertIn("has-session -t swehero-qwen-prod", tmux_log)
-        self.assertNotIn("new-session", tmux_log)
-        self.assertIn("attach-session -t swehero-qwen-prod", tmux_log)
-        self.assertIn("Found existing supervised SWE-HERO session", result.stdout)
-        self.assertIn("Attaching now.", result.stdout)
-        self.assertFalse(setup_log_exists)
-        self.assertFalse(runtime_log_exists)
+        assert "has-session -t swehero-qwen-prod" in tmux_log
+        assert "new-session" not in tmux_log
+        assert "attach-session -t swehero-qwen-prod" in tmux_log
+        assert "Found existing supervised SWE-HERO session" in result.stdout
+        assert "Attaching now." in result.stdout
+        assert not setup_log_exists
+        assert not runtime_log_exists
 
     def test_forced_supervisor_without_tty_starts_detached_and_returns(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -177,16 +175,16 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
                 env_overrides={"SWEHERO_POD_SUPERVISOR": "1"},
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             tmux_log = (tmp / "tmux.log").read_text()
             setup_log_exists = (tmp / "setup.log").exists()
             runtime_log_exists = (tmp / "runtime.log").exists()
 
-        self.assertIn("new-session -d -s swehero-detached", tmux_log)
-        self.assertNotIn("attach-session", tmux_log)
-        self.assertIn("No interactive terminal is available", result.stdout)
-        self.assertFalse(setup_log_exists)
-        self.assertFalse(runtime_log_exists)
+        assert "new-session -d -s swehero-detached" in tmux_log
+        assert "attach-session" not in tmux_log
+        assert "No interactive terminal is available" in result.stdout
+        assert not setup_log_exists
+        assert not runtime_log_exists
 
     def test_supervisor_session_name_uses_out_dir_from_argument_file(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -210,11 +208,11 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             tmux_log = (tmp / "tmux.log").read_text()
 
-        self.assertIn("has-session -t swehero-from-arg-file", tmux_log)
-        self.assertIn("new-session -d -s swehero-from-arg-file", tmux_log)
+        assert "has-session -t swehero-from-arg-file" in tmux_log
+        assert "new-session -d -s swehero-from-arg-file" in tmux_log
 
     def test_supervisor_can_start_before_pod_venv_exists(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -229,11 +227,11 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
                 remove_venv=True,
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             tmux_log = (tmp / "tmux.log").read_text()
 
-        self.assertIn("new-session -d -s swehero-fresh-pod", tmux_log)
-        self.assertNotIn("Canonical TorchTitan venv is missing", result.stderr)
+        assert "new-session -d -s swehero-fresh-pod" in tmux_log
+        assert "Canonical TorchTitan venv is missing" not in result.stderr
 
     def test_supervisor_child_runs_existing_launcher_path_directly(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -247,16 +245,16 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             setup_log = (tmp / "setup.log").read_text()
             runtime_log = (tmp / "runtime.log").read_text()
             tmux_log_exists = (tmp / "tmux.log").exists()
 
-        self.assertIn("--venv", setup_log)
-        self.assertNotIn("--verify-only", setup_log)
-        self.assertIn("scripts/qwen_swehero_train.py", runtime_log)
-        self.assertIn("--out-dir /workspace/runs/direct-child --dry-run", runtime_log)
-        self.assertFalse(tmux_log_exists)
+        assert "--venv" in setup_log
+        assert "--verify-only" not in setup_log
+        assert "scripts/qwen_swehero_train.py" in runtime_log
+        assert "--out-dir /workspace/runs/direct-child --dry-run" in runtime_log
+        assert not tmux_log_exists
 
     def test_direct_launch_repairs_missing_venv_before_training_entrypoint(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -268,14 +266,14 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
                 remove_venv=True,
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             setup_log = (tmp / "setup.log").read_text()
             runtime_log = (tmp / "runtime.log").read_text()
 
-        self.assertIn("--venv", setup_log)
-        self.assertNotIn("--verify-only", setup_log)
-        self.assertIn("scripts/qwen_swehero_train.py", runtime_log)
-        self.assertIn("--out-dir /workspace/runs/fresh-direct --dry-run", runtime_log)
+        assert "--venv" in setup_log
+        assert "--verify-only" not in setup_log
+        assert "scripts/qwen_swehero_train.py" in runtime_log
+        assert "--out-dir /workspace/runs/fresh-direct --dry-run" in runtime_log
 
     def test_default_noninteractive_launch_keeps_existing_direct_behavior(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -285,17 +283,13 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
                 ["--out-dir", "/workspace/runs/noninteractive", "--dry-run"],
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             setup_log = (tmp / "setup.log").read_text()
             runtime_log = (tmp / "runtime.log").read_text()
             tmux_log_exists = (tmp / "tmux.log").exists()
 
-        self.assertIn("--venv", setup_log)
-        self.assertNotIn("--verify-only", setup_log)
-        self.assertIn("scripts/qwen_swehero_train.py", runtime_log)
-        self.assertIn("--out-dir /workspace/runs/noninteractive --dry-run", runtime_log)
-        self.assertFalse(tmux_log_exists)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert "--venv" in setup_log
+        assert "--verify-only" not in setup_log
+        assert "scripts/qwen_swehero_train.py" in runtime_log
+        assert "--out-dir /workspace/runs/noninteractive --dry-run" in runtime_log
+        assert not tmux_log_exists

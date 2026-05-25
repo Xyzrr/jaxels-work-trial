@@ -31,7 +31,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -287,8 +286,7 @@ def validate_context_args(args: argparse.Namespace) -> None:
 
     if args.vllm_max_model_len < args.max_input_tokens:
         raise ValueError(
-            "--vllm-max-model-len must be greater than or equal to "
-            "--max-input-tokens"
+            "--vllm-max-model-len must be greater than or equal to --max-input-tokens"
         )
 
     if (
@@ -368,7 +366,7 @@ def litellm_model_name(args: argparse.Namespace) -> str:
 
 
 def model_output_path_component(litellm_model: str) -> str:
-    model_name = litellm_model.split("/")[-1]
+    model_name = litellm_model.rsplit("/", maxsplit=1)[-1]
     return model_name.replace(":", "_").replace("@", "-")
 
 
@@ -410,7 +408,9 @@ def expected_output_jsonl(args: argparse.Namespace) -> Path:
 def eval_paths(args: argparse.Namespace) -> EvalPaths:
     run_dir = args.output_dir
     output_jsonl = expected_output_jsonl(args)
-    converted_jsonl = output_jsonl.with_name(output_jsonl.name.replace(".jsonl", ".swebench.jsonl"))
+    converted_jsonl = output_jsonl.with_name(
+        output_jsonl.name.replace(".jsonl", ".swebench.jsonl")
+    )
     swebench_report_dir = run_dir / "swebench-results"
     return EvalPaths(
         run_dir=run_dir,
@@ -461,8 +461,7 @@ def build_openhands_config(args: argparse.Namespace) -> str:
         config_lines.append(f"max_output_tokens = {args.max_output_tokens}")
     if args.native_tool_calling and not args.omit_native_tool_calling_config:
         config_lines.append(
-            "completion_kwargs = "
-            f"{{ tool_choice = {_toml_string(args.tool_choice)} }}"
+            f"completion_kwargs = {{ tool_choice = {_toml_string(args.tool_choice)} }}"
         )
 
     config_lines.extend(
@@ -712,8 +711,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             ),
             "tool_choice": (
                 args.tool_choice
-                if args.native_tool_calling
-                and not args.omit_native_tool_calling_config
+                if args.native_tool_calling and not args.omit_native_tool_calling_config
                 else None
             ),
             "tool_call_preflight": args.tool_call_preflight,
@@ -725,9 +723,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "paper_context_tokens": PAPER_CONTEXT_LENGTH,
             "max_input_tokens": args.max_input_tokens,
             "vllm_max_model_len": args.vllm_max_model_len,
-            "vllm_rope_scaling": decoded_vllm_rope_scaling(
-                args.vllm_rope_scaling
-            ),
+            "vllm_rope_scaling": decoded_vllm_rope_scaling(args.vllm_rope_scaling),
         },
         "dataset": {
             "name": args.dataset,
@@ -775,13 +771,13 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "set -euo pipefail",
             "",
             "# Generated command record. The supported launcher is:",
-            "# scripts/run_midtraining_pod.sh eval",
+            "# scripts/run_midtraining_pod.py eval",
             "",
             "# 1. Serve the requested model from the GPU pod.",
             "# " + _shell_join(commands.serve_vllm),
             "",
             "# 2. Prepare the legacy OpenHands SWE-bench harness if needed.",
-            f'test -d {shlex.quote(str(effective_openhands_dir(args) / ".git"))} || '
+            f"test -d {shlex.quote(str(effective_openhands_dir(args) / '.git'))} || "
             + _shell_join(commands.prepare_openhands),
             "",
             "# 3. Run one OpenHands pass@1 rollout on SWE-bench Verified.",
@@ -861,12 +857,21 @@ def ensure_openhands_checkout(args: argparse.Namespace) -> None:
                 raise RuntimeError(
                     f"{args.swe_lego_dir} has local changes; refusing to change refs"
                 )
-            run_command(["git", "fetch", "--depth", "1", "origin", args.swe_lego_ref], cwd=args.swe_lego_dir)
-            run_command(["git", "checkout", "--detach", args.swe_lego_ref], cwd=args.swe_lego_dir)
+            run_command(
+                ["git", "fetch", "--depth", "1", "origin", args.swe_lego_ref],
+                cwd=args.swe_lego_dir,
+            )
+            run_command(
+                ["git", "checkout", "--detach", args.swe_lego_ref],
+                cwd=args.swe_lego_dir,
+            )
         else:
             args.swe_lego_dir.parent.mkdir(parents=True, exist_ok=True)
             run_command(build_commands(args, eval_paths(args)).prepare_openhands)
-            run_command(["git", "checkout", "--detach", args.swe_lego_ref], cwd=args.swe_lego_dir)
+            run_command(
+                ["git", "checkout", "--detach", args.swe_lego_ref],
+                cwd=args.swe_lego_dir,
+            )
         openhands_dir = effective_openhands_dir(args)
         swebench_dir = effective_swebench_dir(args)
         if not openhands_dir.is_dir():
@@ -1030,9 +1035,7 @@ def tool_call_preflight_payload(args: argparse.Namespace) -> dict[str, object]:
             },
             {
                 "role": "user",
-                "content": (
-                    f"Call {TOOL_CALL_PREFLIGHT_NAME} with status set to ok."
-                ),
+                "content": (f"Call {TOOL_CALL_PREFLIGHT_NAME} with status set to ok."),
             },
         ],
         "tools": [TOOL_CALL_PREFLIGHT_TOOL],
@@ -1099,7 +1102,9 @@ def check_tool_call_endpoint(args: argparse.Namespace) -> RuntimeCheck:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=args.tool_call_preflight_timeout) as response:
+        with urllib.request.urlopen(
+            request, timeout=args.tool_call_preflight_timeout
+        ) as response:
             response_body = response.read().decode("utf-8", errors="replace")
             if not (200 <= response.status < 300):
                 return RuntimeCheck(
@@ -1199,7 +1204,9 @@ def summarize_agent_tool_use(output_jsonl: Path) -> dict[str, Any]:
     }
 
 
-def run_eval(args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands) -> None:
+def run_eval(
+    args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands
+) -> None:
     if not args.skip_preflight:
         checks = check_runtime(args)
         for check in checks:
@@ -1260,14 +1267,18 @@ def run_eval(args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands)
                     if not grader_pythonpath
                     else f"{swebench_dir}{os.pathsep}{grader_pythonpath}"
                 )
-                run_command(commands.run_eval, cwd=paths.swebench_report_dir, env=grader_env)
+                run_command(
+                    commands.run_eval, cwd=paths.swebench_report_dir, env=grader_env
+                )
                 report_candidates = sorted(paths.swebench_report_dir.glob("*.json"))
                 if report_candidates:
                     report_candidates[-1].replace(paths.expected_report_json)
             else:
                 run_command(commands.run_eval, cwd=openhands_dir, env=env)
             if paths.expected_report_json.exists():
-                print(json.dumps(summarize_report(paths.expected_report_json), indent=2))
+                print(
+                    json.dumps(summarize_report(paths.expected_report_json), indent=2)
+                )
     finally:
         if filter_state is not None:
             restore_swebench_filter_config(*filter_state)
@@ -1279,7 +1290,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Run/prepare OpenHands SWE-bench Verified pass@1 eval for Qwen2.5-Coder-7B.",
         fromfile_prefix_chars="@",
     )
-    parser.add_argument("--eval-stack", choices=EVAL_STACKS, default=EVAL_STACK_OPENHANDS)
+    parser.add_argument(
+        "--eval-stack", choices=EVAL_STACKS, default=EVAL_STACK_OPENHANDS
+    )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument(
         "--served-model-name",
@@ -1421,12 +1434,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
     )
-    parser.add_argument(
-        "--openhands-repo", default=DEFAULT_OPENHANDS_REPO
-    )
-    parser.add_argument(
-        "--openhands-ref", default=DEFAULT_OPENHANDS_REF
-    )
+    parser.add_argument("--openhands-repo", default=DEFAULT_OPENHANDS_REPO)
+    parser.add_argument("--openhands-ref", default=DEFAULT_OPENHANDS_REF)
     parser.add_argument(
         "--openhands-dir",
         type=Path,
@@ -1656,7 +1665,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("--swebench-max-workers must be positive")
     if not args.base_url and not args.dry_run:
         raise ValueError(
-            "--base-url is required; use scripts/run_midtraining_pod.sh eval "
+            "--base-url is required; use scripts/run_midtraining_pod.py eval "
             "to launch the eval on the GPU pod."
         )
     args.output_dir = args.output_dir.resolve()

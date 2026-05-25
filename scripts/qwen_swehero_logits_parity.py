@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
 MODEL_REVISION = "c03e6d358207e414f1eca0bb1891e29f1db0e242"
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
@@ -80,7 +79,9 @@ def default_position_offsets(context: str, max_tokens: int) -> list[int]:
                 max(0, PAPER_CONTEXT_LENGTH - max_tokens),
             ]
         )
-    return sorted(set(offset for offset in offsets if offset < ref.max_position_embeddings))
+    return sorted(
+        set(offset for offset in offsets if offset < ref.max_position_embeddings)
+    )
 
 
 def parse_int_csv(raw: str) -> list[int]:
@@ -239,7 +240,10 @@ def _resolve_device(torch: Any, raw: str) -> Any:
     if raw == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
-        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        if (
+            getattr(torch.backends, "mps", None) is not None
+            and torch.backends.mps.is_available()
+        ):
             return torch.device("mps")
         return torch.device("cpu")
     return torch.device(raw)
@@ -249,7 +253,10 @@ def _clear_device_cache(torch: Any) -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+    if (
+        getattr(torch.backends, "mps", None) is not None
+        and torch.backends.mps.is_available()
+    ):
         torch.mps.empty_cache()
 
 
@@ -266,14 +273,14 @@ def _apply_reference_to_hf_config(config: Any, context: str) -> dict[str, Any]:
         return summary
 
     rope_scaling = dict(ref.rope_scaling or {})
-    setattr(config, "max_position_embeddings", ref.max_position_embeddings)
+    config.max_position_embeddings = ref.max_position_embeddings
     if hasattr(config, "sliding_window"):
-        setattr(config, "sliding_window", ref.max_position_embeddings)
+        config.sliding_window = ref.max_position_embeddings
 
     # Transformers 4.x accepts rope_scaling; newer configs may expose
     # rope_parameters. Set both when possible so the intended HF reference is
     # unambiguous across runtime versions.
-    setattr(config, "rope_scaling", rope_scaling)
+    config.rope_scaling = rope_scaling
     rope_parameters = {
         "rope_type": rope_scaling["type"],
         "factor": rope_scaling["factor"],
@@ -283,7 +290,7 @@ def _apply_reference_to_hf_config(config: Any, context: str) -> dict[str, Any]:
         ],
     }
     if hasattr(config, "rope_parameters"):
-        setattr(config, "rope_parameters", rope_parameters)
+        config.rope_parameters = rope_parameters
 
     summary["max_position_embeddings"] = ref.max_position_embeddings
     summary["rope_scaling"] = rope_scaling

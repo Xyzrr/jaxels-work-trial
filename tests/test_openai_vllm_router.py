@@ -1,7 +1,6 @@
 import json
 import threading
 import time
-import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -58,8 +57,8 @@ def start_server(handler_cls):
     return server
 
 
-class OpenAIVLLMRouterTests(unittest.TestCase):
-    def tearDown(self):
+class TestOpenAIVLLMRouter:
+    def teardown_method(self):
         for server in getattr(self, "servers", []):
             server.shutdown()
             server.server_close()
@@ -116,12 +115,11 @@ class OpenAIVLLMRouterTests(unittest.TestCase):
 
         responses = [self._post_chat(router_server.server_port)[0] for _ in range(4)]
 
-        self.assertEqual(
-            [response["choices"][0]["message"]["content"] for response in responses],
-            ["backend-0", "backend-1", "backend-0", "backend-1"],
-        )
-        self.assertEqual(len(handler0.seen_requests), 2)
-        self.assertEqual(len(handler1.seen_requests), 2)
+        assert [
+            response["choices"][0]["message"]["content"] for response in responses
+        ] == ["backend-0", "backend-1", "backend-0", "backend-1"]
+        assert len(handler0.seen_requests) == 2
+        assert len(handler1.seen_requests) == 2
 
     def test_per_backend_concurrency_spills_to_next_backend(self):
         self.servers = []
@@ -144,9 +142,5 @@ class OpenAIVLLMRouterTests(unittest.TestCase):
         for thread in threads:
             thread.join()
 
-        self.assertEqual(len(handler0.seen_requests), 1)
-        self.assertEqual(len(handler1.seen_requests), 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert len(handler0.seen_requests) == 1
+        assert len(handler1.seen_requests) == 1

@@ -8,9 +8,9 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Mapping, Sequence
-
+from typing import Any
 
 DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-lifecycle-smoke")
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
@@ -63,7 +63,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--launcher",
         type=Path,
-        default=_repo_root() / "scripts" / "run_qwen_swehero_torchtitan_pod.sh",
+        default=_repo_root() / "scripts" / "run_qwen_swehero_torchtitan_pod.py",
         help="Launcher wrapper to execute. Defaults to the canonical pod wrapper.",
     )
     parser.add_argument(
@@ -375,7 +375,9 @@ def _validate_dcp_checkpoint(out_dir: Path, step: int) -> dict[str, Any]:
 def _validate_final_export(out_dir: Path, step: int) -> dict[str, Any]:
     export = out_dir / "torchtitan" / "final_export" / f"step-{step}"
     _require(export.is_dir(), f"Missing final export directory: {export}")
-    index = _read_json_object(export / "model.safetensors.index.json", "final export index")
+    index = _read_json_object(
+        export / "model.safetensors.index.json", "final export index"
+    )
     weight_map = index.get("weight_map")
     _require(
         isinstance(weight_map, dict) and bool(weight_map),
@@ -454,7 +456,9 @@ def _validate_production_acceptance_metadata(out_dir: Path) -> dict[str, Any]:
     run_spec = _read_json_object(out_dir / "run_spec.json", "run spec")
     args = run_spec.get("args")
     _require(isinstance(args, Mapping), "Run spec has no args object")
-    _require(args.get("production_mode") is True, "Run spec did not record production mode")
+    _require(
+        args.get("production_mode") is True, "Run spec did not record production mode"
+    )
     _require(
         args.get("production_acceptance_smoke") is True,
         "Run spec did not record production acceptance smoke mode",
@@ -478,7 +482,9 @@ def _validate_production_acceptance_metadata(out_dir: Path) -> dict[str, Any]:
         "Data manifest must record real dataset materialization",
     )
     dataset = provenance.get("dataset")
-    dataset_artifact = dataset.get("dataset_artifact") if isinstance(dataset, Mapping) else None
+    dataset_artifact = (
+        dataset.get("dataset_artifact") if isinstance(dataset, Mapping) else None
+    )
     _require(
         isinstance(dataset_artifact, Mapping)
         and dataset_artifact.get("synthetic_smoke") is not True,
@@ -486,9 +492,7 @@ def _validate_production_acceptance_metadata(out_dir: Path) -> dict[str, Any]:
     )
     included = provenance.get("included")
     included_count = (
-        int(included.get("count") or 0)
-        if isinstance(included, Mapping)
-        else 0
+        int(included.get("count") or 0) if isinstance(included, Mapping) else 0
     )
     _require(included_count > 0, "Data manifest did not include real records")
 
@@ -503,7 +507,9 @@ def _validate_production_acceptance_metadata(out_dir: Path) -> dict[str, Any]:
     )
     _require(bool(wandb_identity.get("run_id")), "W&B identity has no run id")
 
-    structured_logs = sorted((out_dir / "torchtitan" / "structured_logs").glob("*.jsonl"))
+    structured_logs = sorted(
+        (out_dir / "torchtitan" / "structured_logs").glob("*.jsonl")
+    )
     _require(bool(structured_logs), "Missing TorchTitan structured JSONL logs")
     for log in structured_logs:
         _require_nonempty_file(log, "TorchTitan structured JSONL log")
@@ -613,6 +619,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (SmokeValidationError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+    except (
+        SmokeValidationError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         print(f"Lifecycle smoke failed: {exc}", file=sys.stderr)
         raise

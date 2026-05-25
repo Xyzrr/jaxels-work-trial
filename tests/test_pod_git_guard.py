@@ -1,11 +1,10 @@
 import subprocess
+import sys
 import tempfile
-import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-GUARD = REPO_ROOT / "scripts" / "pod_git_guard.sh"
+GUARD = REPO_ROOT / "scripts" / "pod_git_guard.py"
 
 
 def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -23,7 +22,7 @@ def commit_all(cwd: Path, message: str) -> None:
     git(cwd, "commit", "-m", message)
 
 
-class PodGitGuardTests(unittest.TestCase):
+class TestPodGitGuard:
     def make_origin(self, tmp: Path) -> tuple[Path, Path]:
         source = tmp / "source"
         source.mkdir()
@@ -50,20 +49,16 @@ class PodGitGuardTests(unittest.TestCase):
         git(pod, "config", "user.email", "pod-guard@example.invalid")
         return pod
 
-    def run_guard(self, pod: Path, expected_branch: str) -> subprocess.CompletedProcess[str]:
+    def run_guard(
+        self, pod: Path, expected_branch: str
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
-                "bash",
-                "-c",
-                (
-                    "set -euo pipefail; "
-                    'source "$1"; '
-                    'swehero_require_pod_git_checkout "$2" "$3" "test pod"'
-                ),
-                "bash",
+                sys.executable,
                 str(GUARD),
                 str(pod),
                 expected_branch,
+                "test pod",
             ],
             cwd=REPO_ROOT,
             text=True,
@@ -83,7 +78,7 @@ class PodGitGuardTests(unittest.TestCase):
 
             result = self.run_guard(pod, "axel/hero")
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             branch = git(pod, "branch", "--show-current").stdout.strip()
             head = git(pod, "rev-parse", "HEAD").stdout.strip()
             remote_head = git(
@@ -91,9 +86,9 @@ class PodGitGuardTests(unittest.TestCase):
             ).stdout.strip()
             status = git(pod, "status", "--porcelain=v1").stdout.strip()
 
-        self.assertEqual(branch, "axel/hero")
-        self.assertEqual(head, remote_head)
-        self.assertEqual(status, "")
+        assert branch == "axel/hero"
+        assert head == remote_head
+        assert status == ""
 
     def test_guard_refuses_dirty_pod_checkout_before_switching_branch(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -105,10 +100,10 @@ class PodGitGuardTests(unittest.TestCase):
             result = self.run_guard(pod, "axel/hero")
             branch = git(pod, "branch", "--show-current").stdout.strip()
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("local git changes", result.stderr)
-        self.assertIn("?? local.txt", result.stderr)
-        self.assertEqual(branch, "main")
+        assert result.returncode != 0
+        assert "local git changes" in result.stderr
+        assert "?? local.txt" in result.stderr
+        assert branch == "main"
 
     def test_guard_refuses_clean_checkout_with_unpushed_local_commit(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -120,11 +115,8 @@ class PodGitGuardTests(unittest.TestCase):
 
             result = self.run_guard(pod, "axel/hero")
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "commits on axel/hero that are not on origin/axel/hero",
-            result.stderr,
-        )
+        assert result.returncode != 0
+        assert "commits on axel/hero that are not on origin/axel/hero" in result.stderr
 
     def test_guard_does_not_switch_to_unpushed_expected_branch(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -138,12 +130,9 @@ class PodGitGuardTests(unittest.TestCase):
             result = self.run_guard(pod, "axel/hero")
             branch = git(pod, "branch", "--show-current").stdout.strip()
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "commits on axel/hero that are not on origin/axel/hero",
-            result.stderr,
-        )
-        self.assertEqual(branch, "main")
+        assert result.returncode != 0
+        assert "commits on axel/hero that are not on origin/axel/hero" in result.stderr
+        assert branch == "main"
 
     def test_guard_requires_expected_branch_from_local_worktree(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -153,9 +142,5 @@ class PodGitGuardTests(unittest.TestCase):
 
             result = self.run_guard(pod, "")
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("SWEHERO_POD_GIT_BRANCH is required", result.stderr)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert result.returncode != 0
+        assert "SWEHERO_POD_GIT_BRANCH is required" in result.stderr

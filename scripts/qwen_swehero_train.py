@@ -44,13 +44,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from scripts import prepare_swehero_historical_one_rollout as one_rollout
 from scripts import qwen_swehero_smoke as smoke
-
 
 IGNORE_INDEX = -100
 
@@ -563,9 +561,7 @@ def parse_bucket_list(raw: str | Iterable[int]) -> tuple[int, ...]:
             try:
                 value = int(part)
             except ValueError as exc:
-                raise ValueError(
-                    f"invalid bucket size in --buckets: {part!r}"
-                ) from exc
+                raise ValueError(f"invalid bucket size in --buckets: {part!r}") from exc
             if value in seen:
                 raise ValueError(f"duplicate bucket size in --buckets: {value}")
             seen.add(value)
@@ -597,9 +593,7 @@ def parse_bucket_cp_map(raw: str | Mapping[int, int]) -> dict[int, int]:
             if not part:
                 continue
             if ":" not in part:
-                raise ValueError(
-                    "bucket CP map entries must look like '<bucket>:<cp>'"
-                )
+                raise ValueError("bucket CP map entries must look like '<bucket>:<cp>'")
             bucket, cp = part.split(":", 1)
             try:
                 parsed_bucket = int(bucket.strip())
@@ -609,9 +603,7 @@ def parse_bucket_cp_map(raw: str | Mapping[int, int]) -> dict[int, int]:
                     f"invalid bucket CP map entry in --bucket-cp: {part!r}"
                 ) from exc
             if parsed_bucket in parsed:
-                raise ValueError(
-                    f"duplicate bucket in --bucket-cp: {parsed_bucket}"
-                )
+                raise ValueError(f"duplicate bucket in --bucket-cp: {parsed_bucket}")
             parsed[parsed_bucket] = parsed_cp
     if not parsed:
         raise ValueError("at least one bucket:cp entry is required")
@@ -1240,9 +1232,7 @@ def validate_launch_inputs(
     )
     for name, value, choices in choice_fields:
         if value not in choices:
-            errors.append(
-                f"{name} must be one of {', '.join(choices)}; got {value!r}"
-            )
+            errors.append(f"{name} must be one of {', '.join(choices)}; got {value!r}")
 
     try:
         cuda_device_max_connections = int(args.cuda_device_max_connections)
@@ -1272,8 +1262,7 @@ def validate_launch_inputs(
     extra_cp_buckets = sorted(set(bucket_cp) - set(buckets))
     if extra_cp_buckets:
         errors.append(
-            "--bucket-cp contains buckets not present in --buckets: "
-            f"{extra_cp_buckets}"
+            f"--bucket-cp contains buckets not present in --buckets: {extra_cp_buckets}"
         )
     if args.bucket_curriculum not in BUCKET_CURRICULUM_CHOICES:
         errors.append(
@@ -1397,9 +1386,7 @@ def ordered_buckets_for_curriculum(
     bucket_curriculum: str = DEFAULT_BUCKET_CURRICULUM,
 ) -> tuple[int, ...]:
     non_empty_buckets = [
-        bucket
-        for bucket, count in bucket_counts.items()
-        if int(count) > 0
+        bucket for bucket, count in bucket_counts.items() if int(count) > 0
     ]
     if bucket_curriculum == "short-to-long":
         return tuple(sorted(non_empty_buckets))
@@ -1581,7 +1568,7 @@ class OutDirLaunchLock:
         self.path = _launch_lock_path(args.out_dir)
         self._acquired = False
 
-    def __enter__(self) -> "OutDirLaunchLock":
+    def __enter__(self) -> OutDirLaunchLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = _launch_lock_payload(self.args)
         payload_text = _canonical_json_text(payload)
@@ -1669,9 +1656,10 @@ def _legacy_model_export_steps(checkpoint_dir: Path) -> list[int]:
         step = _checkpoint_step(path)
         if step is None:
             continue
-        if not _has_dcp_checkpoint_metadata(path) and (
-            path / "model.safetensors.index.json"
-        ).is_file():
+        if (
+            not _has_dcp_checkpoint_metadata(path)
+            and (path / "model.safetensors.index.json").is_file()
+        ):
             steps.append(step)
     return sorted(steps)
 
@@ -1691,9 +1679,7 @@ def validate_resume_request(args: argparse.Namespace) -> ResumeCheckpointState |
     resumable_steps = _checkpoint_steps(checkpoint_dir)
     model_export_steps = _model_export_steps(final_export_dir)
     legacy_export_steps = _legacy_model_export_steps(checkpoint_dir)
-    all_steps = sorted(
-        {*resumable_steps, *model_export_steps, *legacy_export_steps}
-    )
+    all_steps = sorted({*resumable_steps, *model_export_steps, *legacy_export_steps})
     if not all_steps:
         if not checkpoint_dir.is_dir() and not final_export_dir.is_dir():
             raise FileNotFoundError(
@@ -1822,20 +1808,13 @@ def build_resume_contract(
                     **asdict(stage),
                     "bucket_file": str(stage.bucket_file),
                 },
-                "env": {
-                    key: env[key]
-                    for key in RESUME_STAGE_ENV_KEYS
-                    if key in env
-                },
+                "env": {key: env[key] for key in RESUME_STAGE_ENV_KEYS if key in env},
             }
         )
 
     return {
         "schema_version": RESUME_CONTRACT_SCHEMA_VERSION,
-        "args": {
-            field: _jsonable(getattr(args, field))
-            for field in RESUME_ARG_FIELDS
-        },
+        "args": {field: _jsonable(getattr(args, field)) for field in RESUME_ARG_FIELDS},
         "workspace": workspace_root_metadata(args),
         "git": git_state_for_workspace(_configured_workspace_root(args)),
         "manifest": _resume_manifest_contract(manifest),
@@ -1971,9 +1950,7 @@ def stages_to_run_for_resume(
         return ()
     progress_step = resume_state.latest_resumable_step or 0
     return tuple(
-        stage
-        for stage in plan.stages
-        if stage.cumulative_steps > progress_step
+        stage for stage in plan.stages if stage.cumulative_steps > progress_step
     )
 
 
@@ -2011,7 +1988,9 @@ def parse_args(
     env_file_default: str | None = None,
 ) -> argparse.Namespace:
     argv = _argv_with_default_preset(argv)
-    env_file_default = DEFAULT_ENV_FILE if env_file_default is None else env_file_default
+    env_file_default = (
+        DEFAULT_ENV_FILE if env_file_default is None else env_file_default
+    )
     parser = LaunchArgumentParser(
         description="Materialize bucketed SWE-HERO training data and launch TorchTitan.",
         fromfile_prefix_chars="@",
@@ -2158,9 +2137,7 @@ def parse_args(
         "--smoke-synthetic-examples-per-bucket",
         type=int,
         default=1,
-        help=(
-            "Synthetic records per bucket when --smoke-synthetic-buckets is set."
-        ),
+        help=("Synthetic records per bucket when --smoke-synthetic-buckets is set."),
     )
     parser.add_argument(
         "--buckets",
@@ -2937,11 +2914,7 @@ def _asset_file_inventory(hf_assets_path: Path) -> list[dict[str, Any]]:
             f"Hugging Face asset directory does not exist: {hf_assets_path}"
         )
 
-    files = [
-        path
-        for path in hf_assets_path.rglob("*")
-        if path.is_file()
-    ]
+    files = [path for path in hf_assets_path.rglob("*") if path.is_file()]
     inventory = []
     files = sorted(
         files,
@@ -2984,11 +2957,7 @@ def _core_config_summary(config: Mapping[str, Any]) -> dict[str, Any]:
         "use_sliding_window",
         "vocab_size",
     )
-    return {
-        key: config[key]
-        for key in keys
-        if key in config
-    }
+    return {key: config[key] for key in keys if key in config}
 
 
 def _safetensors_index_summary(
@@ -3054,7 +3023,9 @@ def _model_asset_provenance(
         "total_bytes": sum(int(record["bytes"]) for record in inventory),
         "files": inventory,
         "config": {
-            "path": "config.json" if (hf_assets_path / "config.json").exists() else None,
+            "path": "config.json"
+            if (hf_assets_path / "config.json").exists()
+            else None,
             "sha256": _hash_file(hf_assets_path / "config.json"),
             "summary": _core_config_summary(config),
             "json_error": config.get("json_error"),
@@ -3091,8 +3062,12 @@ def _tokenizer_metadata(tokenizer: Any, hf_assets_path: Path) -> dict[str, Any]:
         ).hexdigest()
         if isinstance(chat_template, str)
         else None,
-        "bos_id": getattr(tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None)),
-        "eos_id": getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None)),
+        "bos_id": getattr(
+            tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None)
+        ),
+        "eos_id": getattr(
+            tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None)
+        ),
         "pad_id": infer_pad_token_id(tokenizer, hf_assets_path),
         "trace_serializer": "Qwen2.5 ChatML over OpenHands messages; assistant content/tool_calls trainable; tool observations masked",
     }
@@ -3125,11 +3100,7 @@ def _runtime_lockfile_metadata(
 ) -> list[dict[str, Any]]:
     repo_root = repo_root or Path(__file__).resolve().parents[1]
     python_path = Path(python_executable or sys.executable).expanduser()
-    venv_root = (
-        python_path.parent.parent
-        if python_path.parent.name == "bin"
-        else None
-    )
+    venv_root = python_path.parent.parent if python_path.parent.name == "bin" else None
     lockfiles: list[tuple[str, Path]] = [
         ("pod_lock", repo_root / "requirements" / "torchtitan-pod-cu128.lock"),
         ("pod_requirements", repo_root / "requirements" / "torchtitan-pod-cu128.txt"),
@@ -3145,10 +3116,7 @@ def _runtime_lockfile_metadata(
                 venv_root / "torchtitan-swehero-runtime.json",
             )
         )
-    return [
-        {"kind": kind, **_file_metadata(path)}
-        for kind, path in lockfiles
-    ]
+    return [{"kind": kind, **_file_metadata(path)} for kind, path in lockfiles]
 
 
 def _runtime_environment_metadata() -> dict[str, str]:
@@ -3293,8 +3261,7 @@ def paper_alignment(args: argparse.Namespace) -> dict[str, Any]:
                 "gates are enforced; bounded subset and step-cap deviations "
                 "are explicitly recorded"
                 if args.production_mode and args.production_acceptance_smoke
-                else
-                "enabled: smoke, subset, step-capped, and shortened-context "
+                else "enabled: smoke, subset, step-capped, and shortened-context "
                 "settings are rejected before launch"
                 if args.production_mode
                 else "disabled: smoke/prototype settings are allowed but recorded"
@@ -3360,7 +3327,7 @@ def _qwen_tool_call_text(tool_call: object) -> str:
         arguments = {}
     return (
         "\n<tool_call>\n"
-        + '{"name": '
+        '{"name": '
         + json.dumps(name, ensure_ascii=False)
         + ', "arguments": '
         + json.dumps(arguments, ensure_ascii=False)
@@ -3527,9 +3494,7 @@ def encode_swehero_example(
         token_ids.append(int(bos_id))
         labels.append(IGNORE_INDEX)
 
-    segments = qwen_openhands_segments(
-        example, include_model_patch=include_model_patch
-    )
+    segments = qwen_openhands_segments(example, include_model_patch=include_model_patch)
     tokenized_segments = _tokenize_texts(tokenizer, (text for text, _ in segments))
     if len(tokenized_segments) != len(segments):
         raise RuntimeError(
@@ -3543,7 +3508,9 @@ def encode_swehero_example(
     eos_id = getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None))
     if eos_id is not None:
         token_ids.append(int(eos_id))
-        labels.append(int(eos_id) if labels and labels[-1] != IGNORE_INDEX else IGNORE_INDEX)
+        labels.append(
+            int(eos_id) if labels and labels[-1] != IGNORE_INDEX else IGNORE_INDEX
+        )
 
     if len(token_ids) > max_length + 1:
         raise LongExampleError(token_count=len(token_ids), max_length=max_length)
@@ -3710,7 +3677,9 @@ def _build_data_provenance(
                 "trainable_tokens": _numeric_summary(bucket_trainable_tokens[bucket]),
                 "length_histogram_rounded_to_1024": {
                     str(length): count
-                    for length, count in sorted(bucket_length_histograms[bucket].items())
+                    for length, count in sorted(
+                        bucket_length_histograms[bucket].items()
+                    )
                 },
             }
             for bucket in buckets
@@ -3782,9 +3751,7 @@ def _validate_data_provenance(
     }
     for key, expected in expected_dataset.items():
         if dataset.get(key) != expected:
-            raise RuntimeError(
-                f"data_provenance.dataset.{key} does not match manifest"
-            )
+            raise RuntimeError(f"data_provenance.dataset.{key} does not match manifest")
 
     streamed_source_ids = _validate_id_list_record(
         data_provenance.get("streamed"),
@@ -3822,8 +3789,7 @@ def _validate_data_provenance(
             )
         )
     if skipped_counts != {
-        str(reason): int(count)
-        for reason, count in manifest.get("skipped", {}).items()
+        str(reason): int(count) for reason, count in manifest.get("skipped", {}).items()
     }:
         raise RuntimeError(
             "data_provenance skipped counts do not match manifest skipped counts: "
@@ -3852,7 +3818,9 @@ def _validate_data_provenance(
             raise RuntimeError(
                 f"data_provenance bucket {bucket} file does not match manifest"
             )
-        if int(bucket_record.get("record_count", -1)) != int(bucket_counts[str(bucket)]):
+        if int(bucket_record.get("record_count", -1)) != int(
+            bucket_counts[str(bucket)]
+        ):
             raise RuntimeError(
                 f"data_provenance bucket {bucket} count does not match manifest"
             )
@@ -3930,9 +3898,7 @@ def validate_materialized_data_manifest(
         r"[0-9a-f]{40}",
         model_revision,
     ):
-        raise RuntimeError(
-            "Materialized data manifest is missing exact model_revision"
-        )
+        raise RuntimeError("Materialized data manifest is missing exact model_revision")
     if model_assets.get("model_revision") != model_revision:
         raise RuntimeError(
             "model_assets.model_revision does not match manifest.model_revision: "
@@ -4054,7 +4020,9 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def _promote_materialized_data_dir(staging_data_dir: Path, final_data_dir: Path) -> None:
+def _promote_materialized_data_dir(
+    staging_data_dir: Path, final_data_dir: Path
+) -> None:
     backup_data_dir: Path | None = None
     if final_data_dir.exists():
         backup_data_dir = final_data_dir.with_name(
@@ -4155,9 +4123,7 @@ def materialize_synthetic_smoke_buckets(args: argparse.Namespace) -> dict[str, A
     pad_token_id = infer_pad_token_id(tokenizer, args.hf_assets_path)
     tokenizer_metadata = _tokenizer_metadata(tokenizer, args.hf_assets_path)
 
-    bucket_paths = {
-        bucket: data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets
-    }
+    bucket_paths = {bucket: data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets}
     staging_bucket_paths = {
         bucket: staging_data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets
     }
@@ -4291,15 +4257,11 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer = HuggingFaceTokenizer(tokenizer_path=str(args.hf_assets_path))
     pad_token_id = infer_pad_token_id(tokenizer, args.hf_assets_path)
 
-    bucket_paths = {
-        bucket: data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets
-    }
+    bucket_paths = {bucket: data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets}
     staging_bucket_paths = {
         bucket: staging_data_dir / f"bucket_{bucket}.jsonl" for bucket in buckets
     }
-    handles = {
-        bucket: path.open("w") for bucket, path in staging_bucket_paths.items()
-    }
+    handles = {bucket: path.open("w") for bucket, path in staging_bucket_paths.items()}
     bucket_counts: Counter[int] = Counter()
     skipped: Counter[str] = Counter()
     streamed_source_ids: list[str] = []
@@ -4532,7 +4494,7 @@ def _resolve_executable(command: str) -> str | None:
     if not command:
         return None
     path = Path(command).expanduser()
-    if path.parent != Path(".") or path.is_absolute():
+    if path.parent != Path() or path.is_absolute():
         return str(path) if path.is_file() and os.access(path, os.X_OK) else None
     return shutil.which(command)
 
@@ -5022,8 +4984,8 @@ def validate_torchtitan_runtime(
         raise RuntimeError(
             "The current Python environment does not satisfy the vendored "
             "TorchTitan dependency contract. Create the canonical pod venv with "
-            "scripts/setup_torchtitan_pod_venv.sh and launch through "
-            "scripts/run_qwen_swehero_torchtitan_pod.sh."
+            "scripts/setup_torchtitan_pod_venv.py and launch through "
+            "scripts/run_qwen_swehero_torchtitan_pod.py."
         ) from exc
 
     try:
@@ -5035,7 +4997,7 @@ def validate_torchtitan_runtime(
         raise RuntimeError(
             "TorchAO float8 support is missing from the current Python "
             "environment. Rebuild the canonical pod venv with "
-            "scripts/setup_torchtitan_pod_venv.sh."
+            "scripts/setup_torchtitan_pod_venv.py."
         ) from exc
 
     try:
@@ -5192,8 +5154,7 @@ def validate_launch_preflight(
         )
 
     probe = (
-        args.out_dir
-        / f".launch-preflight-write-test-{os.getpid()}-{time.time_ns()}"
+        args.out_dir / f".launch-preflight-write-test-{os.getpid()}-{time.time_ns()}"
     )
     try:
         probe.write_text("ok\n")
@@ -5508,9 +5469,7 @@ def validate_final_artifacts(
         )
 
     dcp_checkpoints = [
-        _validate_dcp_checkpoint_step(
-            _checkpoint_dir(args.out_dir) / f"step-{step}"
-        )
+        _validate_dcp_checkpoint_step(_checkpoint_dir(args.out_dir) / f"step-{step}")
         for step in checkpoint_steps
     ]
 
@@ -5860,9 +5819,7 @@ def build_stage_env(
             if args.enable_memory_snapshot
             else "0",
             "SWEHERO_MEMORY_SNAPSHOT_FOLDER": args.memory_snapshot_folder,
-            "SWEHERO_LOAD_DATALOADER_STATE": "1"
-            if load_dataloader_state
-            else "0",
+            "SWEHERO_LOAD_DATALOADER_STATE": "1" if load_dataloader_state else "0",
             "SWEHERO_ENABLE_WANDB": "1" if args.enable_wandb else "0",
         }
     )
@@ -5871,9 +5828,7 @@ def build_stage_env(
     if args.profiler_skip_first is not None:
         env["SWEHERO_PROFILER_SKIP_FIRST"] = str(args.profiler_skip_first)
     if args.profiler_skip_first_wait is not None:
-        env["SWEHERO_PROFILER_SKIP_FIRST_WAIT"] = str(
-            args.profiler_skip_first_wait
-        )
+        env["SWEHERO_PROFILER_SKIP_FIRST_WAIT"] = str(args.profiler_skip_first_wait)
     env.update(_wandb_env_overrides(args))
     return env
 
@@ -5956,11 +5911,7 @@ def _stage_env_overrides(
         pad_token_id=pad_token_id,
         load_dataloader_state=load_dataloader_state,
     )
-    return {
-        key: env[key]
-        for key in LAUNCH_STAGE_ENV_KEYS
-        if key in env
-    }
+    return {key: env[key] for key in LAUNCH_STAGE_ENV_KEYS if key in env}
 
 
 def _stage_launch_record(
@@ -5997,8 +5948,7 @@ def build_run_spec(
         "recipe": "qwen2.5-coder-7b-direct-to-hero-torchtitan",
         "paper_alignment": paper_alignment(args),
         "args": {
-            field: _jsonable(getattr(args, field))
-            for field in RUN_SPEC_ARG_FIELDS
+            field: _jsonable(getattr(args, field)) for field in RUN_SPEC_ARG_FIELDS
         },
         "workspace": workspace_root_metadata(args),
         "git": git_state_for_workspace(_configured_workspace_root(args)),
@@ -6048,9 +5998,7 @@ def write_or_validate_run_spec(
 
     if spec_path.exists():
         if not sha_path.exists():
-            raise RuntimeError(
-                f"Immutable run spec checksum is missing: {sha_path}"
-            )
+            raise RuntimeError(f"Immutable run spec checksum is missing: {sha_path}")
         existing_text = spec_path.read_text()
         expected_sha = sha_path.read_text().strip()
         actual_sha = _sha256_text(existing_text)
@@ -6077,9 +6025,7 @@ def write_or_validate_run_spec(
             "prove they match the original launch."
         )
     if sha_path.exists():
-        raise RuntimeError(
-            f"Run spec checksum exists without {spec_path}: {sha_path}"
-        )
+        raise RuntimeError(f"Run spec checksum exists without {spec_path}: {sha_path}")
 
     spec_text = _canonical_json_text(actual)
     _write_text_atomic(spec_path, spec_text)
@@ -6226,9 +6172,7 @@ def _stage_status_counts(stages: Iterable[Mapping[str, Any]]) -> dict[str, int]:
 
 def _stage_status_summary(document: Mapping[str, Any]) -> dict[str, Any]:
     stages = [
-        stage
-        for stage in document.get("stages", [])
-        if isinstance(stage, Mapping)
+        stage for stage in document.get("stages", []) if isinstance(stage, Mapping)
     ]
     counts = _stage_status_counts(stages)
     completed_statuses = {"succeeded", "completed_before_resume"}
@@ -6348,10 +6292,7 @@ def _build_stage_status_document(
     stages_to_run: Iterable[BucketStage],
     dataloader_resume_flags: Mapping[int, bool],
 ) -> dict[str, Any]:
-    stages_to_run_by_step = {
-        stage.cumulative_steps
-        for stage in stages_to_run
-    }
+    stages_to_run_by_step = {stage.cumulative_steps for stage in stages_to_run}
     stage_records = []
     for index, stage in enumerate(plan.stages):
         stage_id = _stage_status_id(index, stage)
@@ -6830,11 +6771,7 @@ def _record_stage_finished(
 
     now = time.time()
     started_at = attempt.get("started_at_unix")
-    duration = (
-        now - float(started_at)
-        if isinstance(started_at, (int, float))
-        else None
-    )
+    duration = now - float(started_at) if isinstance(started_at, (int, float)) else None
     status = "failed" if failure is not None else "succeeded"
     attempt["status"] = status
     attempt["finished_at_unix"] = now
@@ -6976,11 +6913,7 @@ def _record_final_validation_finished(
     record = document["final_artifact_validation"]
     now = time.time()
     started_at = record.get("started_at_unix")
-    duration = (
-        now - float(started_at)
-        if isinstance(started_at, (int, float))
-        else None
-    )
+    duration = now - float(started_at) if isinstance(started_at, (int, float)) else None
     report_path = _final_artifact_validation_path(args.out_dir)
     record.update(
         {
@@ -7071,9 +7004,7 @@ def _post_training_eval_status_record(
     failure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     duration = (
-        finished_at_unix - started_at_unix
-        if finished_at_unix is not None
-        else None
+        finished_at_unix - started_at_unix if finished_at_unix is not None else None
     )
     env_overrides = _post_training_eval_env(args, plan, final_validation)
     return {
@@ -7356,7 +7287,13 @@ def _run_launch(
             raise
         print(json.dumps({"launch_preflight": launch_preflight}, indent=2))
 
-    print(json.dumps({"bucket_plan": [asdict(stage) for stage in plan.stages]}, default=str, indent=2))
+    print(
+        json.dumps(
+            {"bucket_plan": [asdict(stage) for stage in plan.stages]},
+            default=str,
+            indent=2,
+        )
+    )
     if args.prepare_data_only or args.dry_run:
         print(f"Wrote launcher plan to {args.out_dir / 'launcher_plan.json'}")
         return
@@ -7383,7 +7320,9 @@ def _run_launch(
             eval_status = run_post_training_eval(args, plan, final_validation)
             if eval_status is not None:
                 print(json.dumps({"post_training_eval": eval_status}, indent=2))
-            print("No bucket stages remain; training is already complete for this plan.")
+            print(
+                "No bucket stages remain; training is already complete for this plan."
+            )
             return
     for stage in stages_to_run:
         run_stage_with_status(

@@ -1,15 +1,15 @@
 import os
+import py_compile
 import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
-import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "scripts" / "run_midtraining_pod.sh"
-COMMON = REPO_ROOT / "scripts" / "pod_startup_common.sh"
+SCRIPT = REPO_ROOT / "scripts" / "run_midtraining_pod.py"
+COMMON = REPO_ROOT / "scripts" / "pod_startup_common.py"
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -17,10 +17,10 @@ def write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-class RunMidtrainingPodLauncherTests(unittest.TestCase):
-    def test_shell_syntax_is_valid(self):
-        subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
-        subprocess.run(["bash", "-n", str(COMMON)], check=True)
+class TestRunMidtrainingPodLauncher:
+    def test_python_syntax_is_valid(self):
+        py_compile.compile(str(SCRIPT), doraise=True)
+        py_compile.compile(str(COMMON), doraise=True)
 
     def test_eval_workload_pushes_branch_and_execs_pod_wrapper(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -78,6 +78,7 @@ class RunMidtrainingPodLauncherTests(unittest.TestCase):
             }
             result = subprocess.run(
                 [
+                    sys.executable,
                     str(SCRIPT),
                     "--kubeconfig",
                     str(kubeconfig),
@@ -99,29 +100,29 @@ class RunMidtrainingPodLauncherTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             git_invocation = git_log.read_text()
             kubectl_invocation = shlex.split(kubectl_log.read_text())
 
-        self.assertEqual(git_invocation, "git push -u origin axel/test\n")
-        self.assertIn("--kubeconfig", kubectl_invocation)
-        self.assertIn(str(kubeconfig), kubectl_invocation)
-        self.assertIn("exec", kubectl_invocation)
-        self.assertIn("-n", kubectl_invocation)
-        self.assertIn("training", kubectl_invocation)
-        self.assertIn("gpu-dev", kubectl_invocation)
-        self.assertIn("SWEHERO_POD_GIT_BRANCH=axel/test", kubectl_invocation)
-        self.assertIn(
-            "MIDTRAINING_POD_WORKSPACE_ROOT=/workspace/custom-repo",
-            kubectl_invocation,
+        assert git_invocation == "git push -u origin axel/test\n"
+        assert "--kubeconfig" in kubectl_invocation
+        assert str(kubeconfig) in kubectl_invocation
+        assert "exec" in kubectl_invocation
+        assert "-n" in kubectl_invocation
+        assert "training" in kubectl_invocation
+        assert "gpu-dev" in kubectl_invocation
+        assert "SWEHERO_POD_GIT_BRANCH=axel/test" in kubectl_invocation
+        assert (
+            "MIDTRAINING_POD_WORKSPACE_ROOT=/workspace/custom-repo"
+            in kubectl_invocation
         )
-        self.assertIn(
-            "/workspace/custom-repo/scripts/run_openhands_swebench_eval_pod.sh",
-            kubectl_invocation,
+        assert (
+            "/workspace/custom-repo/scripts/run_openhands_swebench_eval_pod.py"
+            in kubectl_invocation
         )
-        self.assertIn("--eval-limit", kubectl_invocation)
-        self.assertIn("1", kubectl_invocation)
-        self.assertIn("--no-attach", kubectl_invocation)
+        assert "--eval-limit" in kubectl_invocation
+        assert "1" in kubectl_invocation
+        assert "--no-attach" in kubectl_invocation
 
     def test_no_push_with_explicit_branch_does_not_require_git(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -147,6 +148,7 @@ class RunMidtrainingPodLauncherTests(unittest.TestCase):
 
             result = subprocess.run(
                 [
+                    sys.executable,
                     str(SCRIPT),
                     "--kubeconfig",
                     str(kubeconfig),
@@ -164,17 +166,13 @@ class RunMidtrainingPodLauncherTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            assert result.returncode == 0, result.stderr
             kubectl_invocation = shlex.split(kubectl_log.read_text())
 
-        self.assertIn("SWEHERO_POD_GIT_BRANCH=axel/manual", kubectl_invocation)
-        self.assertIn(
-            "/workspace/jaxels-work-trial/scripts/prebuild_openhands_swebench_images_pod.sh",
-            kubectl_invocation,
+        assert "SWEHERO_POD_GIT_BRANCH=axel/manual" in kubectl_invocation
+        assert (
+            "/workspace/jaxels-work-trial/scripts/prebuild_openhands_swebench_images_pod.py"
+            in kubectl_invocation
         )
-        self.assertIn("--eval-limit", kubectl_invocation)
-        self.assertIn("2", kubectl_invocation)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert "--eval-limit" in kubectl_invocation
+        assert "2" in kubectl_invocation

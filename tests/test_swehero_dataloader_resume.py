@@ -2,10 +2,10 @@ import json
 import pickle
 import sys
 import tempfile
-import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT / "torchtitan"))
@@ -18,8 +18,8 @@ except ModuleNotFoundError:
     SweHeroDataLoader = None
 
 
-@unittest.skipIf(torch is None, "torch/torchdata runtime is not available")
-class SweHeroDataLoaderResumeTests(unittest.TestCase):
+@pytest.mark.skipif(torch is None, reason="torch/torchdata runtime is not available")
+class TestSweHeroDataLoaderResume:
     def _write_bucket(self, path: Path, count: int) -> None:
         with path.open("w") as handle:
             for index in range(count):
@@ -82,8 +82,8 @@ class SweHeroDataLoaderResumeTests(unittest.TestCase):
                 )
                 inputs, labels = next(iter(loader))
 
-        self.assertEqual(inputs["input"][:, 0].tolist(), [2, 4])
-        self.assertEqual(labels[:, 0].tolist(), [2, 4])
+        assert inputs["input"][:, 0].tolist() == [2, 4]
+        assert labels[:, 0].tolist() == [2, 4]
 
     def test_empty_rank_reuses_tiny_bucket_for_smoke_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,15 +99,15 @@ class SweHeroDataLoaderResumeTests(unittest.TestCase):
             )
             inputs, labels = next(iter(loader))
 
-        self.assertEqual(inputs["input"][0, 0].item(), 1)
-        self.assertEqual(labels[0, 0].item(), 1)
+        assert inputs["input"][0, 0].item() == 1
+        assert labels[0, 0].item() == 1
 
     def test_empty_rank_reuse_is_rejected_unless_explicitly_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             bucket_path = Path(tmp) / "bucket_8.jsonl"
             self._write_bucket(bucket_path, count=1)
 
-            with self.assertRaisesRegex(ValueError, "Refusing to reuse data"):
+            with pytest.raises(ValueError, match="Refusing to reuse data"):
                 self._build_loader(
                     bucket_path,
                     dp_world_size=4,
@@ -137,13 +137,11 @@ class SweHeroDataLoaderResumeTests(unittest.TestCase):
             resumed_inputs,
             resumed_labels,
         ) in zip(expected_batches, resumed_batches):
-            self.assertTrue(
-                torch.equal(expected_inputs["input"], resumed_inputs["input"])
+            assert torch.equal(expected_inputs["input"], resumed_inputs["input"])
+            assert torch.equal(
+                expected_inputs["positions"], resumed_inputs["positions"]
             )
-            self.assertTrue(
-                torch.equal(expected_inputs["positions"], resumed_inputs["positions"])
-            )
-            self.assertTrue(torch.equal(expected_labels, resumed_labels))
+            assert torch.equal(expected_labels, resumed_labels)
 
     def test_legacy_state_dict_restores_from_batch_count(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,11 +168,5 @@ class SweHeroDataLoaderResumeTests(unittest.TestCase):
             resumed_inputs,
             resumed_labels,
         ) in zip(expected_batches, resumed_batches):
-            self.assertTrue(
-                torch.equal(expected_inputs["input"], resumed_inputs["input"])
-            )
-            self.assertTrue(torch.equal(expected_labels, resumed_labels))
-
-
-if __name__ == "__main__":
-    unittest.main()
+            assert torch.equal(expected_inputs["input"], resumed_inputs["input"])
+            assert torch.equal(expected_labels, resumed_labels)

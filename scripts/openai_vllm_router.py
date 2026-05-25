@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
-
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -81,7 +80,9 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if not self.path.startswith("/v1/"):
-            self._send_json(404, {"error": {"message": f"unsupported path: {self.path}"}})
+            self._send_json(
+                404, {"error": {"message": f"unsupported path: {self.path}"}}
+            )
             return
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)

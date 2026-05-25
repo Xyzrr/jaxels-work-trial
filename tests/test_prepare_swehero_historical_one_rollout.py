@@ -1,5 +1,3 @@
-import unittest
-
 from scripts import prepare_swehero_historical_one_rollout as prep
 
 
@@ -21,7 +19,7 @@ def tool(tool_call_id="call-1", content="ok"):
     return {"role": "tool", "id": tool_call_id, "content": content, "tool_calls": []}
 
 
-class PrepareSweHeroHistoricalOneRolloutTests(unittest.TestCase):
+class TestPrepareSweHeroHistoricalOneRollout:
     def test_evaluate_row_accepts_paper_available_valid_row(self):
         row = {
             "model_patch": "diff --git a/file.py b/file.py\n",
@@ -37,24 +35,26 @@ class PrepareSweHeroHistoricalOneRolloutTests(unittest.TestCase):
 
         evaluation = prep.evaluate_row(row)
 
-        self.assertTrue(evaluation.accepted)
-        self.assertEqual(evaluation.assistant_turns, 2)
-        self.assertEqual(evaluation.str_replace_editor_errors, 0)
-        self.assertEqual(evaluation.reject_reasons, ())
+        assert evaluation.accepted
+        assert evaluation.assistant_turns == 2
+        assert evaluation.str_replace_editor_errors == 0
+        assert evaluation.reject_reasons == ()
 
     def test_evaluate_row_rejects_non_meaningful_public_filter_failures(self):
         blank_patch = prep.evaluate_row({"model_patch": "", "trajectory": []})
-        self.assertIn("null_model_patch", blank_patch.reject_reasons)
+        assert "null_model_patch" in blank_patch.reject_reasons
 
         missing_tool_call = prep.evaluate_row(
             {
                 "model_patch": "diff --git a/file.py b/file.py\n",
-                "trajectory": [{"role": "assistant", "content": "done", "tool_calls": []}],
+                "trajectory": [
+                    {"role": "assistant", "content": "done", "tool_calls": []}
+                ],
             }
         )
-        self.assertIn(
-            "assistant_turn_without_exactly_one_tool_call",
-            missing_tool_call.reject_reasons,
+        assert (
+            "assistant_turn_without_exactly_one_tool_call"
+            in missing_tool_call.reject_reasons
         )
 
         too_long = prep.evaluate_row(
@@ -66,7 +66,7 @@ class PrepareSweHeroHistoricalOneRolloutTests(unittest.TestCase):
             },
             max_assistant_turns=2,
         )
-        self.assertIn("exceeds_max_assistant_turns", too_long.reject_reasons)
+        assert "exceeds_max_assistant_turns" in too_long.reject_reasons
 
     def test_str_replace_editor_errors_are_counted_by_tool_call_id(self):
         row = {
@@ -82,8 +82,8 @@ class PrepareSweHeroHistoricalOneRolloutTests(unittest.TestCase):
 
         evaluation = prep.evaluate_row(row, max_str_replace_editor_errors=0)
 
-        self.assertEqual(evaluation.str_replace_editor_errors, 1)
-        self.assertIn("too_many_str_replace_editor_errors", evaluation.reject_reasons)
+        assert evaluation.str_replace_editor_errors == 1
+        assert "too_many_str_replace_editor_errors" in evaluation.reject_reasons
 
     def test_str_replace_editor_source_view_text_is_not_an_error(self):
         row = {
@@ -102,8 +102,8 @@ class PrepareSweHeroHistoricalOneRolloutTests(unittest.TestCase):
 
         evaluation = prep.evaluate_row(row)
 
-        self.assertTrue(evaluation.accepted)
-        self.assertEqual(evaluation.str_replace_editor_errors, 0)
+        assert evaluation.accepted
+        assert evaluation.str_replace_editor_errors == 0
 
     def test_better_selection_prefers_fewer_errors_then_shorter_then_source_order(self):
         current_eval = prep.RowEvaluation(
@@ -145,8 +145,4 @@ class PrepareSweHeroHistoricalOneRolloutTests(unittest.TestCase):
             ({"id": "current"}, current), {"id": "candidate"}, candidate
         )
 
-        self.assertEqual(selected.trajectory_id, "candidate")
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert selected.trajectory_id == "candidate"

@@ -15,7 +15,7 @@ SWE-Hero reproduction.
 The canonical pod runtime is:
 
 ```bash
-scripts/run_midtraining_pod.sh train \
+scripts/run_midtraining_pod.py train \
   @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-torchtitan \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
@@ -26,6 +26,9 @@ current clean branch, enters `midtraining-dev` with
 `tmp/pod-creds/kubeconfig.yaml`, sets the legacy `SWEHERO_POD_GIT_BRANCH`
 runtime variable inside the pod, and starts the lower-level TorchTitan pod
 wrapper from `/workspace/jaxels-work-trial`.
+
+The workstation wrapper is a Python `uv` entrypoint. Run it directly as shown
+or through `uv run`; do not add shell launchers for new training workflows.
 
 The `@configs/training/qwen25-coder-7b-direct-to-hero.args` file is the
 canonical experiment preset for the Qwen2.5-Coder-7B direct-to-hero run. It
@@ -46,14 +49,14 @@ runtime environment variables to the pod. `SWEHERO_POD_GIT_BRANCH` remains a
 pod-side legacy compatibility name; new shared controls should use neutral
 names.
 
-The launcher runs `scripts/setup_torchtitan_pod_venv.sh` itself before the
+The launcher runs `scripts/setup_torchtitan_pod_venv.py` itself before the
 training entrypoint starts. On a fresh pod it creates the canonical venv; on a
 pod with stale or incompatible Python packages it syncs the same pinned lock
 back into place. Run the setup script directly only when you intentionally want
 to prewarm or recreate the venv:
 
 ```bash
-scripts/setup_torchtitan_pod_venv.sh --recreate
+scripts/setup_torchtitan_pod_venv.py --recreate
 ```
 
 When this wrapper is run from an interactive pod terminal, it creates or
@@ -74,19 +77,19 @@ tmux attach-session -t swehero-qwen25-coder7b-swehero-torchtitan
 
 # Override the derived session name for a launch.
 SWEHERO_POD_TMUX_SESSION=swehero-7b-prod \
-  scripts/run_midtraining_pod.sh train \
+  scripts/run_midtraining_pod.py train \
     @configs/training/qwen25-coder-7b-direct-to-hero.args \
     --production-mode --enable-wandb
 
 # Force a supervised detached launch from a non-interactive exec.
 SWEHERO_POD_SUPERVISOR=1 SWEHERO_POD_TMUX_ATTACH=0 \
-  scripts/run_midtraining_pod.sh train \
+  scripts/run_midtraining_pod.py train \
     @configs/training/qwen25-coder-7b-direct-to-hero.args \
     --production-mode --enable-wandb
 
 # Bypass tmux intentionally for non-interactive automation.
 SWEHERO_POD_SUPERVISOR=0 \
-  scripts/run_midtraining_pod.sh train \
+  scripts/run_midtraining_pod.py train \
     @configs/training/qwen25-coder-7b-direct-to-hero.args \
     --dry-run
 ```
@@ -142,13 +145,13 @@ Before launching a new canonical training session from the workstation, use the
 meta-wrapper:
 
 ```bash
-scripts/run_midtraining_pod.sh train \
+scripts/run_midtraining_pod.py train \
   @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --production-mode \
   --enable-wandb
 ```
 
-For a new launch, `scripts/run_midtraining_pod.sh` refuses to push if the local
+For a new launch, `scripts/run_midtraining_pod.py` refuses to push if the local
 checkout has uncommitted changes, then pushes the selected branch and enters the
 pod. The pod-side shared startup guard refuses to launch unless
 `/workspace/jaxels-work-trial` is clean, checked out to that branch, and
@@ -192,7 +195,7 @@ venv's Python so `torchrun` is resolved from the same runtime.
 
 The setup script bootstraps exactly `uv 0.11.16` under
 `/workspace/uv/uv-0.11.16` when that exact version is not already installed.
-The version is pinned inside `scripts/setup_torchtitan_pod_venv.sh`; do not set
+The version is pinned inside `scripts/setup_torchtitan_pod_venv.py`; do not set
 `UV_VERSION` or use an unversioned installer URL. If `UV_BIN` is provided, the
 script verifies it reports `uv 0.11.16` before using it. The downloaded Linux
 x86_64 archive is also checked against its pinned SHA256.
@@ -228,7 +231,7 @@ together and revalidated.
 
 ## Built-In Verification
 
-`scripts/setup_torchtitan_pod_venv.sh` fails unless the venv can:
+`scripts/setup_torchtitan_pod_venv.py` fails unless the venv can:
 
 - import `DataParallelMeshDims` directly from `torch.distributed.fsdp`;
 - import TorchAO float8 support and construct the `rowwise` recipe;
@@ -346,7 +349,7 @@ tiny synthetic tokenized records only; it is not a training dataset and should
 not be used for the paper-aligned run.
 
 ```bash
-scripts/run_midtraining_pod.sh train \
+scripts/run_midtraining_pod.py train \
   @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-all-bucket-cp-smoke \
   --overwrite-output \
@@ -546,7 +549,7 @@ run spec.
 To collect TorchTitan profiler traces during a short soak, add flags such as:
 
 ```bash
-scripts/run_midtraining_pod.sh train \
+scripts/run_midtraining_pod.py train \
   @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-profiler-soak \
   --overwrite-output \
