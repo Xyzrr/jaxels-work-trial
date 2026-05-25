@@ -47,6 +47,8 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn('CONTEXT_MODE="${CONTEXT_MODE:-paper-yarn-128k}"', script)
         self.assertIn('PAPER_YARN_ROPE_SCALING=', script)
         self.assertIn("--context-mode \"$CONTEXT_MODE\"", script)
+        self.assertNotIn("--base-native-32k", script)
+        self.assertNotIn("--base-paper-yarn-128k", script)
         self.assertIn("--max-input-tokens \"$MAX_INPUT_TOKENS\"", script)
         self.assertIn("--vllm-max-model-len \"$VLLM_MAX_MODEL_LEN\"", script)
         self.assertIn("--rope-scaling", script)

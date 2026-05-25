@@ -14,8 +14,6 @@ Options:
   --eval-limit N          Run N instances. Omit for the full Verified split.
   --full                  Clear any eval limit and run the full Verified split.
   --context-mode MODE     paper-yarn-128k, base-native-32k, or base-paper-yarn-128k.
-  --base-native-32k       Shortcut for --context-mode base-native-32k.
-  --base-paper-yarn-128k  Shortcut for --context-mode base-paper-yarn-128k.
   --preflight-only        Check vLLM tool calls and Docker, then exit.
   --skip-swebench-eval    Generate patches without running SWE-bench grading.
   --output-dir PATH       Eval output directory. Defaults to a timestamped pod path.
@@ -165,18 +163,6 @@ while (($#)); do
       [[ $# -ge 2 ]] || die "--context-mode requires a value"
       CONTEXT_MODE="$2"
       shift 2
-      ;;
-    --base-native-32k)
-      CONTEXT_MODE="base-native-32k"
-      shift
-      ;;
-    --base-paper-yarn-128k)
-      CONTEXT_MODE="base-paper-yarn-128k"
-      shift
-      ;;
-    --paper-yarn-128k)
-      CONTEXT_MODE="paper-yarn-128k"
-      shift
       ;;
     --preflight-only)
       PREFLIGHT_ONLY=1

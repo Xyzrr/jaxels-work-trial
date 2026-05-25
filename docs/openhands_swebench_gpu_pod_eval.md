@@ -72,13 +72,14 @@ scripts/run_openhands_swebench_eval_pod.sh --full
 
 ## Base Model Eval Modes
 
-For a full base-model comparison against an SFT checkpoint, run both base modes
-with explicit run IDs:
+For a full base-model comparison against an SFT checkpoint, run both base
+context modes with explicit run IDs:
 
 ```bash
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_openhands_swebench_eval_pod.sh --full --base-native-32k \
+scripts/run_openhands_swebench_eval_pod.sh --full \
+  --context-mode base-native-32k \
   --run-id qwen25-coder7b-base-native32k-pass1
 '
 ```
@@ -86,12 +87,13 @@ scripts/run_openhands_swebench_eval_pod.sh --full --base-native-32k \
 ```bash
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_openhands_swebench_eval_pod.sh --full --base-paper-yarn-128k \
+scripts/run_openhands_swebench_eval_pod.sh --full \
+  --context-mode base-paper-yarn-128k \
   --run-id qwen25-coder7b-base-yarn128k-pass1
 '
 ```
 
-The modes mean different things:
+`--context-mode` controls the eval context contract:
 
 - `base-native-32k`: evaluates the released base model inside its native
   32,768-token context window. vLLM starts with `--max-model-len 32768`, no
