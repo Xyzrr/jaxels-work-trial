@@ -37,6 +37,32 @@ spec:
             apt-get install -y --no-install-recommends "${missing_packages[@]}"
             rm -rf /var/lib/apt/lists/*
           fi
+          if [[ -f /var/run/midtraining-git-ssh/id_ed25519 ]]; then
+            if [[ -f /var/run/midtraining-git-ssh/known_hosts ]]; then
+              install -d -m 700 /root/.ssh
+              install -m 600 /var/run/midtraining-git-ssh/id_ed25519 /root/.ssh/id_ed25519
+              if [[ -f /var/run/midtraining-git-ssh/id_ed25519.pub ]]; then
+                install -m 644 /var/run/midtraining-git-ssh/id_ed25519.pub /root/.ssh/id_ed25519.pub
+              fi
+              install -m 644 /var/run/midtraining-git-ssh/known_hosts /root/.ssh/known_hosts
+              cat >/root/.ssh/config <<'SSH_CONFIG'
+          Host github.com
+            HostName github.com
+            User git
+            IdentityFile /root/.ssh/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile /root/.ssh/known_hosts
+          SSH_CONFIG
+              chmod 600 /root/.ssh/config
+              if [[ -f /var/run/midtraining-git-ssh/gitconfig ]]; then
+                git config --global include.path /var/run/midtraining-git-ssh/gitconfig
+              fi
+              git config --global --add safe.directory /workspace/jaxels-work-trial
+            else
+              echo "midtraining-git-ssh secret is missing known_hosts; skipping Git SSH setup" >&2
+            fi
+          fi
           export UV_CACHE_DIR=/workspace/.cache/uv
           export UV_PYTHON_INSTALL_DIR=/workspace/python
           /workspace/uv/uv-0.11.16/uv python install 3.10.12 \
@@ -58,6 +84,9 @@ spec:
           mountPath: /workspace
         - name: docker-graph
           mountPath: /var/lib/docker
+        - name: git-ssh
+          mountPath: /var/run/midtraining-git-ssh
+          readOnly: true
   volumes:
     - name: workspace
       hostPath:
@@ -67,3 +96,8 @@ spec:
       hostPath:
         path: /workspace/pod-docker-data/midtraining-dev
         type: DirectoryOrCreate
+    - name: git-ssh
+      secret:
+        secretName: midtraining-git-ssh
+        optional: true
+        defaultMode: 0400

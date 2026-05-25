@@ -57,6 +57,48 @@ uses `hostPath.path: /workspace` with `type: Directory`, so the GPU node must
 prepare `/workspace` as a real directory or mountpoint before the pod is
 created. Do not rely on a host symlink for this path.
 
+## Git Access
+
+The project remote currently uses GitHub SSH. To let the pod run the same Git
+remote operations as the workstation, create or refresh the Kubernetes Secret
+that the canonical pod manifest mounts:
+
+```bash
+mkdir -p tmp/pod-creds
+git_name="$(git config --global --get user.name)"
+git_email="$(git config --global --get user.email)"
+printf '[user]\n\tname = %s\n\temail = %s\n' "$git_name" "$git_email" \
+  > tmp/pod-creds/gitconfig
+ssh-keygen -F github.com -f "$HOME/.ssh/known_hosts" \
+  | sed '/^#/d' > tmp/pod-creds/github_known_hosts
+test -s tmp/pod-creds/github_known_hosts \
+  || ssh-keyscan github.com > tmp/pod-creds/github_known_hosts
+
+KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
+  kubectl create secret generic midtraining-git-ssh -n midtraining \
+    --from-file=id_ed25519="$HOME/.ssh/id_ed25519" \
+    --from-file=id_ed25519.pub="$HOME/.ssh/id_ed25519.pub" \
+    --from-file=known_hosts=tmp/pod-creds/github_known_hosts \
+    --from-file=gitconfig=tmp/pod-creds/gitconfig \
+    --dry-run=client -o yaml \
+  | KUBECONFIG=tmp/pod-creds/kubeconfig.yaml kubectl apply -f -
+```
+
+This deliberately keeps private key material in a cluster Secret and ignored
+local files, not in git. It grants the pod whatever GitHub SSH permissions that
+key has; use a repo-scoped deploy key instead if the pod should only access this
+repository. Running pods do not gain new volume mounts, so recreate
+`midtraining-dev` from `manifests/midtraining-hostpath.yaml` after creating the
+Secret when durable Git access is needed across pod restarts.
+
+Verify GitHub auth and repository access from the pod:
+
+```bash
+KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
+  kubectl exec -n midtraining midtraining-dev -- \
+    bash -lc 'ssh -T git@github.com || true; git -C /workspace/jaxels-work-trial pull --ff-only'
+```
+
 The CUDA base image does not include Python. The pod entrypoint uses the pinned
 `/workspace/uv/uv-0.11.16/uv` binary to install CPython 3.10.12 under
 `/workspace/python` before idling. It also installs `tmux`, `git`, the `ssh`

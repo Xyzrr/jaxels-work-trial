@@ -46,9 +46,29 @@ class MidtrainingHostpathManifestTests(unittest.TestCase):
             'apt-get install -y --no-install-recommends "${missing_packages[@]}"',
             manifest,
         )
+        self.assertIn(
+            "install -m 600 /var/run/midtraining-git-ssh/id_ed25519 /root/.ssh/id_ed25519",
+            manifest,
+        )
+        self.assertIn("Host github.com", manifest)
+        self.assertIn("IdentityFile /root/.ssh/id_ed25519", manifest)
+        self.assertIn("StrictHostKeyChecking yes", manifest)
+        self.assertIn(
+            "git config --global include.path /var/run/midtraining-git-ssh/gitconfig",
+            manifest,
+        )
+        self.assertIn(
+            "git config --global --add safe.directory /workspace/jaxels-work-trial",
+            manifest,
+        )
+        self.assertNotIn("ssh-keyscan github.com", manifest)
         self.assertIn("securityContext:\n        privileged: true", manifest)
         self.assertIn("mountPath: /var/lib/docker", manifest)
         self.assertIn("path: /workspace/pod-docker-data/midtraining-dev", manifest)
+        self.assertIn("mountPath: /var/run/midtraining-git-ssh", manifest)
+        self.assertIn("secretName: midtraining-git-ssh", manifest)
+        self.assertIn("optional: true", manifest)
+        self.assertIn("defaultMode: 0400", manifest)
 
 
 if __name__ == "__main__":
