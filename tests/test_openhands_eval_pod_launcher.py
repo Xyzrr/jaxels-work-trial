@@ -5,6 +5,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "run_openhands_swebench_eval_pod.sh"
+LAUNCHER_DEFAULTS_SCRIPT = REPO_ROOT / "scripts" / "openhands_eval_launcher_defaults.sh"
 WORKER_SELECTION_SCRIPT = REPO_ROOT / "scripts" / "openhands_eval_worker_selection.sh"
 
 
@@ -107,6 +108,24 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
             "3",
         )
 
+    def test_swe_lego_uses_vendored_dummy_api_key_by_default(self):
+        self.assertEqual(
+            self._select_llm_api_key("swe-lego", explicit=False, current_key="local-llm"),
+            "dummy-key",
+        )
+
+    def test_explicit_llm_api_key_overrides_swe_lego_default(self):
+        self.assertEqual(
+            self._select_llm_api_key("swe-lego", explicit=True, current_key="custom-key"),
+            "custom-key",
+        )
+
+    def test_current_eval_keeps_local_llm_default(self):
+        self.assertEqual(
+            self._select_llm_api_key("openhands", explicit=False, current_key="local-llm"),
+            "local-llm",
+        )
+
     def test_vllm_requirement_is_pinned(self):
         requirements = REPO_ROOT / "requirements" / "openhands-vllm.txt"
 
@@ -127,6 +146,22 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
             "select_openhands_eval_num_workers "
             f"{eval_stack!r} {eval_limit!r} {eval_ids!r} "
             f"{config_num_workers} {total_agent_workers}"
+        )
+        return subprocess.check_output(
+            ["bash", "-lc", command],
+            text=True,
+        ).strip()
+
+    def _select_llm_api_key(
+        self,
+        eval_stack: str,
+        explicit: bool,
+        current_key: str,
+    ) -> str:
+        command = (
+            f"source {LAUNCHER_DEFAULTS_SCRIPT}; "
+            "select_openhands_llm_api_key "
+            f"{eval_stack!r} {'1' if explicit else '0'} {current_key!r}"
         )
         return subprocess.check_output(
             ["bash", "-lc", command],

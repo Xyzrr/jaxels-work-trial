@@ -5,6 +5,8 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # shellcheck source=scripts/pod_git_guard.sh
 source "$ROOT_DIR/scripts/pod_git_guard.sh"
+# shellcheck source=scripts/openhands_eval_launcher_defaults.sh
+source "$ROOT_DIR/scripts/openhands_eval_launcher_defaults.sh"
 # shellcheck source=scripts/openhands_eval_worker_selection.sh
 source "$ROOT_DIR/scripts/openhands_eval_worker_selection.sh"
 
@@ -29,7 +31,9 @@ Options:
 
 Environment overrides:
   WORKSPACE_ROOT          Default: /workspace/jaxels-work-trial
-  LLM_API_KEY             Default: local-llm
+  LLM_API_KEY             Default: local-llm, or dummy-key for the SWE-Lego
+                          eval stack to match its vendored OpenHands/vLLM
+                          scripts.
   VLLM_VENV               Default: /workspace/venvs/openhands-vllm
   VLLM_REQUIREMENTS_PATH  Default: requirements/openhands-vllm.txt
   VLLM_FORCE_RESTART      Set to 1 to replace an already-running vLLM server.
@@ -103,6 +107,11 @@ readonly PAPER_YARN_ROPE_SCALING='{"rope_type":"yarn","factor":4.0,"original_max
 
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace/jaxels-work-trial}"
 CONFIG_PRESET="$ROOT_DIR/configs/eval/openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args"
+if [[ -v LLM_API_KEY ]]; then
+  LLM_API_KEY_EXPLICIT=1
+else
+  LLM_API_KEY_EXPLICIT=0
+fi
 LLM_API_KEY="${LLM_API_KEY:-local-llm}"
 VLLM_VENV="${VLLM_VENV:-/workspace/venvs/openhands-vllm}"
 VLLM_REQUIREMENTS_PATH="${VLLM_REQUIREMENTS_PATH:-$ROOT_DIR/requirements/openhands-vllm.txt}"
@@ -306,6 +315,12 @@ PY
 
 CONFIG_PRESET_PATH="$(resolve_config_preset_path "$CONFIG_PRESET")"
 eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
+LLM_API_KEY="$(
+  select_openhands_llm_api_key \
+    "$EVAL_STACK" \
+    "$LLM_API_KEY_EXPLICIT" \
+    "$LLM_API_KEY"
+)"
 if [[ -n "$OPENHANDS_POETRY_VERSION_FROM_CONFIG" ]]; then
   OPENHANDS_EVAL_POETRY_VERSION="$OPENHANDS_POETRY_VERSION_FROM_CONFIG"
 fi
