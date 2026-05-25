@@ -80,6 +80,8 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn("--eval-ids", script)
         self.assertIn("SWE_LEGO_SWEBENCH_DIR", script)
         self.assertIn('-e "$SWE_LEGO_SWEBENCH_DIR"', script)
+        self.assertIn("for stale_gpu in $(seq 0 $((VISIBLE_GPU_COUNT - 1)))", script)
+        self.assertIn('tmux kill-session -t "$(vllm_session_name "$stale_gpu")"', script)
 
     def test_vllm_requirement_is_pinned(self):
         requirements = REPO_ROOT / "requirements" / "openhands-vllm.txt"

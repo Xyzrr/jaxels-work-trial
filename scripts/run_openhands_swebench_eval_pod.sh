@@ -806,6 +806,15 @@ ensure_vllm_stack() {
   local ip="$1"
   if [[ "$VLLM_FORCE_RESTART" == "1" || "$VLLM_FORCE_RESTART" == "true" ]]; then
     tmux kill-session -t "$VLLM_TMUX_SESSION" 2>/dev/null || true
+    if [[ "$VLLM_SERVER_COUNT" -eq 1 && "$VLLM_PARALLEL_GPU_COUNT" -gt 1 ]]; then
+      local stale_gpu
+      for stale_gpu in $(seq 0 $((VISIBLE_GPU_COUNT - 1))); do
+        tmux kill-session -t "$(vllm_session_name "$stale_gpu")" 2>/dev/null || true
+      done
+    fi
+    if [[ "$VLLM_USE_ROUTER" != "1" && "$VLLM_USE_ROUTER" != "true" ]]; then
+      tmux kill-session -t "$VLLM_ROUTER_TMUX_SESSION" 2>/dev/null || true
+    fi
   fi
 
   local backend_args=()
