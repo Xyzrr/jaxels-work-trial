@@ -383,7 +383,12 @@ ensure_vllm_python() {
   fi
   [[ -f "$VLLM_REQUIREMENTS_PATH" ]] || die "vLLM requirements file not found: $VLLM_REQUIREMENTS_PATH"
   ensure_python_venv "$VLLM_VENV" "$VLLM_PYTHON_VERSION"
-  "$PINNED_UV_BIN" pip sync --python "$VLLM_VENV/bin/python" "$VLLM_REQUIREMENTS_PATH"
+  local resolved_requirements="$VLLM_VENV/openhands-vllm-resolved.txt"
+  "$PINNED_UV_BIN" pip compile \
+    --python "$VLLM_VENV/bin/python" \
+    --output-file "$resolved_requirements" \
+    "$VLLM_REQUIREMENTS_PATH"
+  "$PINNED_UV_BIN" pip sync --python "$VLLM_VENV/bin/python" "$resolved_requirements"
   "$PINNED_UV_BIN" pip check --python "$VLLM_VENV/bin/python"
   "$VLLM_VENV/bin/python" - "$VLLM_VENV" "$VLLM_REQUIREMENTS_PATH" "$PINNED_UV_BIN" <<'PY'
 from __future__ import annotations
