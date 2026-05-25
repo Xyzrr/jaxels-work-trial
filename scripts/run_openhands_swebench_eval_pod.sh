@@ -31,6 +31,9 @@ Environment overrides:
   VLLM_VENV               Default: /workspace/venvs/openhands-vllm
   VLLM_REQUIREMENTS_PATH  Default: requirements/openhands-vllm.txt
   VLLM_FORCE_RESTART      Set to 1 to replace an already-running vLLM server.
+  VLLM_NCCL_CUMEM_ENABLE  Default: auto. The launcher sets NCCL_CUMEM_ENABLE=1
+                          for multi-GPU vLLM servers to avoid tiny /dev/shm
+                          failures on the pod.
   EVAL_VENV               Default: /workspace/venvs/openhands-eval-pod-py312
   OPENHANDS_EVAL_POETRY_VERSION
                           Default: 2.1.3
@@ -68,6 +71,7 @@ supervised_env_args() {
     "VLLM_PYTHON_VERSION=$VLLM_PYTHON_VERSION" \
     "VLLM_VISIBLE_DEVICES=$VLLM_VISIBLE_DEVICES" \
     "VLLM_FORCE_RESTART=$VLLM_FORCE_RESTART" \
+    "VLLM_NCCL_CUMEM_ENABLE=$VLLM_NCCL_CUMEM_ENABLE" \
     "VLLM_TMUX_SESSION=$VLLM_TMUX_SESSION" \
     "VLLM_TMUX_SESSION_PREFIX=$VLLM_TMUX_SESSION_PREFIX" \
     "VLLM_ROUTER_TMUX_SESSION=$VLLM_ROUTER_TMUX_SESSION" \
@@ -103,6 +107,7 @@ VLLM_REQUIREMENTS_PATH="${VLLM_REQUIREMENTS_PATH:-$ROOT_DIR/requirements/openhan
 VLLM_PYTHON_VERSION="${VLLM_PYTHON_VERSION:-3.12}"
 VLLM_VISIBLE_DEVICES="${VLLM_VISIBLE_DEVICES:-${VLLM_GPU:-}}"
 VLLM_FORCE_RESTART="${VLLM_FORCE_RESTART:-0}"
+VLLM_NCCL_CUMEM_ENABLE="${VLLM_NCCL_CUMEM_ENABLE:-auto}"
 VLLM_TMUX_SESSION="${VLLM_TMUX_SESSION:-openhands-vllm-7b}"
 VLLM_TMUX_SESSION_PREFIX="${VLLM_TMUX_SESSION_PREFIX:-openhands-vllm-7b-gpu}"
 VLLM_ROUTER_TMUX_SESSION="${VLLM_ROUTER_TMUX_SESSION:-openhands-vllm-router}"
@@ -682,9 +687,20 @@ VLLM_DISTRIBUTED_EXECUTOR_BACKEND=$VLLM_DISTRIBUTED_EXECUTOR_BACKEND
 VLLM_ENFORCE_EAGER=$VLLM_ENFORCE_EAGER
 VLLM_ENABLE_AUTO_TOOL_CHOICE=$VLLM_ENABLE_AUTO_TOOL_CHOICE
 VLLM_TOOL_CALL_PARSER=$VLLM_TOOL_CALL_PARSER
+NCCL_CUMEM_ENABLE=$(effective_vllm_nccl_cumem_enable)
 GPU=$gpu
 PORT=$port
 EOF
+}
+
+effective_vllm_nccl_cumem_enable() {
+  if [[ "$VLLM_NCCL_CUMEM_ENABLE" == "auto" ]]; then
+    if [[ "$VLLM_PARALLEL_GPU_COUNT" -gt 1 ]]; then
+      printf "1\n"
+    fi
+    return
+  fi
+  printf "%s\n" "$VLLM_NCCL_CUMEM_ENABLE"
 }
 
 kill_process_pattern() {
@@ -706,6 +722,7 @@ kill_process_pattern() {
 cleanup_vllm_runtime() {
   kill_process_pattern "$VLLM_VENV/bin/vllm"
   kill_process_pattern "$VLLM_VENV/bin/python -c from multiprocessing"
+  rm -f /dev/shm/psm_* /dev/shm/sem.mp-* /dev/shm/nccl-* 2>/dev/null || true
 }
 
 ensure_vllm_server() {
@@ -744,6 +761,7 @@ ensure_vllm_server() {
   local vllm_distributed_arg=()
   local cuda_visible_arg=()
   local vllm_long_context_env=()
+  local vllm_nccl_env=()
   local vllm_rope_arg=()
   local vllm_max_num_seqs_arg=()
   local vllm_tool_args=()
@@ -771,6 +789,11 @@ ensure_vllm_server() {
   if [[ "$VLLM_ALLOW_LONG_MAX_MODEL_LEN" == "1" || "$VLLM_ALLOW_LONG_MAX_MODEL_LEN" == "true" ]]; then
     vllm_long_context_env=(VLLM_ALLOW_LONG_MAX_MODEL_LEN=1)
   fi
+  local nccl_cumem_enable
+  nccl_cumem_enable="$(effective_vllm_nccl_cumem_enable)"
+  if [[ -n "$nccl_cumem_enable" ]]; then
+    vllm_nccl_env=(NCCL_CUMEM_ENABLE="$nccl_cumem_enable")
+  fi
   if [[ -n "$VLLM_ROPE_SCALING" ]]; then
     vllm_rope_arg=(--rope-scaling "$VLLM_ROPE_SCALING")
   fi
@@ -784,7 +807,7 @@ ensure_vllm_server() {
     fi
   fi
   tmux new-session -d -s "$session" \
-    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") $(quote_args "${vllm_long_context_env[@]}") $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host $(quote_args "$VLLM_HOST") --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len $(quote_args "$VLLM_MAX_MODEL_LEN") $(quote_args "${vllm_rope_arg[@]}") --tensor-parallel-size $(quote_args "$VLLM_TENSOR_PARALLEL_SIZE") --pipeline-parallel-size $(quote_args "$VLLM_PIPELINE_PARALLEL_SIZE") $(quote_args "${vllm_max_num_seqs_arg[@]}") --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") $(quote_args "${vllm_tool_args[@]}") $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
+    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") $(quote_args "${vllm_long_context_env[@]}") $(quote_args "${vllm_nccl_env[@]}") $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host $(quote_args "$VLLM_HOST") --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len $(quote_args "$VLLM_MAX_MODEL_LEN") $(quote_args "${vllm_rope_arg[@]}") --tensor-parallel-size $(quote_args "$VLLM_TENSOR_PARALLEL_SIZE") --pipeline-parallel-size $(quote_args "$VLLM_PIPELINE_PARALLEL_SIZE") $(quote_args "${vllm_max_num_seqs_arg[@]}") --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") $(quote_args "${vllm_tool_args[@]}") $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
 
   for _ in $(seq 1 240); do
     if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1; then

@@ -28,6 +28,7 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn("OpenHands eval pod execution directory", script)
         self.assertIn("supervised_env_args", script)
         self.assertIn('"VLLM_FORCE_RESTART=$VLLM_FORCE_RESTART"', script)
+        self.assertIn('"VLLM_NCCL_CUMEM_ENABLE=$VLLM_NCCL_CUMEM_ENABLE"', script)
         self.assertIn('env $(supervised_env_args)', script)
 
     def test_launcher_verifies_docker_and_buildx(self):
@@ -88,6 +89,9 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn("cleanup_vllm_runtime", script)
         self.assertIn('kill_process_pattern "$VLLM_VENV/bin/vllm"', script)
         self.assertIn('kill_process_pattern "$VLLM_VENV/bin/python -c from multiprocessing"', script)
+        self.assertIn("effective_vllm_nccl_cumem_enable", script)
+        self.assertIn('vllm_nccl_env=(NCCL_CUMEM_ENABLE="$nccl_cumem_enable")', script)
+        self.assertIn("rm -f /dev/shm/psm_* /dev/shm/sem.mp-* /dev/shm/nccl-*", script)
 
     def test_vllm_requirement_is_pinned(self):
         requirements = REPO_ROOT / "requirements" / "openhands-vllm.txt"

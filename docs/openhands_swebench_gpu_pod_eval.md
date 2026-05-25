@@ -38,7 +38,8 @@ for those flags.
 Environment variables are reserved for secrets and pod/runtime plumbing:
 `LLM_API_KEY`, `WORKSPACE_ROOT`, `VLLM_VENV`, `VLLM_REQUIREMENTS_PATH`,
 `VLLM_FORCE_RESTART`, `VLLM_VISIBLE_DEVICES`, `EVAL_VENV`,
-`OPENHANDS_EVAL_POETRY_VERSION`, `REQUIRED_GPU_COUNT`,
+`VLLM_NCCL_CUMEM_ENABLE`, `OPENHANDS_EVAL_POETRY_VERSION`,
+`REQUIRED_GPU_COUNT`,
 `SWEHERO_POD_GIT_BRANCH`, and tmux/uv path controls. The API key is env-only;
 set `LLM_API_KEY` when the default `local-llm` key is not appropriate.
 
@@ -167,6 +168,9 @@ The model-serving contract is the SWE-Lego Qwen3 contract:
 
 The Qwen3 long-context settings are taken from the model's own `config.json`.
 Do not add the Qwen2.5 YaRN `--rope-scaling` override to this preset.
+For multi-GPU vLLM servers, the launcher sets `NCCL_CUMEM_ENABLE=1` by default
+because the pod's default `/dev/shm` is too small for NCCL's per-rank shared
+memory segments when vLLM disables cuMem.
 
 Run SWE-Lego-Qwen3-8B on the 16-task infrastructure check set with:
 
