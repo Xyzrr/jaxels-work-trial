@@ -29,6 +29,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 if __package__ is None or __package__ == "":
@@ -36,6 +37,8 @@ if __package__ is None or __package__ == "":
 
 DEFAULT_OPENHANDS_REPO = "https://github.com/OpenHands/OpenHands.git"
 DEFAULT_OPENHANDS_REF = "0.62.0"
+DEFAULT_SWE_LEGO_REPO = "https://github.com/SWE-Lego/SWE-Lego.git"
+DEFAULT_SWE_LEGO_REF = "94704b69aac886e003660e1e0f69f7de163b284e"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
 DEFAULT_DATASET = "princeton-nlp/SWE-bench_Verified"
 DEFAULT_SPLIT = "test"
@@ -66,6 +69,13 @@ DEFAULT_VLLM_ROUTER_PORT = 8090
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.90
 DEFAULT_VLLM_DTYPE = "bfloat16"
 DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND = "mp"
+SWE_LEGO_MAX_INPUT_TOKENS = 147_456
+SWE_LEGO_VLLM_MAX_MODEL_LEN = 163_840
+SWE_LEGO_MAX_OUTPUT_TOKENS = 16_384
+SWE_LEGO_TEMPERATURE = 0.0
+SWE_LEGO_GRADER_MAX_WORKERS = 10
+SWE_LEGO_GRADER_TIMEOUT = 500
+SWE_LEGO_GRADER_CACHE_LEVEL = "instance"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVAL_PRESET = (
     REPO_ROOT
@@ -76,12 +86,17 @@ DEFAULT_EVAL_PRESET = (
 CONTEXT_MODE_PAPER_YARN_128K = "paper-yarn-128k"
 CONTEXT_MODE_BASE_NATIVE_32K = "base-native-32k"
 CONTEXT_MODE_BASE_PAPER_YARN_128K = "base-paper-yarn-128k"
+CONTEXT_MODE_SWE_LEGO_QWEN3_160K = "swe-lego-qwen3-160k"
 CONTEXT_MODES = (
     CONTEXT_MODE_PAPER_YARN_128K,
     CONTEXT_MODE_BASE_NATIVE_32K,
     CONTEXT_MODE_BASE_PAPER_YARN_128K,
+    CONTEXT_MODE_SWE_LEGO_QWEN3_160K,
 )
 DEFAULT_CONTEXT_MODE = CONTEXT_MODE_PAPER_YARN_128K
+EVAL_STACK_OPENHANDS = "openhands"
+EVAL_STACK_SWE_LEGO = "swe-lego"
+EVAL_STACKS = (EVAL_STACK_OPENHANDS, EVAL_STACK_SWE_LEGO)
 PAPER_YARN_ROPE_SCALING = {
     "rope_type": "yarn",
     "factor": PAPER_YARN_FACTOR,
@@ -124,13 +139,16 @@ class EvalPaths:
     commands_path: Path
     openhands_output_dir: Path
     expected_output_jsonl: Path
+    converted_swebench_jsonl: Path
     expected_report_json: Path
+    swebench_report_dir: Path
 
 
 @dataclass(frozen=True)
 class EvalCommands:
     prepare_openhands: list[str]
     run_infer: list[str]
+    convert_output: list[str] | None
     run_eval: list[str]
     serve_vllm: list[str]
 
@@ -143,6 +161,8 @@ class ContextModeSpec:
     vllm_max_model_len: int
     vllm_rope_scaling: str | None
     default_eval_note: str
+    requires_rope_scaling: bool = True
+    allow_long_max_model_len: bool = True
 
 
 def paper_yarn_rope_scaling_json() -> str:
@@ -173,6 +193,8 @@ def context_mode_spec(mode: str) -> ContextModeSpec:
             vllm_max_model_len=QWEN_NATIVE_CONTEXT_LENGTH,
             vllm_rope_scaling=None,
             default_eval_note="base-native-32k-pass1",
+            requires_rope_scaling=False,
+            allow_long_max_model_len=False,
         )
     if mode == CONTEXT_MODE_BASE_PAPER_YARN_128K:
         return ContextModeSpec(
@@ -185,6 +207,22 @@ def context_mode_spec(mode: str) -> ContextModeSpec:
             vllm_max_model_len=PAPER_CONTEXT_LENGTH,
             vllm_rope_scaling=paper_yarn_rope_scaling_json(),
             default_eval_note="base-paper-yarn-128k-pass1",
+        )
+    if mode == CONTEXT_MODE_SWE_LEGO_QWEN3_160K:
+        return ContextModeSpec(
+            mode=mode,
+            description=(
+                "SWE-Lego Qwen3 long-context serving contract: 147456 "
+                "OpenHands input tokens against a 163840-token model context. "
+                "The SWE-Lego checkpoint carries its Qwen3 YaRN long-context "
+                "configuration in config.json, so no vLLM rope override is passed."
+            ),
+            max_input_tokens=SWE_LEGO_MAX_INPUT_TOKENS,
+            vllm_max_model_len=SWE_LEGO_VLLM_MAX_MODEL_LEN,
+            vllm_rope_scaling=None,
+            default_eval_note="swe-lego-qwen3-8b-pass1",
+            requires_rope_scaling=False,
+            allow_long_max_model_len=False,
         )
     raise ValueError(f"unknown context mode: {mode}")
 
@@ -218,6 +256,7 @@ def decoded_vllm_rope_scaling(value: str | None) -> object:
 
 
 def validate_context_args(args: argparse.Namespace) -> None:
+    context_spec = context_mode_spec(args.context_mode)
     if args.context_mode == CONTEXT_MODE_BASE_NATIVE_32K:
         if args.max_input_tokens > QWEN_NATIVE_CONTEXT_LENGTH:
             raise ValueError(
@@ -252,7 +291,11 @@ def validate_context_args(args: argparse.Namespace) -> None:
             "--max-input-tokens"
         )
 
-    if args.vllm_max_model_len > QWEN_NATIVE_CONTEXT_LENGTH and not args.vllm_rope_scaling:
+    if (
+        context_spec.requires_rope_scaling
+        and args.vllm_max_model_len > QWEN_NATIVE_CONTEXT_LENGTH
+        and not args.vllm_rope_scaling
+    ):
         raise ValueError(
             f"{args.context_mode} extends Qwen2.5-Coder beyond "
             f"{QWEN_NATIVE_CONTEXT_LENGTH} tokens and requires explicit "
@@ -289,6 +332,20 @@ def _optional_positive_int(value: str) -> int | None:
     return parsed
 
 
+def _optional_float(value: str) -> float | None:
+    normalized = value.strip().lower()
+    if normalized in {"none", "null", "off", "false", "disabled", "omit"}:
+        return None
+    return float(value)
+
+
+def _optional_int(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"none", "null", "off", "false", "disabled", "omit"}:
+        return None
+    return int(value)
+
+
 def _toml_string(value: str) -> str:
     return json.dumps(value)
 
@@ -319,6 +376,24 @@ def dataset_description(dataset: str, split: str) -> str:
     return dataset.replace("/", "__") + "-" + split.replace("/", "__")
 
 
+def parse_eval_ids(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def effective_openhands_dir(args: argparse.Namespace) -> Path:
+    if args.eval_stack == EVAL_STACK_SWE_LEGO:
+        return args.swe_lego_dir / "OpenHands-0.53.0"
+    return args.openhands_dir
+
+
+def effective_swebench_dir(args: argparse.Namespace) -> Path | None:
+    if args.eval_stack == EVAL_STACK_SWE_LEGO:
+        return args.swe_lego_dir / "SWE-bench-4.0.4"
+    return None
+
+
 def expected_output_jsonl(args: argparse.Namespace) -> Path:
     litellm_model = litellm_model_name(args)
     eval_note = f"_N_{args.eval_note}" if args.eval_note else ""
@@ -335,6 +410,8 @@ def expected_output_jsonl(args: argparse.Namespace) -> Path:
 def eval_paths(args: argparse.Namespace) -> EvalPaths:
     run_dir = args.output_dir
     output_jsonl = expected_output_jsonl(args)
+    converted_jsonl = output_jsonl.with_name(output_jsonl.name.replace(".jsonl", ".swebench.jsonl"))
+    swebench_report_dir = run_dir / "swebench-results"
     return EvalPaths(
         run_dir=run_dir,
         config_path=run_dir / "config.toml",
@@ -342,7 +419,13 @@ def eval_paths(args: argparse.Namespace) -> EvalPaths:
         commands_path=run_dir / "commands.sh",
         openhands_output_dir=run_dir / "outputs",
         expected_output_jsonl=output_jsonl,
-        expected_report_json=output_jsonl.parent / "report.json",
+        converted_swebench_jsonl=converted_jsonl,
+        expected_report_json=(
+            output_jsonl.parent / "report.json"
+            if args.eval_stack == EVAL_STACK_OPENHANDS
+            else swebench_report_dir / "run_report.json"
+        ),
+        swebench_report_dir=swebench_report_dir,
     )
 
 
@@ -357,21 +440,26 @@ def build_openhands_config(args: argparse.Namespace) -> str:
         f"base_url = {_toml_string(args.base_url)}",
         f"api_key = {_toml_string(args.api_key)}",
         f"temperature = {args.temperature}",
-        f"top_p = {args.top_p}",
-        f"top_k = {args.top_k}",
         f"max_input_tokens = {args.max_input_tokens}",
         f"timeout = {args.timeout}",
         f"drop_params = {_toml_bool(args.drop_params)}",
         f"disable_vision = {_toml_bool(args.disable_vision)}",
-        f"native_tool_calling = {_toml_bool(args.native_tool_calling)}",
     ]
+    if args.top_p is not None:
+        config_lines.append(f"top_p = {args.top_p}")
+    if args.top_k is not None:
+        config_lines.append(f"top_k = {args.top_k}")
+    if not args.omit_native_tool_calling_config:
+        config_lines.append(
+            f"native_tool_calling = {_toml_bool(args.native_tool_calling)}"
+        )
     if args.custom_llm_provider:
         config_lines.append(
             f"custom_llm_provider = {_toml_string(args.custom_llm_provider)}"
         )
     if args.max_output_tokens is not None:
         config_lines.append(f"max_output_tokens = {args.max_output_tokens}")
-    if args.native_tool_calling:
+    if args.native_tool_calling and not args.omit_native_tool_calling_config:
         config_lines.append(
             "completion_kwargs = "
             f"{{ tool_choice = {_toml_string(args.tool_choice)} }}"
@@ -396,16 +484,24 @@ def build_openhands_config(args: argparse.Namespace) -> str:
 
 
 def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
-    prepare_openhands = [
-        "git",
-        "clone",
-        "--branch",
-        args.openhands_ref,
-        "--depth",
-        "1",
-        args.openhands_repo,
-        str(args.openhands_dir),
-    ]
+    if args.eval_stack == EVAL_STACK_SWE_LEGO:
+        prepare_openhands = [
+            "git",
+            "clone",
+            args.swe_lego_repo,
+            str(args.swe_lego_dir),
+        ]
+    else:
+        prepare_openhands = [
+            "git",
+            "clone",
+            "--branch",
+            args.openhands_ref,
+            "--depth",
+            "1",
+            args.openhands_repo,
+            str(args.openhands_dir),
+        ]
 
     run_infer = [
         "poetry",
@@ -437,16 +533,49 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
     ]
     if args.eval_limit is not None:
         run_infer.extend(["--eval-n-limit", str(args.eval_limit)])
+    if args.eval_ids:
+        run_infer.extend(["--eval-ids", args.eval_ids])
 
-    run_eval = [
-        "bash",
-        "evaluation/benchmarks/swe_bench/scripts/eval_infer.sh",
-        str(paths.expected_output_jsonl),
-        "",
-        args.dataset,
-        args.split,
-        SWE_BENCH_DOCKER_ENVIRONMENT,
-    ]
+    convert_output = None
+    if args.eval_stack == EVAL_STACK_SWE_LEGO:
+        convert_output = [
+            "poetry",
+            "run",
+            "python",
+            "evaluation/benchmarks/swe_bench/scripts/eval/convert_oh_output_to_swe_json.py",
+            str(paths.expected_output_jsonl),
+        ]
+        run_eval = [
+            "python",
+            "-m",
+            "swebench.harness.run_evaluation",
+            "--max_workers",
+            str(args.swebench_max_workers),
+            "--dataset_name",
+            args.dataset,
+            "--split",
+            args.split,
+            "--report_dir",
+            str(paths.swebench_report_dir),
+            "--cache_level",
+            args.swebench_cache_level,
+            "--predictions_path",
+            str(paths.converted_swebench_jsonl),
+            "--run_id",
+            args.swebench_run_id,
+            "--timeout",
+            str(args.swebench_timeout),
+        ]
+    else:
+        run_eval = [
+            "bash",
+            "evaluation/benchmarks/swe_bench/scripts/eval_infer.sh",
+            str(paths.expected_output_jsonl),
+            "",
+            args.dataset,
+            args.split,
+            SWE_BENCH_DOCKER_ENVIRONMENT,
+        ]
 
     served_model_name = args.served_model_name or args.model_id
     serve_vllm = [
@@ -474,6 +603,8 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
         serve_vllm.extend(
             ["--pipeline-parallel-size", str(args.vllm_pipeline_parallel_size)]
         )
+    if args.vllm_max_num_seqs is not None:
+        serve_vllm.extend(["--max-num-seqs", str(args.vllm_max_num_seqs)])
     serve_vllm.extend(
         ["--gpu-memory-utilization", str(args.vllm_gpu_memory_utilization)]
     )
@@ -496,6 +627,7 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
     return EvalCommands(
         prepare_openhands=prepare_openhands,
         run_infer=run_infer,
+        convert_output=convert_output,
         run_eval=run_eval,
         serve_vllm=serve_vllm,
     )
@@ -518,11 +650,17 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "serve_vllm": commands.serve_vllm,
             "prepare_openhands": commands.prepare_openhands,
             "run_infer": commands.run_infer,
+            "convert_output": commands.convert_output or [],
             "run_eval": commands.run_eval,
         }.items()
     }
     metadata = {
-        "intent": "SWE-HERO paper-aligned OpenHands pass@1 evaluation scaffold",
+        "intent": (
+            "SWE-Lego vendored OpenHands/SWE-bench pass@1 evaluation scaffold"
+            if args.eval_stack == EVAL_STACK_SWE_LEGO
+            else "SWE-HERO paper-aligned OpenHands pass@1 evaluation scaffold"
+        ),
+        "eval_stack": args.eval_stack,
         "paper_eval_settings": {
             "benchmark": "SWE-bench Verified",
             "metric": "resolved rate / pass@1",
@@ -537,6 +675,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "max_interaction_rounds": args.max_iterations,
             "tts": "disabled",
             "n_runs": 1,
+            "eval_ids": parse_eval_ids(args.eval_ids),
         },
         "paper_caveats": [
             "The paper says reported results average three evaluation passes; this scaffold defaults to one pass@1 run per user request.",
@@ -546,7 +685,18 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
         "openhands": {
             "repo": args.openhands_repo,
             "ref": args.openhands_ref,
-            "dir": str(args.openhands_dir),
+            "dir": str(effective_openhands_dir(args)),
+        },
+        "swe_lego": {
+            "repo": args.swe_lego_repo,
+            "ref": args.swe_lego_ref,
+            "dir": str(args.swe_lego_dir),
+            "openhands_dir": str(effective_openhands_dir(args)),
+            "swebench_dir": (
+                str(effective_swebench_dir(args))
+                if effective_swebench_dir(args) is not None
+                else None
+            ),
         },
         "model": {
             "model_id": args.model_id,
@@ -555,8 +705,17 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "base_url": args.base_url,
             "api_key_source": args.api_key_source,
             "custom_llm_provider": args.custom_llm_provider,
-            "native_tool_calling": args.native_tool_calling,
-            "tool_choice": args.tool_choice if args.native_tool_calling else None,
+            "native_tool_calling": (
+                None
+                if args.omit_native_tool_calling_config
+                else args.native_tool_calling
+            ),
+            "tool_choice": (
+                args.tool_choice
+                if args.native_tool_calling
+                and not args.omit_native_tool_calling_config
+                else None
+            ),
             "tool_call_preflight": args.tool_call_preflight,
         },
         "context": {
@@ -585,8 +744,10 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "vllm_pipeline_parallel_size": args.vllm_pipeline_parallel_size,
             "vllm_server_count": args.vllm_server_count,
             "vllm_agent_tasks_per_server": args.vllm_agent_tasks_per_server,
+            "vllm_use_router": args.vllm_use_router,
             "vllm_router_port": args.vllm_router_port,
             "vllm_max_model_len": args.vllm_max_model_len,
+            "vllm_max_num_seqs": args.vllm_max_num_seqs,
             "vllm_rope_scaling": args.vllm_rope_scaling,
             "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
             "vllm_dtype": args.vllm_dtype,
@@ -599,7 +760,9 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "config": str(paths.config_path),
             "commands": str(paths.commands_path),
             "expected_output_jsonl": str(paths.expected_output_jsonl),
+            "converted_swebench_jsonl": str(paths.converted_swebench_jsonl),
             "expected_report_json": str(paths.expected_report_json),
+            "swebench_report_dir": str(paths.swebench_report_dir),
         },
         "commands": redacted_commands,
         "generated_at_unix": time.time(),
@@ -614,23 +777,35 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "# Generated command record. The supported launcher is:",
             "# scripts/run_openhands_swebench_eval_pod.sh",
             "",
-            "# 1. Serve Qwen2.5-Coder-7B-Instruct from the GPU pod.",
+            "# 1. Serve the requested model from the GPU pod.",
             "# " + _shell_join(commands.serve_vllm),
             "",
             "# 2. Prepare the legacy OpenHands SWE-bench harness if needed.",
-            f'test -d {shlex.quote(str(args.openhands_dir / ".git"))} || '
+            f'test -d {shlex.quote(str(effective_openhands_dir(args) / ".git"))} || '
             + _shell_join(commands.prepare_openhands),
             "",
             "# 3. Run one OpenHands pass@1 rollout on SWE-bench Verified.",
-            f"cd {shlex.quote(str(args.openhands_dir))}",
+            f"cd {shlex.quote(str(effective_openhands_dir(args)))}",
             f"export RUNTIME={shlex.quote(args.runtime)}",
             "export RUN_WITH_BROWSING=false",
-            "export USE_HINT_TEXT=false",
-            "export ITERATIVE_EVAL_MODE=false",
-            "export ENABLE_LLM_EDITOR=false",
+            f"export USE_HINT_TEXT={shlex.quote(str(args.use_hint_text).lower())}",
+            f"export ENABLE_PLAN_MODE={shlex.quote(str(args.enable_plan_mode).lower())}",
+            "export ADD_IN_CONTEXT_LEARNING_EXAMPLE="
+            f"{shlex.quote(str(args.add_in_context_learning_example).lower())}",
+            f"export INSTRUCTION_TEMPLATE_NAME={shlex.quote(args.instruction_template_name)}",
+            f"export ITERATIVE_EVAL_MODE={shlex.quote(str(args.iterative_eval_mode).lower())}",
+            f"export ENABLE_LLM_EDITOR={shlex.quote(str(args.enable_llm_editor).lower())}",
             _shell_join(commands.run_infer),
             "",
             "# 4. Grade generated patches with the SWE-bench dockerized harness.",
+            *(
+                [
+                    "# Convert OpenHands output to SWE-bench prediction JSONL.",
+                    _shell_join(commands.convert_output),
+                ]
+                if commands.convert_output
+                else []
+            ),
             _shell_join(commands.run_eval),
             "",
         ]
@@ -650,11 +825,56 @@ def run_command(
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
+def write_swebench_filter_config(
+    openhands_dir: Path, eval_ids: list[str]
+) -> tuple[Path, str | None]:
+    config_path = (
+        openhands_dir / "evaluation" / "benchmarks" / "swe_bench" / "config.toml"
+    )
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    original = config_path.read_text() if config_path.exists() else None
+    selected = ", ".join(_toml_string(instance_id) for instance_id in eval_ids)
+    config_path.write_text(f"selected_ids = [{selected}]\n")
+    return config_path, original
+
+
+def restore_swebench_filter_config(config_path: Path, original: str | None) -> None:
+    if original is None:
+        config_path.unlink(missing_ok=True)
+    else:
+        config_path.write_text(original)
+
+
 def git_output(args: list[str], *, cwd: Path) -> str:
     return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
 
 
 def ensure_openhands_checkout(args: argparse.Namespace) -> None:
+    if args.eval_stack == EVAL_STACK_SWE_LEGO:
+        if args.swe_lego_dir.exists():
+            if not (args.swe_lego_dir / ".git").exists():
+                raise RuntimeError(
+                    f"{args.swe_lego_dir} exists but is not a git checkout"
+                )
+            status = git_output(["status", "--porcelain"], cwd=args.swe_lego_dir)
+            if status:
+                raise RuntimeError(
+                    f"{args.swe_lego_dir} has local changes; refusing to change refs"
+                )
+            run_command(["git", "fetch", "--depth", "1", "origin", args.swe_lego_ref], cwd=args.swe_lego_dir)
+            run_command(["git", "checkout", "--detach", args.swe_lego_ref], cwd=args.swe_lego_dir)
+        else:
+            args.swe_lego_dir.parent.mkdir(parents=True, exist_ok=True)
+            run_command(build_commands(args, eval_paths(args)).prepare_openhands)
+            run_command(["git", "checkout", "--detach", args.swe_lego_ref], cwd=args.swe_lego_dir)
+        openhands_dir = effective_openhands_dir(args)
+        swebench_dir = effective_swebench_dir(args)
+        if not openhands_dir.is_dir():
+            raise RuntimeError(f"SWE-Lego OpenHands checkout missing: {openhands_dir}")
+        if swebench_dir is None or not swebench_dir.is_dir():
+            raise RuntimeError(f"SWE-Lego SWE-bench checkout missing: {swebench_dir}")
+        return
+
     if args.openhands_dir.exists():
         if not (args.openhands_dir / ".git").exists():
             raise RuntimeError(f"{args.openhands_dir} exists but is not a git checkout")
@@ -695,7 +915,11 @@ def check_runtime(args: argparse.Namespace) -> list[RuntimeCheck]:
     )
     if not args.skip_llm_endpoint_check:
         checks.append(check_llm_endpoint(args))
-    if args.native_tool_calling and args.tool_call_preflight:
+    if (
+        args.native_tool_calling
+        and not args.omit_native_tool_calling_config
+        and args.tool_call_preflight
+    ):
         checks.append(check_tool_call_endpoint(args))
     if args.runtime == "docker":
         checks.extend(check_docker_runtime(args))
@@ -984,34 +1208,69 @@ def run_eval(args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands)
         assert_preflight_ok(checks)
 
     ensure_openhands_checkout(args)
+    openhands_dir = effective_openhands_dir(args)
     env = os.environ.copy()
     env["RUNTIME"] = args.runtime
     env["RUN_WITH_BROWSING"] = "false"
-    env["USE_HINT_TEXT"] = "false"
-    env["ITERATIVE_EVAL_MODE"] = "false"
-    env["ENABLE_LLM_EDITOR"] = "false"
+    env["USE_HINT_TEXT"] = str(args.use_hint_text).lower()
+    env["ENABLE_PLAN_MODE"] = str(args.enable_plan_mode).lower()
+    env["ADD_IN_CONTEXT_LEARNING_EXAMPLE"] = str(
+        args.add_in_context_learning_example
+    ).lower()
+    env["INSTRUCTION_TEMPLATE_NAME"] = args.instruction_template_name
+    env["ITERATIVE_EVAL_MODE"] = str(args.iterative_eval_mode).lower()
+    env["ENABLE_LLM_EDITOR"] = str(args.enable_llm_editor).lower()
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
-        str(args.openhands_dir)
+        str(openhands_dir)
         if not existing_pythonpath
-        else f"{args.openhands_dir}{os.pathsep}{existing_pythonpath}"
+        else f"{openhands_dir}{os.pathsep}{existing_pythonpath}"
     )
 
-    run_command(commands.run_infer, cwd=args.openhands_dir, env=env)
-    if not paths.expected_output_jsonl.exists():
-        raise RuntimeError(
-            f"OpenHands finished but expected output was not found: {paths.expected_output_jsonl}"
+    eval_ids = parse_eval_ids(args.eval_ids)
+    filter_state: tuple[Path, str | None] | None = None
+    if eval_ids:
+        filter_state = write_swebench_filter_config(openhands_dir, eval_ids)
+    try:
+        run_command(commands.run_infer, cwd=openhands_dir, env=env)
+        if not paths.expected_output_jsonl.exists():
+            raise RuntimeError(
+                "OpenHands finished but expected output was not found: "
+                f"{paths.expected_output_jsonl}"
+            )
+        print(
+            "agent_tool_use="
+            + json.dumps(
+                summarize_agent_tool_use(paths.expected_output_jsonl),
+                sort_keys=True,
+            )
         )
-    print(
-        "agent_tool_use="
-        + json.dumps(
-            summarize_agent_tool_use(paths.expected_output_jsonl), sort_keys=True
-        )
-    )
-    if not args.skip_swebench_eval:
-        run_command(commands.run_eval, cwd=args.openhands_dir, env=env)
-        if paths.expected_report_json.exists():
-            print(json.dumps(summarize_report(paths.expected_report_json), indent=2))
+        if not args.skip_swebench_eval:
+            if commands.convert_output is not None:
+                run_command(commands.convert_output, cwd=openhands_dir, env=env)
+            if args.eval_stack == EVAL_STACK_SWE_LEGO:
+                swebench_dir = effective_swebench_dir(args)
+                if swebench_dir is None:
+                    raise RuntimeError("SWE-Lego SWE-bench directory is not configured")
+                paths.swebench_report_dir.mkdir(parents=True, exist_ok=True)
+                grader_env = env.copy()
+                grader_pythonpath = grader_env.get("PYTHONPATH")
+                grader_env["PYTHONPATH"] = (
+                    str(swebench_dir)
+                    if not grader_pythonpath
+                    else f"{swebench_dir}{os.pathsep}{grader_pythonpath}"
+                )
+                run_command(commands.run_eval, cwd=paths.swebench_report_dir, env=grader_env)
+                report_candidates = sorted(paths.swebench_report_dir.glob("*.json"))
+                if report_candidates:
+                    report_candidates[-1].replace(paths.expected_report_json)
+            else:
+                run_command(commands.run_eval, cwd=openhands_dir, env=env)
+            if paths.expected_report_json.exists():
+                print(json.dumps(summarize_report(paths.expected_report_json), indent=2))
+    finally:
+        if filter_state is not None:
+            restore_swebench_filter_config(*filter_state)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1020,6 +1279,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Run/prepare OpenHands SWE-bench Verified pass@1 eval for Qwen2.5-Coder-7B.",
         fromfile_prefix_chars="@",
     )
+    parser.add_argument("--eval-stack", choices=EVAL_STACKS, default=EVAL_STACK_OPENHANDS)
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument(
         "--served-model-name",
@@ -1044,6 +1304,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--native-tool-calling",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--omit-native-tool-calling-config",
+        action="store_true",
+        default=False,
+        help=(
+            "Do not write native_tool_calling or tool_choice to config.toml. "
+            "Use for eval stacks whose checked-in config intentionally leaves "
+            "OpenHands on its default non-native tool-calling path."
+        ),
     )
     parser.add_argument(
         "--tool-choice",
@@ -1072,10 +1342,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--top-p",
-        type=float,
+        type=_optional_float,
         default=PAPER_TOP_P,
     )
-    parser.add_argument("--top-k", type=int, default=PAPER_TOP_K)
+    parser.add_argument("--top-k", type=_optional_int, default=PAPER_TOP_K)
     parser.add_argument(
         "--tool-call-preflight",
         action=argparse.BooleanOptionalAction,
@@ -1125,6 +1395,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Limit tasks for smoke runs. Omit for all 500 Verified tasks.",
     )
+    parser.add_argument(
+        "--eval-ids",
+        default="",
+        help=(
+            "Comma-separated SWE-bench instance IDs to evaluate. The launcher "
+            "also writes OpenHands' benchmark-local selected_ids filter so old "
+            "OpenHands releases that ignore --eval-ids still run exactly this set."
+        ),
+    )
     parser.add_argument("--agent", default=DEFAULT_AGENT)
     parser.add_argument(
         "--max-iterations",
@@ -1153,6 +1432,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("eval-runs/OpenHands"),
     )
+    parser.add_argument("--swe-lego-repo", default=DEFAULT_SWE_LEGO_REPO)
+    parser.add_argument("--swe-lego-ref", default=DEFAULT_SWE_LEGO_REF)
+    parser.add_argument(
+        "--swe-lego-dir",
+        type=Path,
+        default=Path("eval-runs/SWE-Lego"),
+    )
+    parser.add_argument(
+        "--openhands-poetry-version",
+        default="",
+        help=(
+            "Poetry version expected by the eval checkout. The pod launcher "
+            "uses this to provision the OpenHands environment."
+        ),
+    )
     parser.add_argument("--model-config-name", default=DEFAULT_MODEL_CONFIG_NAME)
     parser.add_argument("--agent-config-name", default=DEFAULT_AGENT_CONFIG_NAME)
     parser.add_argument(
@@ -1160,6 +1454,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("docker", "remote"),
         default="docker",
         help="OpenHands runtime backend. Docker is the paper default.",
+    )
+    parser.add_argument(
+        "--use-hint-text",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--enable-plan-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--add-in-context-learning-example",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--instruction-template-name",
+        default="swe_default.j2",
+    )
+    parser.add_argument(
+        "--iterative-eval-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--enable-llm-editor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument(
         "--docker-smoke-image",
@@ -1213,6 +1536,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Concurrent OpenHands workers allocated per vLLM replica.",
     )
     parser.add_argument(
+        "--vllm-use-router",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--vllm-router-port",
         type=int,
         default=DEFAULT_VLLM_ROUTER_PORT,
@@ -1226,6 +1554,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "and must be at least --max-input-tokens."
         ),
     )
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=None)
     parser.add_argument(
         "--vllm-rope-scaling",
         default="auto",
@@ -1261,6 +1590,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--swebench-cache-level",
+        default=SWE_LEGO_GRADER_CACHE_LEVEL,
+        choices=("none", "base", "env", "instance"),
+    )
+    parser.add_argument(
+        "--swebench-timeout",
+        type=int,
+        default=SWE_LEGO_GRADER_TIMEOUT,
+    )
+    parser.add_argument(
+        "--swebench-max-workers",
+        type=int,
+        default=SWE_LEGO_GRADER_MAX_WORKERS,
+    )
+    parser.add_argument("--swebench-run-id", default="openhands")
     parser.add_argument("--dry-run", action="store_true", default=False)
     parser.add_argument("--preflight-only", action="store_true", default=False)
     parser.add_argument("--skip-preflight", action="store_true", default=False)
@@ -1285,11 +1630,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.vllm_rope_scaling = resolve_vllm_rope_scaling(
         args.vllm_rope_scaling, context_spec
     )
+    args.vllm_distributed_executor_backend = normalize_optional_value(
+        args.vllm_distributed_executor_backend
+    )
     if not args.eval_note:
         args.eval_note = context_spec.default_eval_note
     validate_context_args(args)
     if args.eval_limit is not None and args.eval_limit <= 0:
         raise ValueError("--eval-limit must be positive when provided")
+    if args.eval_limit is not None and args.eval_ids:
+        raise ValueError("--eval-limit and --eval-ids are mutually exclusive")
+    if args.vllm_server_count <= 0:
+        raise ValueError("--vllm-server-count must be positive")
+    if args.vllm_tensor_parallel_size <= 0:
+        raise ValueError("--vllm-tensor-parallel-size must be positive")
+    if args.vllm_pipeline_parallel_size <= 0:
+        raise ValueError("--vllm-pipeline-parallel-size must be positive")
+    if not args.vllm_use_router and args.vllm_server_count != 1:
+        raise ValueError("--no-vllm-use-router requires --vllm-server-count 1")
+    if args.vllm_max_num_seqs is not None and args.vllm_max_num_seqs <= 0:
+        raise ValueError("--vllm-max-num-seqs must be positive when provided")
+    if args.swebench_timeout <= 0:
+        raise ValueError("--swebench-timeout must be positive")
+    if args.swebench_max_workers <= 0:
+        raise ValueError("--swebench-max-workers must be positive")
     if not args.base_url and not args.dry_run:
         raise ValueError(
             "--base-url is required; use scripts/run_openhands_swebench_eval_pod.sh "
@@ -1297,6 +1661,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     args.output_dir = args.output_dir.resolve()
     args.openhands_dir = args.openhands_dir.resolve()
+    args.swe_lego_dir = args.swe_lego_dir.resolve()
     return args
 
 
@@ -1320,6 +1685,8 @@ def main(argv: list[str] | None = None) -> None:
         print("serve_vllm:", _shell_join(commands.serve_vllm))
         print("prepare_openhands:", _shell_join(commands.prepare_openhands))
         print("run_infer:", _shell_join(commands.run_infer))
+        if commands.convert_output:
+            print("convert_output:", _shell_join(commands.convert_output))
         print("run_eval:", _shell_join(commands.run_eval))
         return
 

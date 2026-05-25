@@ -14,7 +14,8 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn('[[ -d /workspace ]]', script)
         self.assertIn("command -v nvidia-smi", script)
         self.assertIn('POD_IP="${POD_IP:-$(pod_ip)}"', script)
-        self.assertIn('--base-url "http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"', script)
+        self.assertIn('LLM_BASE_URL="http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"', script)
+        self.assertIn('--base-url "$LLM_BASE_URL"', script)
         self.assertNotIn("127.0.0.1", script)
         self.assertNotIn("openhands" + "-eval-driver", script)
 
@@ -52,6 +53,7 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
 
         self.assertIn('"$VLLM_VENV/bin/vllm") serve', script)
         self.assertIn("CUDA_VISIBLE_DEVICES=\"$gpu\"", script)
+        self.assertIn('CUDA_VISIBLE_DEVICES="$visible_devices"', script)
         self.assertIn("CONFIG_PRESET=", script)
         self.assertIn("resolve_eval_config", script)
         self.assertIn("@$CONFIG_PRESET_PATH", script)
@@ -65,6 +67,19 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertIn("--tool-call-parser", script)
         self.assertIn('"$EVAL_VENV/bin/python" scripts/openhands_swebench_eval.py', script)
         self.assertIn("--preflight-only", script)
+
+    def test_launcher_supports_swe_lego_single_multi_gpu_vllm_without_router(self):
+        script = SCRIPT.read_text()
+
+        self.assertIn("VLLM_PARALLEL_GPU_COUNT=$((VLLM_TENSOR_PARALLEL_SIZE * VLLM_PIPELINE_PARALLEL_SIZE))", script)
+        self.assertIn('if [[ "$VLLM_SERVER_COUNT" -eq 1 ]]; then', script)
+        self.assertIn("direct vLLM base URL without router requires VLLM_SERVER_COUNT=1", script)
+        self.assertIn('vllm_max_num_seqs_arg=(--max-num-seqs "$VLLM_MAX_NUM_SEQS")', script)
+        self.assertIn('if [[ "$VLLM_USE_ROUTER" == "1" || "$VLLM_USE_ROUTER" == "true" ]]; then', script)
+        self.assertIn('LLM_BASE_URL="http://${POD_IP}:${VLLM_PORT}/v1"', script)
+        self.assertIn("--eval-ids", script)
+        self.assertIn("SWE_LEGO_SWEBENCH_DIR", script)
+        self.assertIn('-e "$SWE_LEGO_SWEBENCH_DIR"', script)
 
     def test_vllm_requirement_is_pinned(self):
         requirements = REPO_ROOT / "requirements" / "openhands-vllm.txt"

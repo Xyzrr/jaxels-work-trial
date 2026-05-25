@@ -230,6 +230,12 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
                 131_072,
                 "base-paper-yarn-128k-pass1",
             ),
+            (
+                "openhands-swebench-verified-swe-lego-qwen3-8b.args",
+                "swe-lego-qwen3-160k",
+                147_456,
+                "swe-lego-qwen3-8b-pass1",
+            ),
         ]
 
         for filename, mode, max_tokens, eval_note in cases:
@@ -238,8 +244,74 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
 
             self.assertEqual(args.context_mode, mode)
             self.assertEqual(args.max_input_tokens, max_tokens)
-            self.assertEqual(args.vllm_max_model_len, max_tokens)
+            if mode == "swe-lego-qwen3-160k":
+                self.assertEqual(args.vllm_max_model_len, 163_840)
+            else:
+                self.assertEqual(args.vllm_max_model_len, max_tokens)
             self.assertEqual(args.eval_note, eval_note)
+
+    def test_swe_lego_qwen3_preset_matches_upstream_serving_and_llm_contract(self):
+        preset = (
+            REPO_ROOT
+            / "configs"
+            / "eval"
+            / "openhands-swebench-verified-swe-lego-qwen3-8b.args"
+        )
+        args = self._args(f"@{preset}")
+        paths, commands = eval_script.write_scaffold(args)
+
+        self.assertEqual(args.eval_stack, "swe-lego")
+        self.assertEqual(args.model_id, "SWE-Lego/SWE-Lego-Qwen3-8B")
+        self.assertEqual(args.served_model_name, "Qwen/Qwen3-8B")
+        self.assertEqual(args.temperature, 0.0)
+        self.assertIsNone(args.top_p)
+        self.assertIsNone(args.top_k)
+        self.assertEqual(args.max_input_tokens, 147_456)
+        self.assertEqual(args.max_output_tokens, 16_384)
+        self.assertEqual(args.vllm_max_model_len, 163_840)
+        self.assertIsNone(args.vllm_rope_scaling)
+        self.assertEqual(args.vllm_tensor_parallel_size, 8)
+        self.assertEqual(args.vllm_server_count, 1)
+        self.assertFalse(args.vllm_use_router)
+        self.assertEqual(args.vllm_max_num_seqs, 24)
+        self.assertFalse(args.native_tool_calling and not args.omit_native_tool_calling_config)
+        self.assertFalse(args.tool_call_preflight)
+        self.assertEqual(args.num_workers, 24)
+        self.assertEqual(args.swebench_cache_level, "instance")
+        self.assertEqual(args.swebench_timeout, 500)
+        self.assertEqual(args.swebench_max_workers, 10)
+
+        config = paths.config_path.read_text()
+        self.assertIn("[llm.eval_qwen3_8b]", config)
+        self.assertIn('model = "openai/Qwen/Qwen3-8B"', config)
+        self.assertIn("temperature = 0.0", config)
+        self.assertIn("max_input_tokens = 147456", config)
+        self.assertIn("max_output_tokens = 16384", config)
+        self.assertNotIn("top_p", config)
+        self.assertNotIn("top_k", config)
+        self.assertNotIn("native_tool_calling", config)
+        self.assertNotIn("tool_choice", config)
+
+        self.assertIn("--tensor-parallel-size", commands.serve_vllm)
+        self.assertIn("8", commands.serve_vllm)
+        self.assertIn("--max-model-len", commands.serve_vllm)
+        self.assertIn("163840", commands.serve_vllm)
+        self.assertIn("--max-num-seqs", commands.serve_vllm)
+        self.assertIn("24", commands.serve_vllm)
+        self.assertNotIn("--rope-scaling", commands.serve_vllm)
+        self.assertNotIn("--enable-auto-tool-choice", commands.serve_vllm)
+        self.assertIsNotNone(commands.convert_output)
+        self.assertTrue(
+            any(
+                "convert_oh_output_to_swe_json.py" in part
+                for part in commands.convert_output
+            )
+        )
+        self.assertIn("swebench.harness.run_evaluation", commands.run_eval)
+        self.assertIn("--cache_level", commands.run_eval)
+        self.assertIn("instance", commands.run_eval)
+        self.assertIn("--timeout", commands.run_eval)
+        self.assertIn("500", commands.run_eval)
 
     def test_base_native_32k_rejects_forced_128k_context(self):
         with self.assertRaisesRegex(ValueError, "base-native-32k requires"):
@@ -249,6 +321,38 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
                 "--max-input-tokens",
                 "131072",
             )
+
+    def test_eval_ids_are_passed_to_openhands_and_conflict_with_eval_limit(self):
+        args = self._args("--eval-ids", "django__django-13670,sympy__sympy-15599")
+        _paths, commands = eval_script.write_scaffold(args)
+
+        self.assertIn("--eval-ids", commands.run_infer)
+        self.assertIn("django__django-13670,sympy__sympy-15599", commands.run_infer)
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            self._args(
+                "--eval-limit",
+                "1",
+                "--eval-ids",
+                "django__django-13670",
+            )
+
+    def test_selected_id_filter_config_is_restored_after_use(self):
+        openhands_dir = Path(self.tempdir.name) / "OpenHands-filter"
+        config_dir = openhands_dir / "evaluation" / "benchmarks" / "swe_bench"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "config.toml"
+        config_path.write_text('selected_repos = ["django/django"]\n')
+
+        state = eval_script.write_swebench_filter_config(
+            openhands_dir, ["django__django-13670", "sympy__sympy-15599"]
+        )
+        self.assertIn('"django__django-13670"', config_path.read_text())
+        self.assertIn('"sympy__sympy-15599"', config_path.read_text())
+
+        eval_script.restore_swebench_filter_config(*state)
+
+        self.assertEqual(config_path.read_text(), 'selected_repos = ["django/django"]\n')
 
     def test_summarize_report_computes_pass_at_1_from_resolved_ids(self):
         report_path = Path(self.tempdir.name) / "report.json"

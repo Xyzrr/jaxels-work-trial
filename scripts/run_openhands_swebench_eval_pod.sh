@@ -15,6 +15,7 @@ Launch the canonical OpenHands SWE-bench Verified pass@1 eval from the GPU pod.
 Options:
   --config PATH           Argparse preset file. Defaults to the 7B 128k preset.
   --eval-limit N          Run N instances. Omit for the full Verified split.
+  --eval-ids IDS          Comma-separated SWE-bench instance IDs to run.
   --preflight-only        Check vLLM tool calls and Docker, then exit.
   --skip-swebench-eval    Generate patches without running SWE-bench grading.
   --output-dir PATH       Eval output directory. Defaults to a timestamped pod path.
@@ -103,6 +104,7 @@ EVAL_PYTHON_READY=0
 VLLM_PYTHON_READY=0
 
 EVAL_LIMIT=""
+EVAL_IDS=""
 PREFLIGHT_ONLY=0
 SKIP_SWEBENCH_EVAL=0
 FOREGROUND=0
@@ -122,6 +124,11 @@ while (($#)); do
     --eval-limit)
       [[ $# -ge 2 ]] || die "--eval-limit requires a value"
       EVAL_LIMIT="$2"
+      shift 2
+      ;;
+    --eval-ids)
+      [[ $# -ge 2 ]] || die "--eval-ids requires a value"
+      EVAL_IDS="$2"
       shift 2
       ;;
     --preflight-only)
@@ -170,6 +177,10 @@ while (($#)); do
   esac
 done
 
+if [[ -n "$EVAL_LIMIT" && -n "$EVAL_IDS" ]]; then
+  die "--eval-limit and --eval-ids are mutually exclusive"
+fi
+
 resolve_config_preset_path() {
   local raw="$1"
   if [[ "$raw" = /* ]]; then
@@ -210,27 +221,39 @@ args = eval_script.parse_args(
 
 values = {
     "CONFIG_PRESET_PATH": str(config_path),
+    "EVAL_STACK": args.eval_stack,
     "MODEL_ID": args.model_id,
     "SERVED_MODEL_NAME": args.served_model_name,
     "LITELLM_MODEL": args.litellm_model or "",
     "CONTEXT_MODE": args.context_mode,
     "MAX_INPUT_TOKENS": args.max_input_tokens,
+    "CONTEXT_ALLOW_LONG_MAX_MODEL_LEN": (
+        "1" if eval_script.context_mode_spec(args.context_mode).allow_long_max_model_len else "0"
+    ),
     "OPENHANDS_REPO": args.openhands_repo,
     "OPENHANDS_REF": args.openhands_ref,
-    "OPENHANDS_DIR": args.openhands_dir,
+    "OPENHANDS_DIR": eval_script.effective_openhands_dir(args),
+    "OPENHANDS_POETRY_VERSION_FROM_CONFIG": args.openhands_poetry_version,
+    "SWE_LEGO_REPO": args.swe_lego_repo,
+    "SWE_LEGO_REF": args.swe_lego_ref,
+    "SWE_LEGO_DIR": args.swe_lego_dir,
+    "SWE_LEGO_SWEBENCH_DIR": eval_script.effective_swebench_dir(args) or "",
     "DOCKER_SMOKE_IMAGE": args.docker_smoke_image,
     "VLLM_HOST": args.vllm_host,
     "VLLM_PORT": args.vllm_port,
     "VLLM_MAX_MODEL_LEN": args.vllm_max_model_len,
+    "VLLM_MAX_NUM_SEQS": args.vllm_max_num_seqs or "",
     "VLLM_ROPE_SCALING": args.vllm_rope_scaling or "",
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
-    if args.vllm_max_model_len > eval_script.QWEN_NATIVE_CONTEXT_LENGTH
+    if eval_script.context_mode_spec(args.context_mode).allow_long_max_model_len
+    and args.vllm_max_model_len > eval_script.QWEN_NATIVE_CONTEXT_LENGTH
     else "0",
     "VLLM_ENFORCE_EAGER": "1" if args.vllm_enforce_eager else "0",
     "VLLM_TENSOR_PARALLEL_SIZE": args.vllm_tensor_parallel_size,
     "VLLM_PIPELINE_PARALLEL_SIZE": args.vllm_pipeline_parallel_size,
     "VLLM_SERVER_COUNT": args.vllm_server_count,
     "VLLM_AGENT_TASKS_PER_SERVER": args.vllm_agent_tasks_per_server,
+    "VLLM_USE_ROUTER": "1" if args.vllm_use_router else "0",
     "VLLM_ROUTER_PORT": args.vllm_router_port,
     "VLLM_GPU_MEMORY_UTILIZATION": args.vllm_gpu_memory_utilization,
     "VLLM_DTYPE": args.vllm_dtype,
@@ -242,6 +265,9 @@ values = {
         args.vllm_distributed_executor_backend or ""
     ),
     "CONFIG_NUM_WORKERS": args.num_workers,
+    "SWEBENCH_CACHE_LEVEL": args.swebench_cache_level,
+    "SWEBENCH_TIMEOUT": args.swebench_timeout,
+    "SWEBENCH_MAX_WORKERS": args.swebench_max_workers,
 }
 for key, value in values.items():
     print(f"{key}={shlex.quote(str(value))}")
@@ -250,6 +276,9 @@ PY
 
 CONFIG_PRESET_PATH="$(resolve_config_preset_path "$CONFIG_PRESET")"
 eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
+if [[ -n "$OPENHANDS_POETRY_VERSION_FROM_CONFIG" ]]; then
+  OPENHANDS_EVAL_POETRY_VERSION="$OPENHANDS_POETRY_VERSION_FROM_CONFIG"
+fi
 
 if [[ "$FOREGROUND" != "1" ]]; then
   command -v tmux >/dev/null 2>&1 || die "tmux is required for supervised pod launches"
@@ -262,6 +291,9 @@ if [[ "$FOREGROUND" != "1" ]]; then
     command="cd $(quote_args "$WORKSPACE_ROOT") && SWEHERO_POD_GIT_BRANCH=$(quote_args "$SWEHERO_POD_GIT_BRANCH") $(quote_args "$script_path") --foreground"
     if [[ -n "$EVAL_LIMIT" ]]; then
       command+=" --eval-limit $(quote_args "$EVAL_LIMIT")"
+    fi
+    if [[ -n "$EVAL_IDS" ]]; then
+      command+=" --eval-ids $(quote_args "$EVAL_IDS")"
     fi
     if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
       command+=" --preflight-only"
@@ -527,8 +559,16 @@ export UV_PYTHON_INSTALL_DIR
 PINNED_UV_BIN="$(ensure_uv)"
 VISIBLE_GPU_COUNT="$(nvidia-smi --list-gpus | wc -l | tr -d ' ')"
 (( VISIBLE_GPU_COUNT >= REQUIRED_GPU_COUNT )) || die "expected at least ${REQUIRED_GPU_COUNT} visible GPUs, found ${VISIBLE_GPU_COUNT}"
-(( VLLM_SERVER_COUNT <= VISIBLE_GPU_COUNT )) || die "vLLM server count exceeds visible GPUs: ${VLLM_SERVER_COUNT} > ${VISIBLE_GPU_COUNT}"
-(( VLLM_TENSOR_PARALLEL_SIZE == 1 && VLLM_PIPELINE_PARALLEL_SIZE == 1 )) || die "canonical pod eval uses one vLLM per GPU; keep VLLM_TENSOR_PARALLEL_SIZE=1 and VLLM_PIPELINE_PARALLEL_SIZE=1"
+VLLM_PARALLEL_GPU_COUNT=$((VLLM_TENSOR_PARALLEL_SIZE * VLLM_PIPELINE_PARALLEL_SIZE))
+if [[ "$VLLM_SERVER_COUNT" -eq 1 ]]; then
+  (( VLLM_PARALLEL_GPU_COUNT <= VISIBLE_GPU_COUNT )) || die "vLLM parallel size exceeds visible GPUs: ${VLLM_PARALLEL_GPU_COUNT} > ${VISIBLE_GPU_COUNT}"
+else
+  (( VLLM_SERVER_COUNT <= VISIBLE_GPU_COUNT )) || die "vLLM server count exceeds visible GPUs: ${VLLM_SERVER_COUNT} > ${VISIBLE_GPU_COUNT}"
+  (( VLLM_TENSOR_PARALLEL_SIZE == 1 && VLLM_PIPELINE_PARALLEL_SIZE == 1 )) || die "multi-replica pod eval uses one vLLM process per GPU; keep VLLM_TENSOR_PARALLEL_SIZE=1 and VLLM_PIPELINE_PARALLEL_SIZE=1 when VLLM_SERVER_COUNT>1"
+fi
+if [[ "$VLLM_USE_ROUTER" != "1" && "$VLLM_USE_ROUTER" != "true" && "$VLLM_SERVER_COUNT" -ne 1 ]]; then
+  die "direct vLLM base URL without router requires VLLM_SERVER_COUNT=1"
+fi
 if [[ -n "$VLLM_VISIBLE_DEVICES" && "$VLLM_VISIBLE_DEVICES" != "all" && "$VLLM_SERVER_COUNT" -ne 1 ]]; then
   die "VLLM_VISIBLE_DEVICES/VLLM_GPU override is only supported with VLLM_SERVER_COUNT=1"
 fi
@@ -553,6 +593,21 @@ ensure_docker() {
 }
 
 ensure_openhands_checkout() {
+  if [[ "$EVAL_STACK" == "swe-lego" ]]; then
+    if [[ ! -d "$SWE_LEGO_DIR/.git" ]]; then
+      mkdir -p "$(dirname "$SWE_LEGO_DIR")"
+      git clone "$SWE_LEGO_REPO" "$SWE_LEGO_DIR"
+    fi
+    if [[ -n "$(git -C "$SWE_LEGO_DIR" status --porcelain)" ]]; then
+      die "$SWE_LEGO_DIR has local changes; clean it before launching eval"
+    fi
+    git -C "$SWE_LEGO_DIR" fetch --depth 1 origin "$SWE_LEGO_REF"
+    git -C "$SWE_LEGO_DIR" checkout --detach "$SWE_LEGO_REF"
+    [[ -d "$OPENHANDS_DIR" ]] || die "SWE-Lego OpenHands directory missing: $OPENHANDS_DIR"
+    [[ -d "$SWE_LEGO_SWEBENCH_DIR" ]] || die "SWE-Lego SWE-bench directory missing: $SWE_LEGO_SWEBENCH_DIR"
+    return
+  fi
+
   if [[ ! -d "$OPENHANDS_DIR/.git" ]]; then
     mkdir -p "$(dirname "$OPENHANDS_DIR")"
     git clone --branch "$OPENHANDS_REF" --depth 1 "$OPENHANDS_REPO" "$OPENHANDS_DIR"
@@ -567,6 +622,12 @@ ensure_openhands_checkout() {
 ensure_openhands_dependencies() {
   ensure_openhands_checkout
   poetry_install_openhands_dependencies
+  if [[ "$EVAL_STACK" == "swe-lego" ]]; then
+    "$PINNED_UV_BIN" pip install \
+      --python "$EVAL_VENV/bin/python" \
+      -e "$SWE_LEGO_SWEBENCH_DIR"
+    "$PINNED_UV_BIN" pip check --python "$EVAL_VENV/bin/python"
+  fi
 }
 
 pod_ip() {
@@ -588,9 +649,12 @@ MODEL_ID=$MODEL_ID
 SERVED_MODEL_NAME=$SERVED_MODEL_NAME
 MAX_INPUT_TOKENS=$MAX_INPUT_TOKENS
 VLLM_MAX_MODEL_LEN=$VLLM_MAX_MODEL_LEN
+VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS
 VLLM_ROPE_SCALING=$VLLM_ROPE_SCALING
 VLLM_DTYPE=$VLLM_DTYPE
 VLLM_GPU_MEMORY_UTILIZATION=$VLLM_GPU_MEMORY_UTILIZATION
+VLLM_TENSOR_PARALLEL_SIZE=$VLLM_TENSOR_PARALLEL_SIZE
+VLLM_PIPELINE_PARALLEL_SIZE=$VLLM_PIPELINE_PARALLEL_SIZE
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND=$VLLM_DISTRIBUTED_EXECUTOR_BACKEND
 VLLM_ENFORCE_EAGER=$VLLM_ENFORCE_EAGER
 VLLM_ENABLE_AUTO_TOOL_CHOICE=$VLLM_ENABLE_AUTO_TOOL_CHOICE
@@ -637,6 +701,7 @@ ensure_vllm_server() {
   local cuda_visible_arg=()
   local vllm_long_context_env=()
   local vllm_rope_arg=()
+  local vllm_max_num_seqs_arg=()
   local vllm_tool_args=()
   if [[ "$VLLM_ENFORCE_EAGER" == "1" || "$VLLM_ENFORCE_EAGER" == "true" ]]; then
     vllm_eager_arg=(--enforce-eager)
@@ -646,6 +711,16 @@ ensure_vllm_server() {
   fi
   if [[ -n "$VLLM_VISIBLE_DEVICES" && "$VLLM_VISIBLE_DEVICES" != "all" ]]; then
     cuda_visible_arg=(CUDA_VISIBLE_DEVICES="$VLLM_VISIBLE_DEVICES")
+  elif [[ "$VLLM_SERVER_COUNT" -eq 1 && "$VLLM_PARALLEL_GPU_COUNT" -gt 1 ]]; then
+    local visible_devices=""
+    local i
+    for i in $(seq 0 $((VLLM_PARALLEL_GPU_COUNT - 1))); do
+      if [[ -n "$visible_devices" ]]; then
+        visible_devices+=","
+      fi
+      visible_devices+="$i"
+    done
+    cuda_visible_arg=(CUDA_VISIBLE_DEVICES="$visible_devices")
   else
     cuda_visible_arg=(CUDA_VISIBLE_DEVICES="$gpu")
   fi
@@ -655,6 +730,9 @@ ensure_vllm_server() {
   if [[ -n "$VLLM_ROPE_SCALING" ]]; then
     vllm_rope_arg=(--rope-scaling "$VLLM_ROPE_SCALING")
   fi
+  if [[ -n "$VLLM_MAX_NUM_SEQS" ]]; then
+    vllm_max_num_seqs_arg=(--max-num-seqs "$VLLM_MAX_NUM_SEQS")
+  fi
   if [[ "$VLLM_ENABLE_AUTO_TOOL_CHOICE" == "1" || "$VLLM_ENABLE_AUTO_TOOL_CHOICE" == "true" ]]; then
     vllm_tool_args=(--enable-auto-tool-choice)
     if [[ -n "$VLLM_TOOL_CALL_PARSER" ]]; then
@@ -662,7 +740,7 @@ ensure_vllm_server() {
     fi
   fi
   tmux new-session -d -s "$session" \
-    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") $(quote_args "${vllm_long_context_env[@]}") $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host $(quote_args "$VLLM_HOST") --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len $(quote_args "$VLLM_MAX_MODEL_LEN") $(quote_args "${vllm_rope_arg[@]}") --tensor-parallel-size $(quote_args "$VLLM_TENSOR_PARALLEL_SIZE") --pipeline-parallel-size $(quote_args "$VLLM_PIPELINE_PARALLEL_SIZE") --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") $(quote_args "${vllm_tool_args[@]}") $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
+    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") $(quote_args "${vllm_long_context_env[@]}") $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host $(quote_args "$VLLM_HOST") --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len $(quote_args "$VLLM_MAX_MODEL_LEN") $(quote_args "${vllm_rope_arg[@]}") --tensor-parallel-size $(quote_args "$VLLM_TENSOR_PARALLEL_SIZE") --pipeline-parallel-size $(quote_args "$VLLM_PIPELINE_PARALLEL_SIZE") $(quote_args "${vllm_max_num_seqs_arg[@]}") --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") $(quote_args "${vllm_tool_args[@]}") $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
 
   for _ in $(seq 1 240); do
     if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1; then
@@ -738,7 +816,9 @@ ensure_vllm_stack() {
     ensure_vllm_server "$ip" "$gpu" "$port" "$session"
     backend_args+=(--backend "http://${ip}:${port}/v1")
   done
-  ensure_vllm_router "$ip" "${backend_args[@]}"
+  if [[ "$VLLM_USE_ROUTER" == "1" || "$VLLM_USE_ROUTER" == "true" ]]; then
+    ensure_vllm_router "$ip" "${backend_args[@]}"
+  fi
 }
 
 ensure_docker
@@ -747,8 +827,22 @@ POD_IP="${POD_IP:-$(pod_ip)}"
 ensure_vllm_stack "$POD_IP"
 
 TOTAL_AGENT_WORKERS=$((VLLM_SERVER_COUNT * VLLM_AGENT_TASKS_PER_SERVER))
+if [[ "$VLLM_USE_ROUTER" == "1" || "$VLLM_USE_ROUTER" == "true" ]]; then
+  LLM_BASE_URL="http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"
+else
+  LLM_BASE_URL="http://${POD_IP}:${VLLM_PORT}/v1"
+fi
 if [[ -n "$EVAL_LIMIT" && "$EVAL_LIMIT" -gt 0 && "$EVAL_LIMIT" -lt "$TOTAL_AGENT_WORKERS" ]]; then
   EVAL_NUM_WORKERS="$EVAL_LIMIT"
+elif [[ -n "$EVAL_IDS" ]]; then
+  EVAL_ID_COUNT="$(tr ',' '\n' <<<"$EVAL_IDS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+  if [[ "$EVAL_ID_COUNT" -gt 0 && "$EVAL_ID_COUNT" -lt "$TOTAL_AGENT_WORKERS" ]]; then
+    EVAL_NUM_WORKERS="$EVAL_ID_COUNT"
+  elif [[ "$CONFIG_NUM_WORKERS" -gt 0 ]]; then
+    EVAL_NUM_WORKERS="$CONFIG_NUM_WORKERS"
+  else
+    EVAL_NUM_WORKERS="$TOTAL_AGENT_WORKERS"
+  fi
 elif [[ "$CONFIG_NUM_WORKERS" -gt 0 ]]; then
   EVAL_NUM_WORKERS="$CONFIG_NUM_WORKERS"
 else
@@ -757,7 +851,7 @@ fi
 
 eval_args=(
   "@$CONFIG_PRESET_PATH"
-  --base-url "http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"
+  --base-url "$LLM_BASE_URL"
   --output-dir "$OUTPUT_DIR"
   --openhands-dir "$OPENHANDS_DIR"
   --openhands-ref "$OPENHANDS_REF"
@@ -766,6 +860,9 @@ eval_args=(
 
 if [[ -n "$EVAL_LIMIT" ]]; then
   eval_args+=(--eval-limit "$EVAL_LIMIT")
+fi
+if [[ -n "$EVAL_IDS" ]]; then
+  eval_args+=(--eval-ids "$EVAL_IDS")
 fi
 if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
   eval_args+=(--preflight-only)

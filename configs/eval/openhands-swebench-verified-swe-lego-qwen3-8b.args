@@ -1,0 +1,54 @@
+# SWE-Lego-Qwen3-8B pass@1 reproduction preset.
+# This uses the SWE-Lego repo's vendored OpenHands-0.53.0 and SWE-bench-4.0.4
+# stack, plus its single 8-way tensor-parallel vLLM serving contract.
+
+--eval-stack swe-lego
+--model-id SWE-Lego/SWE-Lego-Qwen3-8B
+--served-model-name Qwen/Qwen3-8B
+--litellm-model openai/Qwen/Qwen3-8B
+--context-mode swe-lego-qwen3-160k
+--temperature 0.0
+--top-p none
+--top-k none
+--max-output-tokens 16384
+--dataset princeton-nlp/SWE-bench_Verified
+--split test
+--agent CodeActAgent
+--max-iterations 100
+--num-workers 24
+--eval-note swe-lego-qwen3-8b-pass1
+--model-config-name llm.eval_qwen3_8b
+--agent-config-name agent.swe_lego_openhands
+--runtime docker
+--omit-native-tool-calling-config
+--no-tool-call-preflight
+--no-enable-plan-mode
+--no-use-hint-text
+--no-add-in-context-learning-example
+--instruction-template-name swe_default.j2
+
+--swe-lego-repo https://github.com/SWE-Lego/SWE-Lego.git
+--swe-lego-ref 94704b69aac886e003660e1e0f69f7de163b284e
+--swe-lego-dir /workspace/eval-runs/SWE-Lego
+--openhands-poetry-version 2.1.4
+
+--vllm-host 0.0.0.0
+--vllm-port 8000
+--vllm-tensor-parallel-size 8
+--vllm-pipeline-parallel-size 1
+--vllm-server-count 1
+--vllm-agent-tasks-per-server 24
+--no-vllm-use-router
+--vllm-max-model-len 163840
+--vllm-rope-scaling none
+--vllm-max-num-seqs 24
+--vllm-gpu-memory-utilization 0.90
+--vllm-dtype bfloat16
+--no-vllm-enable-auto-tool-choice
+--vllm-distributed-executor-backend none
+--no-vllm-enforce-eager
+
+--swebench-cache-level instance
+--swebench-timeout 500
+--swebench-max-workers 10
+--swebench-run-id openhands
