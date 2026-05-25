@@ -10,9 +10,26 @@ The canonical pod runtime is:
 cd /workspace/jaxels-work-trial
 export SWEHERO_POD_GIT_BRANCH=your-local-branch
 scripts/run_qwen_swehero_torchtitan_pod.sh \
+  @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-torchtitan \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
 ```
+
+The `@configs/training/qwen25-coder-7b-direct-to-hero.args` file is the
+canonical experiment preset for the Qwen2.5-Coder-7B direct-to-hero run. It
+contains the paper-aligned model, dataset, context, optimizer, bucket, CP,
+checkpoint, and launch settings that used to be implicit defaults in the
+launcher. The Python entrypoint still prepends this preset when no `@...` file
+is supplied for backward-compatible direct invocations, but new commands should
+name the preset explicitly.
+
+For a different training experiment, copy that preset, edit the copied file,
+and swap the `@...` argument. Use CLI flags after the preset for one-off
+overrides; later flags win through normal argparse ordering. Keep secrets and
+pod/runtime plumbing as environment only: `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
+`WANDB_API_KEY`, `SWEHERO_POD_GIT_BRANCH`, `TORCHTITAN_POD_VENV`,
+`TORCHTITAN_POD_SUPERVISOR`, and tmux-related controls are not experiment
+settings and do not belong in presets.
 
 The launcher runs `scripts/setup_torchtitan_pod_venv.sh` itself before the
 training entrypoint starts. On a fresh pod it creates the canonical venv; on a
@@ -42,15 +59,21 @@ tmux attach-session -t swehero-qwen25-coder7b-swehero-torchtitan
 
 # Override the derived session name for a launch.
 SWEHERO_POD_TMUX_SESSION=swehero-7b-prod \
-  scripts/run_qwen_swehero_torchtitan_pod.sh --production-mode --enable-wandb
+  scripts/run_qwen_swehero_torchtitan_pod.sh \
+    @configs/training/qwen25-coder-7b-direct-to-hero.args \
+    --production-mode --enable-wandb
 
 # Force a supervised detached launch from a non-interactive exec.
 SWEHERO_POD_SUPERVISOR=1 SWEHERO_POD_TMUX_ATTACH=0 \
-  scripts/run_qwen_swehero_torchtitan_pod.sh --production-mode --enable-wandb
+  scripts/run_qwen_swehero_torchtitan_pod.sh \
+    @configs/training/qwen25-coder-7b-direct-to-hero.args \
+    --production-mode --enable-wandb
 
 # Bypass tmux intentionally for non-interactive automation.
 SWEHERO_POD_SUPERVISOR=0 \
-  scripts/run_qwen_swehero_torchtitan_pod.sh --dry-run
+  scripts/run_qwen_swehero_torchtitan_pod.sh \
+    @configs/training/qwen25-coder-7b-direct-to-hero.args \
+    --dry-run
 ```
 
 The host and container workspace root are both `/workspace`. The pod manifest
@@ -111,6 +134,7 @@ KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
     env SWEHERO_POD_GIT_BRANCH="$branch" bash -lc '
 cd /workspace/jaxels-work-trial
 scripts/run_qwen_swehero_torchtitan_pod.sh \
+  @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --production-mode \
   --enable-wandb
 '
@@ -133,7 +157,7 @@ The persisted uv-managed venv under `/workspace/venvs/torchtitan-swehero-cu128`
 has a valid interpreter after every pod recreation without relying on
 apt-managed Python.
 
-The launcher pins the base checkpoint to
+The training preset pins the base checkpoint to
 `Qwen/Qwen2.5-Coder-7B-Instruct@c03e6d358207e414f1eca0bb1891e29f1db0e242`.
 That revision is passed to Hugging Face asset downloads, recorded in the data
 manifest and run spec, and checked during preflight before launch.
@@ -143,14 +167,14 @@ Production launches require the canonical workspace root
 script root, and their resolved physical paths in `run_spec.json`,
 `resume_contract.json`, `launcher_plan.json`, and `runtime_metadata.json`.
 `launcher_plan.json` and `runtime_metadata.json` also record the current working
-directory for debugging. Override `--workspace-root` or `WORKSPACE_ROOT` only
-for non-production local tests; `--production-mode` rejects any root other than
-the canonical pod path.
+directory for debugging. Override `--workspace-root` only for non-production
+local tests; `--production-mode` rejects any root other than the canonical pod
+path.
 
 Do not launch this job with bare `python`, bare `torchrun`, or
 `/workspace/venv`. The run wrapper creates or repairs the canonical venv first,
-prepends that venv to `PATH`, and points `TORCHRUN_BIN` at the venv's
-`torchrun`.
+prepends that venv to `PATH`, and launches the training entrypoint with the
+venv's Python so `torchrun` is resolved from the same runtime.
 
 ## Locked Runtime
 
@@ -312,6 +336,7 @@ not be used for the paper-aligned run.
 ```bash
 cd /workspace/jaxels-work-trial
 scripts/run_qwen_swehero_torchtitan_pod.sh \
+  @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-all-bucket-cp-smoke \
   --overwrite-output \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \
@@ -471,9 +496,9 @@ The currently explicit controls are:
 --torch-nccl-async-error-handling 1
 ```
 
-These defaults match the existing direct-to-hero TorchTitan config path. Change
-them only for an intentional experiment or debugging run; otherwise leave the
-launcher defaults in place.
+These preset values match the existing direct-to-hero TorchTitan config path.
+Change them only in a copied preset or through an explicit one-off CLI override
+for an intentional experiment or debugging run.
 
 With `--validate-first-step-checkpoint` enabled, TorchTitan writes a full DCP
 checkpoint at optimizer step 1, validates its metadata and payload files before
@@ -512,6 +537,7 @@ To collect TorchTitan profiler traces during a short soak, add flags such as:
 ```bash
 cd /workspace/jaxels-work-trial
 scripts/run_qwen_swehero_torchtitan_pod.sh \
+  @configs/training/qwen25-coder-7b-direct-to-hero.args \
   --out-dir /workspace/qwen25-coder7b-swehero-profiler-soak \
   --overwrite-output \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct \

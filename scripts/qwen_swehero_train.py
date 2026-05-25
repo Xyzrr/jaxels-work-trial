@@ -66,6 +66,11 @@ DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-torchtitan")
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
 DEFAULT_DATASET_PATH = Path("/workspace/datasets") / TRAINING_DATASET_NAME
 CANONICAL_WORKSPACE_ROOT = Path("/workspace/jaxels-work-trial")
+DEFAULT_ENV_FILE = "/workspace/.env"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TRAINING_PRESET = (
+    REPO_ROOT / "configs" / "training" / "qwen25-coder-7b-direct-to-hero.args"
+)
 DEFAULT_NUM_EXAMPLES = 0
 DEFAULT_MAX_STREAMED_EXAMPLES = 0
 DEFAULT_BUCKETS = (32_768, 65_536, PAPER_CONTEXT_LENGTH)
@@ -474,67 +479,6 @@ class SignalTerminationError(RuntimeError):
         super().__init__(message)
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(
-        f"{name} must be a boolean env value "
-        "(one of 1/0, true/false, yes/no, on/off)"
-    )
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer; got {raw!r}") from exc
-
-
-def _env_optional_int(name: str) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return None
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer; got {raw!r}") from exc
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a finite float; got {raw!r}") from exc
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite; got {raw!r}")
-    return value
-
-
-def _env_path(name: str, default: Path) -> Path:
-    raw = os.environ.get(name)
-    return default if raw is None else Path(raw)
-
-
-def _env_first(*names: str, default: str | None = None) -> str | None:
-    for name in names:
-        raw = os.environ.get(name)
-        if raw is not None:
-            return raw
-    return default
-
-
 def _default_torchrun_bin() -> str:
     candidate = Path(sys.executable).with_name("torchrun")
     if candidate.exists():
@@ -550,8 +494,44 @@ class LaunchArgumentParser(argparse.ArgumentParser):
         return shlex.split(stripped)
 
 
+def _argv_with_default_preset(
+    argv: list[str] | None,
+    *,
+    default_preset: Path = DEFAULT_TRAINING_PRESET,
+) -> list[str]:
+    values = list(sys.argv[1:] if argv is None else argv)
+    if any(value.startswith("@") for value in values):
+        return values
+    return [f"@{default_preset}", *values]
+
+
+def _expand_argfiles_for_scan(argv: list[str]) -> list[str]:
+    expanded: list[str] = []
+
+    def expand(value: str) -> None:
+        if not value.startswith("@"):
+            expanded.append(value)
+            return
+        path = Path(value[1:])
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        if not path.is_file():
+            expanded.append(value)
+            return
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            for part in shlex.split(stripped):
+                expand(part)
+
+    for value in argv:
+        expand(value)
+    return expanded
+
+
 def _argv_for_env_file_scan(argv: list[str] | None) -> list[str]:
-    return list(sys.argv[1:] if argv is None else argv)
+    return _expand_argfiles_for_scan(_argv_with_default_preset(argv))
 
 
 def _env_file_from_argv(argv: list[str] | None) -> tuple[str, bool]:
@@ -563,12 +543,7 @@ def _env_file_from_argv(argv: list[str] | None) -> tuple[str, bool]:
             raise ValueError("--env-file cannot be empty")
         return namespace.env_file, True
 
-    env_file = os.environ.get("ENV_FILE")
-    if env_file is not None:
-        if not env_file.strip():
-            raise ValueError("ENV_FILE cannot be empty")
-        return env_file, True
-    return smoke.ENV_FILE, False
+    return DEFAULT_ENV_FILE, False
 
 
 def load_launch_env_file(argv: list[str] | None = None) -> str:
@@ -778,11 +753,6 @@ def _detected_workspace_root() -> Path:
 
 
 def _default_workspace_root() -> Path:
-    configured = os.environ.get("WORKSPACE_ROOT") or os.environ.get(
-        "SWEHERO_WORKSPACE_ROOT"
-    )
-    if configured:
-        return _absolute_without_symlink_resolution(Path(configured))
     return _detected_workspace_root()
 
 
@@ -2040,43 +2010,26 @@ def parse_args(
     *,
     env_file_default: str | None = None,
 ) -> argparse.Namespace:
-    env_file_default = (
-        os.environ.get("ENV_FILE", smoke.ENV_FILE)
-        if env_file_default is None
-        else env_file_default
-    )
+    argv = _argv_with_default_preset(argv)
+    env_file_default = DEFAULT_ENV_FILE if env_file_default is None else env_file_default
     parser = LaunchArgumentParser(
         description="Materialize bucketed SWE-HERO training data and launch TorchTitan.",
         fromfile_prefix_chars="@",
     )
-    parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", MODEL_ID))
+    parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument(
         "--model-revision",
-        default=(
-            os.environ.get("MODEL_REVISION")
-            or os.environ.get("HF_MODEL_REVISION")
-            or MODEL_REVISION
-        ),
+        default=MODEL_REVISION,
         help=(
             "Pinned Hugging Face model commit SHA. This production 7B launcher "
             f"requires {MODEL_ID}@{MODEL_REVISION} so asset downloads cannot float."
         ),
     )
-    parser.add_argument(
-        "--dataset-id", default=os.environ.get("DATASET_ID", DATASET_ID)
-    )
-    parser.add_argument(
-        "--dataset-revision",
-        default=os.environ.get("DATASET_REVISION"),
-        help=(
-            "Deprecated alias for --source-dataset-revision. Kept so older "
-            "pod commands still pin the same source revision."
-        ),
-    )
+    parser.add_argument("--dataset-id", default=DATASET_ID)
     parser.add_argument(
         "--dataset-path",
         type=Path,
-        default=_env_path("DATASET_PATH", DEFAULT_DATASET_PATH),
+        default=DEFAULT_DATASET_PATH,
         help=(
             "Local one-rollout SWE-Hero dataset artifact. On pods this defaults "
             "to /workspace/datasets/... and is built automatically when missing."
@@ -2084,48 +2037,42 @@ def parse_args(
     )
     parser.add_argument(
         "--source-dataset-id",
-        default=os.environ.get("SOURCE_DATASET_ID", SOURCE_DATASET_ID),
+        default=SOURCE_DATASET_ID,
         help="Public source dataset used to build --dataset-path when missing.",
     )
     parser.add_argument(
         "--source-dataset-revision",
-        default=(
-            os.environ.get("SOURCE_DATASET_REVISION")
-            or os.environ.get("DATASET_REVISION")
-            or SOURCE_DATASET_REVISION
-        ),
+        default=SOURCE_DATASET_REVISION,
         help="Pinned source dataset revision used to build --dataset-path.",
     )
     parser.add_argument(
         "--build-dataset-if-missing",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("BUILD_DATASET_IF_MISSING", True),
+        default=True,
         help="Build --dataset-path from the pinned source dataset when it is absent.",
     )
     parser.add_argument(
         "--rebuild-source-dataset",
         action="store_true",
-        default=_env_flag("REBUILD_SOURCE_DATASET", False),
+        default=False,
         help="Rebuild --dataset-path from the pinned source dataset before tokenizing.",
     )
     parser.add_argument(
         "--source-dataset-rows-per-shard",
         type=int,
-        default=_env_int(
-            "SOURCE_DATASET_ROWS_PER_SHARD", one_rollout.DEFAULT_ROWS_PER_SHARD
-        ),
+        default=one_rollout.DEFAULT_ROWS_PER_SHARD,
         help="Rows per Parquet shard when building --dataset-path.",
     )
     parser.add_argument(
         "--source-dataset-build-batch-size",
         type=int,
-        default=_env_int("SOURCE_DATASET_BUILD_BATCH_SIZE", 64),
+        default=64,
         help="Parquet read batch size when building --dataset-path.",
     )
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=_env_path("OUT_DIR", DEFAULT_OUT_DIR),
+        default=DEFAULT_OUT_DIR,
         help="Run folder on the pod. Bucket JSONL, manifests, and checkpoints live here.",
     )
     parser.add_argument(
@@ -2140,63 +2087,57 @@ def parse_args(
     parser.add_argument(
         "--hf-assets-path",
         type=Path,
-        default=_env_path("HF_ASSETS_PATH", DEFAULT_HF_ASSETS_PATH),
+        default=DEFAULT_HF_ASSETS_PATH,
         help="Local directory containing Qwen tokenizer/config/safetensors assets.",
     )
     parser.add_argument(
         "--env-file",
         default=env_file_default,
         help=(
-            "Optional dotenv-style file loaded before argument defaults are "
-            "resolved. CLI flags override process env, and process env overrides "
-            "values in this file."
+            "Optional dotenv-style file for secrets such as HF_TOKEN or "
+            "WANDB_API_KEY. Experiment settings belong in argparse preset files."
         ),
     )
     parser.add_argument(
         "--download-hf-assets",
         action="store_true",
-        default=_env_flag("DOWNLOAD_HF_ASSETS", False),
+        default=False,
         help="Download tokenizer/config/safetensors into --hf-assets-path parent first.",
-    )
-    parser.add_argument(
-        "--hf-token",
-        default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
-        help="Optional Hugging Face token for asset download.",
     )
     parser.add_argument(
         "--num-examples",
         type=int,
-        default=_env_int("NUM_EXAMPLES", DEFAULT_NUM_EXAMPLES),
+        default=DEFAULT_NUM_EXAMPLES,
         help="Usable examples to keep. Defaults to 0, meaning all examples.",
     )
     parser.add_argument(
         "--max-streamed-examples",
         type=int,
-        default=_env_int("MAX_STREAMED_EXAMPLES", DEFAULT_MAX_STREAMED_EXAMPLES),
+        default=DEFAULT_MAX_STREAMED_EXAMPLES,
         help="Maximum raw streamed rows to inspect while finding usable examples.",
     )
     parser.add_argument(
         "--shuffle-buffer",
         type=int,
-        default=_env_int("SHUFFLE_BUFFER", 2_048),
+        default=2_048,
         help="Streaming shuffle buffer. Set 0 to keep HF order.",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=_env_int("SEED", 17),
+        default=17,
         help="Dataset shuffle and TorchTitan seed.",
     )
     parser.add_argument(
         "--max-length",
         type=int,
-        default=_env_int("MAX_LENGTH", PAPER_CONTEXT_LENGTH),
+        default=PAPER_CONTEXT_LENGTH,
         help="Maximum shifted input length. Defaults to the paper 128k context.",
     )
     parser.add_argument(
         "--long-example-policy",
         choices=("error", "skip"),
-        default=os.environ.get("LONG_EXAMPLE_POLICY", DEFAULT_LONG_EXAMPLE_POLICY),
+        default=DEFAULT_LONG_EXAMPLE_POLICY,
         help=(
             "How to handle examples whose shifted input length exceeds "
             "--max-length. The production default is error so over-context "
@@ -2206,7 +2147,7 @@ def parse_args(
     parser.add_argument(
         "--smoke-synthetic-buckets",
         action="store_true",
-        default=_env_flag("SMOKE_SYNTHETIC_BUCKETS", False),
+        default=False,
         help=(
             "Smoke-only mode: materialize synthetic tokenized records so every "
             "configured bucket/CP stage is non-empty. Do not use for a real "
@@ -2216,23 +2157,19 @@ def parse_args(
     parser.add_argument(
         "--smoke-synthetic-examples-per-bucket",
         type=int,
-        default=_env_int("SMOKE_SYNTHETIC_EXAMPLES_PER_BUCKET", 1),
+        default=1,
         help=(
             "Synthetic records per bucket when --smoke-synthetic-buckets is set."
         ),
     )
     parser.add_argument(
         "--buckets",
-        default=os.environ.get(
-            "SWEHERO_BUCKETS", ",".join(str(b) for b in DEFAULT_BUCKETS)
-        ),
+        default=",".join(str(b) for b in DEFAULT_BUCKETS),
         help="Comma-separated sequence buckets.",
     )
     parser.add_argument(
         "--bucket-curriculum",
-        default=os.environ.get(
-            "SWEHERO_BUCKET_CURRICULUM", DEFAULT_BUCKET_CURRICULUM
-        ),
+        default=DEFAULT_BUCKET_CURRICULUM,
         choices=BUCKET_CURRICULUM_CHOICES,
         help=(
             "Order non-empty bucket stages. short-to-long preserves the "
@@ -2242,80 +2179,78 @@ def parse_args(
     )
     parser.add_argument(
         "--bucket-cp",
-        default=os.environ.get(
-            "SWEHERO_BUCKET_CP", _format_bucket_cp_map(DEFAULT_BUCKET_CP)
-        ),
+        default=_format_bucket_cp_map(DEFAULT_BUCKET_CP),
         help="Comma-separated '<bucket>:<context-parallel-degree>' entries.",
     )
     parser.add_argument(
         "--min-trainable-tokens",
         type=int,
-        default=_env_int("MIN_TRAINABLE_TOKENS", DEFAULT_MIN_TRAINABLE_TOKENS),
+        default=DEFAULT_MIN_TRAINABLE_TOKENS,
         help="Drop examples with fewer trainable shifted labels than this.",
     )
     parser.add_argument(
         "--include-model-patch",
         action="store_true",
-        default=_env_flag("INCLUDE_MODEL_PATCH", DEFAULT_INCLUDE_MODEL_PATCH),
+        default=DEFAULT_INCLUDE_MODEL_PATCH,
         help="Also train on the model_patch field when present.",
     )
     parser.add_argument(
         "--num-train-epochs",
         type=float,
-        default=_env_float("NUM_TRAIN_EPOCHS", DEFAULT_NUM_TRAIN_EPOCHS),
+        default=DEFAULT_NUM_TRAIN_EPOCHS,
         help="SFT epochs over the materialized subset. Paper uses up to 3.",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=_env_int("MAX_STEPS", DEFAULT_MAX_STEPS),
+        default=DEFAULT_MAX_STEPS,
         help="Optional total optimizer-step cap across all bucket stages.",
     )
     parser.add_argument(
         "--global-batch-size",
         type=int,
-        default=_env_int("GLOBAL_BATCH_SIZE", DEFAULT_GLOBAL_BATCH_SIZE),
+        default=DEFAULT_GLOBAL_BATCH_SIZE,
         help="Paper global batch size is 32.",
     )
     parser.add_argument(
         "--local-batch-size",
         type=int,
-        default=_env_int("LOCAL_BATCH_SIZE", DEFAULT_LOCAL_BATCH_SIZE),
+        default=DEFAULT_LOCAL_BATCH_SIZE,
         help="TorchTitan local microbatch size per data-parallel rank.",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=_env_float("LEARNING_RATE", DEFAULT_LEARNING_RATE),
+        default=DEFAULT_LEARNING_RATE,
         help="Peak AdamW learning rate. Paper uses 1e-5.",
     )
     parser.add_argument(
         "--min-learning-rate",
         type=float,
-        default=_env_float("MIN_LEARNING_RATE", DEFAULT_MIN_LEARNING_RATE),
+        default=DEFAULT_MIN_LEARNING_RATE,
         help="Cosine floor learning rate. Paper uses 1e-8.",
     )
     parser.add_argument(
         "--warmup-ratio",
         type=float,
-        default=_env_float("WARMUP_RATIO", DEFAULT_WARMUP_RATIO),
+        default=DEFAULT_WARMUP_RATIO,
         help="Warmup ratio. Paper uses 0.1.",
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=_env_float("WEIGHT_DECAY", DEFAULT_WEIGHT_DECAY),
+        default=DEFAULT_WEIGHT_DECAY,
         help="AdamW weight decay. The paper does not report this.",
     )
     parser.add_argument(
         "--max-grad-norm",
         type=float,
-        default=_env_float("MAX_GRAD_NORM", 1.0),
+        default=1.0,
     )
     parser.add_argument(
         "--optimizer-impl",
         choices=OPTIMIZER_IMPL_CHOICES,
-        default=os.environ.get("SWEHERO_OPTIMIZER_IMPL", "foreach"),
+        default="foreach",
         help=(
             "TorchTitan AdamW implementation. This used to be an implicit "
             "SWEHERO_OPTIMIZER_IMPL environment input; it is now part of the "
@@ -2325,30 +2260,30 @@ def parse_args(
     parser.add_argument(
         "--attention-backend",
         choices=("sdpa", "flex", "flex_flash", "varlen"),
-        default=os.environ.get("ATTENTION_BACKEND", "sdpa"),
+        default="sdpa",
         help="Use sdpa/flex/flex_flash for CP. Varlen is allowed only when CP=1.",
     )
     parser.add_argument(
         "--enable-fp8",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("ENABLE_FP8", True),
+        default=True,
         help="Use TorchTitan float8 linear training where safe and supported.",
     )
     parser.add_argument(
         "--fp8-recipe",
         choices=("rowwise", "rowwise_with_gw_hp"),
-        default=os.environ.get("FP8_RECIPE", "rowwise"),
+        default="rowwise",
     )
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("COMPILE", True),
+        default=True,
         help="Torch compile model/loss. Keep enabled for FP8 performance.",
     )
     parser.add_argument(
         "--training-dtype",
         choices=TORCH_DTYPE_CHOICES,
-        default=os.environ.get("SWEHERO_TRAINING_DTYPE", "float32"),
+        default="float32",
         help=(
             "TorchTitan training dtype. Defaults to the current direct-to-hero "
             "config value and is exported as SWEHERO_TRAINING_DTYPE."
@@ -2357,19 +2292,19 @@ def parse_args(
     parser.add_argument(
         "--mixed-precision-param-dtype",
         choices=TORCH_DTYPE_CHOICES,
-        default=os.environ.get("SWEHERO_MP_PARAM_DTYPE", "bfloat16"),
+        default="bfloat16",
         help="FSDP/autocast parameter dtype exported as SWEHERO_MP_PARAM_DTYPE.",
     )
     parser.add_argument(
         "--mixed-precision-reduce-dtype",
         choices=TORCH_DTYPE_CHOICES,
-        default=os.environ.get("SWEHERO_MP_REDUCE_DTYPE", "bfloat16"),
+        default="bfloat16",
         help="FSDP reduction dtype exported as SWEHERO_MP_REDUCE_DTYPE.",
     )
     parser.add_argument(
         "--fsdp-reshard-after-forward",
         choices=FSDP_RESHARD_AFTER_FORWARD_CHOICES,
-        default=os.environ.get("SWEHERO_FSDP_RESHARD_AFTER_FORWARD", "never"),
+        default="never",
         help=(
             "TorchTitan FSDP reshard policy. Defaults to the current "
             "direct-to-hero config value and is recorded in the run spec."
@@ -2378,30 +2313,27 @@ def parse_args(
     parser.add_argument(
         "--activation-checkpoint-mode",
         choices=("full", "selective", "memory_budget", "none"),
-        default=os.environ.get("ACTIVATION_CHECKPOINT_MODE", "full"),
+        default="full",
     )
     parser.add_argument(
         "--chunked-ce-chunks",
         type=int,
-        default=_env_int("CHUNKED_CE_CHUNKS", 8),
+        default=8,
     )
     parser.add_argument(
         "--checkpoint-interval",
         type=int,
-        default=_env_int("CHECKPOINT_INTERVAL", 25),
+        default=25,
     )
     parser.add_argument(
         "--checkpoint-async-mode",
         choices=("disabled", "async", "async_with_pinned_mem"),
-        default=os.environ.get("CHECKPOINT_ASYNC_MODE", "async"),
+        default="async",
     )
     parser.add_argument(
         "--validate-first-step-checkpoint",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag(
-            "VALIDATE_FIRST_STEP_CHECKPOINT",
-            DEFAULT_VALIDATE_FIRST_STEP_CHECKPOINT,
-        ),
+        default=DEFAULT_VALIDATE_FIRST_STEP_CHECKPOINT,
         help=(
             "Ask TorchTitan to save and validate a full DCP checkpoint after "
             "optimizer step 1, then require the validation report before the "
@@ -2411,121 +2343,100 @@ def parse_args(
     parser.add_argument(
         "--metrics-log-freq",
         type=int,
-        default=_env_int("METRICS_LOG_FREQ", 1),
+        default=1,
     )
     parser.add_argument(
         "--min-free-disk-gb",
         type=float,
-        default=float(os.environ.get("MIN_FREE_DISK_GB", DEFAULT_MIN_FREE_DISK_GB)),
+        default=DEFAULT_MIN_FREE_DISK_GB,
         help="Minimum free GiB required on --out-dir filesystem before launch.",
     )
     parser.add_argument(
         "--min-free-gpu-memory-gb",
         type=float,
-        default=float(
-            os.environ.get(
-                "MIN_FREE_GPU_MEMORY_GB",
-                DEFAULT_MIN_FREE_GPU_MEMORY_GB,
-            )
-        ),
+        default=DEFAULT_MIN_FREE_GPU_MEMORY_GB,
         help="Minimum free GiB required on each visible training GPU.",
     )
     parser.add_argument(
         "--min-free-cpu-memory-gb",
         type=float,
-        default=float(
-            os.environ.get(
-                "MIN_FREE_CPU_MEMORY_GB",
-                DEFAULT_MIN_FREE_CPU_MEMORY_GB,
-            )
-        ),
+        default=DEFAULT_MIN_FREE_CPU_MEMORY_GB,
         help="Minimum available system memory GiB required before launch.",
     )
     parser.add_argument(
         "--min-write-throughput-mb-s",
         type=float,
-        default=float(
-            os.environ.get(
-                "MIN_WRITE_THROUGHPUT_MB_S",
-                DEFAULT_MIN_WRITE_THROUGHPUT_MB_S,
-            )
-        ),
+        default=DEFAULT_MIN_WRITE_THROUGHPUT_MB_S,
         help="Minimum write throughput MiB/s required on --out-dir filesystem.",
     )
     parser.add_argument(
         "--write-throughput-probe-mb",
         type=int,
-        default=_env_int(
-            "WRITE_THROUGHPUT_PROBE_MB",
-            DEFAULT_WRITE_THROUGHPUT_PROBE_MB,
-        ),
+        default=DEFAULT_WRITE_THROUGHPUT_PROBE_MB,
         help="MiB to write for the output filesystem throughput probe.",
     )
     parser.add_argument(
         "--enable-profiler",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("ENABLE_PROFILER", False),
+        default=False,
         help="Enable TorchTitan torch.profiler traces. Default is disabled.",
     )
     parser.add_argument(
         "--profiler-trace-folder",
-        default=os.environ.get("PROFILER_TRACE_FOLDER", "profiling/traces"),
+        default="profiling/traces",
         help="Profiler trace folder relative to the TorchTitan dump folder.",
     )
     parser.add_argument(
         "--profiler-freq",
         type=int,
-        default=_env_int("PROFILER_FREQ", 10),
+        default=10,
         help="Torch profiler schedule period in training steps.",
     )
     parser.add_argument(
         "--profiler-active",
         type=int,
-        default=_env_int("PROFILER_ACTIVE", 1),
+        default=1,
         help="Active profiler steps per profiling period.",
     )
     parser.add_argument(
         "--profiler-warmup",
         type=int,
-        default=_env_int("PROFILER_WARMUP", 3),
+        default=3,
         help="Warmup profiler steps per profiling period.",
     )
     parser.add_argument(
         "--profiler-repeat",
         type=int,
-        default=_env_optional_int("PROFILER_REPEAT"),
+        default=None,
         help="Optional torch.profiler schedule repeat count.",
     )
     parser.add_argument(
         "--profiler-skip-first",
         type=int,
-        default=_env_optional_int("PROFILER_SKIP_FIRST"),
+        default=None,
         help="Optional initial profiler cycles to skip.",
     )
     parser.add_argument(
         "--profiler-skip-first-wait",
         type=int,
-        default=_env_optional_int("PROFILER_SKIP_FIRST_WAIT"),
+        default=None,
         help="Optional initial profiler wait cycles to skip.",
     )
     parser.add_argument(
         "--enable-memory-snapshot",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("ENABLE_MEMORY_SNAPSHOT", False),
+        default=False,
         help="Enable TorchTitan CUDA memory snapshots. Default is disabled.",
     )
     parser.add_argument(
         "--memory-snapshot-folder",
-        default=os.environ.get(
-            "MEMORY_SNAPSHOT_FOLDER",
-            "profiling/memory_snapshot",
-        ),
+        default="profiling/memory_snapshot",
         help="Memory snapshot folder relative to the TorchTitan dump folder.",
     )
     parser.add_argument(
         "--detect-anomaly",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("SWEHERO_DETECT_ANOMALY", False),
+        default=False,
         help=(
             "Enable Torch autograd anomaly detection through TorchTitan. This "
             "used to be an unrecorded SWEHERO_DETECT_ANOMALY environment input."
@@ -2534,17 +2445,16 @@ def parse_args(
     parser.add_argument(
         "--enable-wandb",
         action="store_true",
-        default=_env_flag("ENABLE_WANDB", False),
+        default=False,
     )
     parser.add_argument(
         "--wandb-project",
-        default=os.environ.get("WANDB_PROJECT", smoke.WANDB_PROJECT),
+        default="jaxels-midtraining",
     )
     parser.add_argument(
         "--wandb-entity",
-        "--wandb-team",
         dest="wandb_entity",
-        default=_env_first("WANDB_TEAM", "WANDB_ENTITY"),
+        default=None,
         help=(
             "Optional W&B entity/team. Passed to TorchTitan through WANDB_TEAM "
             "and also exported as WANDB_ENTITY for SDK compatibility."
@@ -2552,15 +2462,11 @@ def parse_args(
     )
     parser.add_argument(
         "--wandb-run-name",
-        default=_env_first(
-            "WANDB_RUN_NAME",
-            "WANDB_NAME",
-            default="qwen25-coder7b-swehero-tt",
-        ),
+        default="qwen25-coder7b-swehero-tt",
     )
     parser.add_argument(
         "--wandb-run-id",
-        default=os.environ.get("WANDB_RUN_ID"),
+        default=None,
         help=(
             "Stable W&B run id. If W&B is enabled and omitted for a fresh "
             "launch, the launcher generates one and persists it in "
@@ -2570,7 +2476,7 @@ def parse_args(
     parser.add_argument(
         "--wandb-resume",
         choices=WANDB_RESUME_CHOICES,
-        default=os.environ.get("WANDB_RESUME"),
+        default=None,
         help=(
             "W&B resume policy for runs with --wandb-run-id. Defaults to "
             "'allow' when W&B is enabled, matching W&B's recommended explicit "
@@ -2579,40 +2485,40 @@ def parse_args(
     )
     parser.add_argument(
         "--wandb-resume-from",
-        default=os.environ.get("WANDB_RESUME_FROM"),
+        default=None,
         help="Optional W&B resume_from value, for example '<run_id>?_step=<step>'.",
     )
     parser.add_argument(
         "--wandb-fork-from",
-        default=os.environ.get("WANDB_FORK_FROM"),
+        default=None,
         help="Optional W&B fork_from value, for example '<run_id>?_step=<step>'.",
     )
     parser.add_argument(
         "--wandb-run-group",
-        default=os.environ.get("WANDB_RUN_GROUP"),
+        default=None,
     )
     parser.add_argument(
         "--wandb-run-job-type",
-        default=_env_first("WANDB_RUN_JOB_TYPE", "WANDB_JOB_TYPE"),
+        default=None,
     )
     parser.add_argument(
         "--wandb-run-tags",
-        default=_env_first("WANDB_RUN_TAGS", "WANDB_TAGS"),
+        default=None,
         help="Comma-separated W&B run tags.",
     )
     parser.add_argument(
         "--wandb-run-notes",
-        default=_env_first("WANDB_RUN_NOTES", "WANDB_NOTES"),
+        default=None,
     )
     parser.add_argument(
         "--wandb-mode",
         choices=WANDB_MODE_CHOICES,
-        default=os.environ.get("WANDB_MODE"),
+        default=None,
         help="Optional W&B mode such as 'online', 'offline', or 'disabled'.",
     )
     parser.add_argument(
         "--post-training-eval-command",
-        default=os.environ.get("POST_TRAINING_EVAL_COMMAND", ""),
+        default="",
         help=(
             "Optional shell command to run after final artifact validation. "
             "The command receives SWEHERO_* environment variables pointing at "
@@ -2622,29 +2528,29 @@ def parse_args(
     parser.add_argument(
         "--nproc-per-node",
         type=int,
-        default=_env_int("NPROC_PER_NODE", 8),
+        default=8,
         help="GPU processes per node. Target pod is 8xH100.",
     )
     parser.add_argument(
         "--nnodes",
         type=int,
-        default=_env_int("NNODES", 1),
+        default=1,
         help="Number of torchrun nodes. Defaults to the current single-node pod.",
     )
     parser.add_argument(
         "--node-rank",
         type=int,
-        default=_env_int("NODE_RANK", 0),
+        default=0,
         help="Rank of this node for multi-node torchrun launches.",
     )
     parser.add_argument(
         "--rdzv-backend",
-        default=os.environ.get("RDZV_BACKEND", "c10d"),
+        default="c10d",
         help="torchrun rendezvous backend.",
     )
     parser.add_argument(
         "--rdzv-endpoint",
-        default=os.environ.get("RDZV_ENDPOINT", "localhost:0"),
+        default="localhost:0",
         help=(
             "torchrun rendezvous endpoint. Multi-node launches must provide a "
             "stable host:port reachable from every node."
@@ -2652,26 +2558,26 @@ def parse_args(
     )
     parser.add_argument(
         "--rdzv-id",
-        default=os.environ.get("RDZV_ID", ""),
+        default="",
         help="torchrun rendezvous id. Required when --nnodes > 1.",
     )
     parser.add_argument(
         "--torchrun-bin",
-        default=os.environ.get("TORCHRUN_BIN", _default_torchrun_bin()),
+        default=_default_torchrun_bin(),
     )
     parser.add_argument(
         "--log-rank",
-        default=os.environ.get("LOG_RANK", "0"),
+        default="0",
         help="Ranks TorchTitan should log. Passed through LOG_RANK.",
     )
     parser.add_argument(
         "--torchrun-log-rank-filter",
-        default=os.environ.get("TORCHRUN_LOG_RANK_FILTER", "0"),
+        default="0",
         help="Optional torchrun --local-ranks-filter value.",
     )
     parser.add_argument(
         "--cuda-device-max-connections",
-        default=os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
+        default="1",
         help=(
             "Value exported to CUDA_DEVICE_MAX_CONNECTIONS for torchrun workers. "
             "The previous implicit default was 1."
@@ -2679,7 +2585,7 @@ def parse_args(
     )
     parser.add_argument(
         "--torch-nccl-async-error-handling",
-        default=os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"),
+        default="1",
         help=(
             "Value exported to TORCH_NCCL_ASYNC_ERROR_HANDLING for torchrun "
             "workers. The previous implicit default was 1."
@@ -2688,7 +2594,7 @@ def parse_args(
     parser.add_argument(
         "--production-mode",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("PRODUCTION_MODE", False),
+        default=False,
         help=(
             "Fail closed unless the launch uses the full reviewed "
             "direct-to-hero recipe. This rejects dry-run, synthetic smoke, "
@@ -2698,7 +2604,7 @@ def parse_args(
     parser.add_argument(
         "--production-acceptance-smoke",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("PRODUCTION_ACCEPTANCE_SMOKE", False),
+        default=False,
         help=(
             "Explicit final-acceptance exception inside --production-mode. "
             "This keeps production provenance, real-data, checkpoint, export, "
@@ -2709,45 +2615,43 @@ def parse_args(
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        default=_env_flag("DRY_RUN", False),
+        default=False,
         help="Materialize data and print torchrun commands without launching.",
     )
     parser.add_argument(
         "--prepare-data-only",
         action="store_true",
-        default=_env_flag("PREPARE_DATA_ONLY", False),
+        default=False,
         help="Materialize bucket files and exit.",
     )
     parser.add_argument(
         "--skip-data-prep",
         action="store_true",
-        default=_env_flag("SKIP_DATA_PREP", False),
+        default=False,
         help="Reuse existing manifest/bucket files under --out-dir/data.",
     )
     parser.add_argument(
         "--overwrite-output",
         action="store_true",
-        default=_env_flag("OVERWRITE_OUTPUT", False),
+        default=False,
         help="Remove --out-dir before materializing a fresh run.",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        default=_env_flag("RESUME", False),
+        default=False,
         help="Reuse an existing checkpoint folder in --out-dir/torchtitan.",
     )
     parser.add_argument(
         "--verify-hf-logits-parity",
         action="store_true",
-        default=_env_flag("VERIFY_HF_LOGITS_PARITY", False),
+        default=False,
         help=(
             "Before training, run the paper-aligned HF-vs-TorchTitan logits "
             "parity check for the Qwen2.5-Coder-7B-Instruct initial load."
         ),
     )
     args = parser.parse_args(argv)
-    if args.dataset_revision:
-        args.source_dataset_revision = args.dataset_revision
     args.workspace_root = _configured_workspace_root(args)
     return args
 
@@ -4618,8 +4522,9 @@ def download_hf_assets_if_requested(args: argparse.Namespace) -> None:
         "safetensors",
         "index",
     ]
-    if args.hf_token:
-        command.extend(["--hf_token", args.hf_token])
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if hf_token:
+        command.extend(["--hf_token", hf_token])
     subprocess.run(command, check=True)
 
 

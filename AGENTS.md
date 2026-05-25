@@ -36,3 +36,11 @@ Replicate and extend the "direct-to-hero" baseline from "From SWE-ZERO to SWE-HE
 - Keep secrets, pod credentials, `.env`, checkpoints, datasets, and generated run artifacts out of git.
 - Preserve enough metadata to reproduce each run: model, dataset revision, tokenizer/chat template, sequence length, loss masking, LR schedule, batch size, hardware, commit, and eval harness revision.
 - Verify meaningful behavior with automated tests or a concrete dry run whenever feasible.
+
+# Configuration Principles
+
+- Every public setting must have exactly one configuration source: either a CLI/preset argument or an environment variable, never both.
+- Use argparse `@preset` files for experiment and reproducibility settings. Paper-faithful recipes belong in swappable preset files under `configs/`, not hidden launcher defaults or ambient env defaults.
+- Reserve environment variables for secrets, credentials, pod/runtime plumbing, and process supervision. Do not use env vars for model, dataset, context, optimizer, eval harness, vLLM sizing, sampling, or other experiment settings.
+- Avoid aliases and convenience synonyms. Prefer primitive flags such as `--eval-limit 1` over named smoke/full shortcuts.
+- When adding or changing training/eval config, update the workflow docs with the canonical preset-based command and preserve the existing runnable behavior through preset contents or explicit CLI flags.

@@ -13,10 +13,8 @@ Usage: scripts/run_openhands_swebench_eval_pod.sh [options]
 Launch the canonical OpenHands SWE-bench Verified pass@1 eval from the GPU pod.
 
 Options:
-  --smoke                 Run one SWE-bench Verified instance.
+  --config PATH           Argparse preset file. Defaults to the 7B 128k preset.
   --eval-limit N          Run N instances. Omit for the full Verified split.
-  --full                  Clear any eval limit and run the full Verified split.
-  --context-mode MODE     paper-yarn-128k, base-native-32k, or base-paper-yarn-128k.
   --preflight-only        Check vLLM tool calls and Docker, then exit.
   --skip-swebench-eval    Generate patches without running SWE-bench grading.
   --output-dir PATH       Eval output directory. Defaults to a timestamped pod path.
@@ -28,32 +26,13 @@ Options:
 
 Environment overrides:
   WORKSPACE_ROOT          Default: /workspace/jaxels-work-trial
-  MODEL_ID                Default: /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
-  SERVED_MODEL_NAME       Default: Qwen/Qwen2.5-Coder-7B-Instruct
-  LITELLM_MODEL           Default: openai/Qwen/Qwen2.5-Coder-7B-Instruct
   LLM_API_KEY             Default: local-llm
-  CONTEXT_MODE            Default: paper-yarn-128k
-  MAX_INPUT_TOKENS        Default: context-mode dependent.
   VLLM_VENV               Default: /workspace/venvs/openhands-vllm
   VLLM_REQUIREMENTS_PATH  Default: requirements/openhands-vllm.txt
-  VLLM_MAX_MODEL_LEN      Default: context-mode dependent.
-  VLLM_ROPE_SCALING       Default: auto. 128k modes use YaRN; 32k native does not.
-  VLLM_TENSOR_PARALLEL_SIZE
-                          Default: 1
-  VLLM_PIPELINE_PARALLEL_SIZE
-                          Default: 1
-  VLLM_SERVER_COUNT       Default: 8
-  VLLM_AGENT_TASKS_PER_SERVER
-                          Default: 24
-  VLLM_ROUTER_PORT        Default: 8090
-  VLLM_DTYPE              Default: bfloat16
   VLLM_FORCE_RESTART      Set to 1 to replace an already-running vLLM server.
   EVAL_VENV               Default: /workspace/venvs/openhands-eval-pod-py312
   OPENHANDS_EVAL_POETRY_VERSION
                           Default: 2.1.3
-  OPENHANDS_DIR           Default: /workspace/eval-runs/OpenHands
-  OPENHANDS_REF           Default: 0.62.0
-  MAX_OUTPUT_TOKENS       Default: 4096. Set to none only for ablations.
   REQUIRED_GPU_COUNT      Default: 8
   SWEHERO_POD_GIT_BRANCH  Required. Current local worktree branch expected on
                           the pod; the launcher fast-forwards it from origin.
@@ -93,30 +72,13 @@ readonly PAPER_CONTEXT_LENGTH=131072
 readonly PAPER_YARN_ROPE_SCALING='{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}'
 
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace/jaxels-work-trial}"
-MODEL_ID="${MODEL_ID:-/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen2.5-Coder-7B-Instruct}"
-LITELLM_MODEL="${LITELLM_MODEL:-openai/Qwen/Qwen2.5-Coder-7B-Instruct}"
+CONFIG_PRESET="$ROOT_DIR/configs/eval/openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args"
 LLM_API_KEY="${LLM_API_KEY:-local-llm}"
-CONTEXT_MODE="${CONTEXT_MODE:-paper-yarn-128k}"
-MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-}"
 VLLM_VENV="${VLLM_VENV:-/workspace/venvs/openhands-vllm}"
 VLLM_REQUIREMENTS_PATH="${VLLM_REQUIREMENTS_PATH:-$ROOT_DIR/requirements/openhands-vllm.txt}"
 VLLM_PYTHON_VERSION="${VLLM_PYTHON_VERSION:-3.12}"
-VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_VISIBLE_DEVICES="${VLLM_VISIBLE_DEVICES:-${VLLM_GPU:-}}"
-VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-}"
-VLLM_ROPE_SCALING="${VLLM_ROPE_SCALING:-auto}"
-VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-auto}"
-VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
-VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
-VLLM_PIPELINE_PARALLEL_SIZE="${VLLM_PIPELINE_PARALLEL_SIZE:-1}"
-VLLM_SERVER_COUNT="${VLLM_SERVER_COUNT:-8}"
-VLLM_AGENT_TASKS_PER_SERVER="${VLLM_AGENT_TASKS_PER_SERVER:-24}"
-VLLM_ROUTER_PORT="${VLLM_ROUTER_PORT:-8090}"
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
-VLLM_DTYPE="${VLLM_DTYPE:-bfloat16}"
 VLLM_FORCE_RESTART="${VLLM_FORCE_RESTART:-0}"
-VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
 VLLM_TMUX_SESSION="${VLLM_TMUX_SESSION:-openhands-vllm-7b}"
 VLLM_TMUX_SESSION_PREFIX="${VLLM_TMUX_SESSION_PREFIX:-openhands-vllm-7b-gpu}"
 VLLM_ROUTER_TMUX_SESSION="${VLLM_ROUTER_TMUX_SESSION:-openhands-vllm-router}"
@@ -125,19 +87,11 @@ OPENHANDS_EVAL_PYTHON_VERSION="${OPENHANDS_EVAL_PYTHON_VERSION:-3.12}"
 # OpenHands 0.62.0 locks Poetry to 2.1.3; keep the launcher tool version in
 # step with that checkout instead of floating to the newest Poetry release.
 OPENHANDS_EVAL_POETRY_VERSION="${OPENHANDS_EVAL_POETRY_VERSION:-2.1.3}"
-OPENHANDS_DIR="${OPENHANDS_DIR:-/workspace/eval-runs/OpenHands}"
-OPENHANDS_REF="${OPENHANDS_REF:-0.62.0}"
-OPENHANDS_REPO="${OPENHANDS_REPO:-https://github.com/OpenHands/OpenHands.git}"
 DOCKER_TMUX_SESSION="${DOCKER_TMUX_SESSION:-openhands-dockerd}"
-DOCKER_SMOKE_IMAGE="${DOCKER_SMOKE_IMAGE:-hello-world:latest}"
 REQUIRED_GPU_COUNT="${REQUIRED_GPU_COUNT:-8}"
-RUN_ID="${OPENHANDS_EVAL_RUN_ID:-$(date -u +%Y%m%d_%H%M%S)}"
-if [[ -n "${OUTPUT_DIR:-}" ]]; then
-  OUTPUT_DIR_EXPLICIT=1
-else
-  OUTPUT_DIR_EXPLICIT=0
-fi
-OUTPUT_DIR="${OUTPUT_DIR:-/workspace/eval-runs/openhands-swebench-verified-pass1/${RUN_ID}}"
+RUN_ID="$(date -u +%Y%m%d_%H%M%S)"
+OUTPUT_DIR_EXPLICIT=0
+OUTPUT_DIR="/workspace/eval-runs/openhands-swebench-verified-pass1/${RUN_ID}"
 TMUX_SESSION="${OPENHANDS_EVAL_TMUX_SESSION:-openhands-swebench-eval-${RUN_ID}}"
 TMUX_LOG_DIR="${OPENHANDS_EVAL_TMUX_LOG_DIR:-/workspace/runlogs}"
 TMUX_LOG_PATH="${TMUX_LOG_DIR}/${TMUX_SESSION}.log"
@@ -148,7 +102,7 @@ BOOTSTRAP_PYTHON="${PYTHON:-}"
 EVAL_PYTHON_READY=0
 VLLM_PYTHON_READY=0
 
-EVAL_LIMIT="${EVAL_LIMIT:-}"
+EVAL_LIMIT=""
 PREFLIGHT_ONLY=0
 SKIP_SWEBENCH_EVAL=0
 FOREGROUND=0
@@ -160,22 +114,14 @@ fi
 
 while (($#)); do
   case "$1" in
-    --smoke)
-      EVAL_LIMIT=1
-      shift
+    --config)
+      [[ $# -ge 2 ]] || die "--config requires a value"
+      CONFIG_PRESET="$2"
+      shift 2
       ;;
     --eval-limit)
       [[ $# -ge 2 ]] || die "--eval-limit requires a value"
       EVAL_LIMIT="$2"
-      shift 2
-      ;;
-    --full)
-      EVAL_LIMIT=""
-      shift
-      ;;
-    --context-mode)
-      [[ $# -ge 2 ]] || die "--context-mode requires a value"
-      CONTEXT_MODE="$2"
       shift 2
       ;;
     --preflight-only)
@@ -224,64 +170,86 @@ while (($#)); do
   esac
 done
 
-resolve_context_mode() {
-  local default_max_input_tokens
-  local default_vllm_max_model_len
-  local default_vllm_rope_scaling
-  local default_vllm_allow_long
-
-  case "$CONTEXT_MODE" in
-    paper-yarn-128k|base-paper-yarn-128k)
-      default_max_input_tokens="$PAPER_CONTEXT_LENGTH"
-      default_vllm_max_model_len="$PAPER_CONTEXT_LENGTH"
-      default_vllm_rope_scaling="$PAPER_YARN_ROPE_SCALING"
-      default_vllm_allow_long=1
-      ;;
-    base-native-32k)
-      default_max_input_tokens="$QWEN_NATIVE_CONTEXT_LENGTH"
-      default_vllm_max_model_len="$QWEN_NATIVE_CONTEXT_LENGTH"
-      default_vllm_rope_scaling=""
-      default_vllm_allow_long=0
-      ;;
-    *)
-      die "unknown CONTEXT_MODE: $CONTEXT_MODE"
-      ;;
-  esac
-
-  MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-$default_max_input_tokens}"
-  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$default_vllm_max_model_len}"
-  if [[ "$VLLM_ROPE_SCALING" == "auto" ]]; then
-    VLLM_ROPE_SCALING="$default_vllm_rope_scaling"
-  fi
-  local rope_scaling_lower
-  rope_scaling_lower="$(printf "%s" "$VLLM_ROPE_SCALING" | tr "[:upper:]" "[:lower:]")"
-  case "$rope_scaling_lower" in
-    none|null|off|false|disabled)
-      VLLM_ROPE_SCALING=""
-      ;;
-  esac
-  if [[ "$VLLM_ALLOW_LONG_MAX_MODEL_LEN" == "auto" ]]; then
-    VLLM_ALLOW_LONG_MAX_MODEL_LEN="$default_vllm_allow_long"
-  fi
-
-  [[ "$MAX_INPUT_TOKENS" =~ ^[0-9]+$ ]] || die "MAX_INPUT_TOKENS must be an integer"
-  [[ "$VLLM_MAX_MODEL_LEN" =~ ^[0-9]+$ ]] || die "VLLM_MAX_MODEL_LEN must be an integer"
-  (( VLLM_MAX_MODEL_LEN >= MAX_INPUT_TOKENS )) || \
-    die "VLLM_MAX_MODEL_LEN must be >= MAX_INPUT_TOKENS"
-
-  if [[ "$CONTEXT_MODE" == "base-native-32k" ]]; then
-    (( MAX_INPUT_TOKENS <= QWEN_NATIVE_CONTEXT_LENGTH )) || \
-      die "base-native-32k requires MAX_INPUT_TOKENS <= ${QWEN_NATIVE_CONTEXT_LENGTH}"
-    (( VLLM_MAX_MODEL_LEN <= QWEN_NATIVE_CONTEXT_LENGTH )) || \
-      die "base-native-32k requires VLLM_MAX_MODEL_LEN <= ${QWEN_NATIVE_CONTEXT_LENGTH}"
-    [[ -z "$VLLM_ROPE_SCALING" ]] || \
-      die "base-native-32k must not set VLLM_ROPE_SCALING"
-  elif (( VLLM_MAX_MODEL_LEN > QWEN_NATIVE_CONTEXT_LENGTH )) && [[ -z "$VLLM_ROPE_SCALING" ]]; then
-    die "$CONTEXT_MODE requires explicit VLLM_ROPE_SCALING for >32k context"
+resolve_config_preset_path() {
+  local raw="$1"
+  if [[ "$raw" = /* ]]; then
+    printf "%s\n" "$raw"
+  else
+    printf "%s\n" "$ROOT_DIR/$raw"
   fi
 }
 
-resolve_context_mode
+resolve_eval_config() {
+  local config_path="$1"
+  local bootstrap_python="${BOOTSTRAP_PYTHON:-python3}"
+  command -v "$bootstrap_python" >/dev/null 2>&1 || \
+    die "python3 is required to read eval presets before venv setup"
+  "$bootstrap_python" - "$ROOT_DIR" "$config_path" "$OUTPUT_DIR" <<'PY'
+from __future__ import annotations
+
+import shlex
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+config_path = Path(sys.argv[2])
+output_dir = sys.argv[3]
+if not config_path.is_file():
+    raise SystemExit(f"eval config preset not found: {config_path}")
+sys.path.insert(0, str(root))
+from scripts import openhands_swebench_eval as eval_script
+
+args = eval_script.parse_args(
+    [
+        f"@{config_path}",
+        "--dry-run",
+        "--output-dir",
+        output_dir,
+    ]
+)
+
+values = {
+    "CONFIG_PRESET_PATH": str(config_path),
+    "MODEL_ID": args.model_id,
+    "SERVED_MODEL_NAME": args.served_model_name,
+    "LITELLM_MODEL": args.litellm_model or "",
+    "CONTEXT_MODE": args.context_mode,
+    "MAX_INPUT_TOKENS": args.max_input_tokens,
+    "OPENHANDS_REPO": args.openhands_repo,
+    "OPENHANDS_REF": args.openhands_ref,
+    "OPENHANDS_DIR": args.openhands_dir,
+    "DOCKER_SMOKE_IMAGE": args.docker_smoke_image,
+    "VLLM_HOST": args.vllm_host,
+    "VLLM_PORT": args.vllm_port,
+    "VLLM_MAX_MODEL_LEN": args.vllm_max_model_len,
+    "VLLM_ROPE_SCALING": args.vllm_rope_scaling or "",
+    "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+    if args.vllm_max_model_len > eval_script.QWEN_NATIVE_CONTEXT_LENGTH
+    else "0",
+    "VLLM_ENFORCE_EAGER": "1" if args.vllm_enforce_eager else "0",
+    "VLLM_TENSOR_PARALLEL_SIZE": args.vllm_tensor_parallel_size,
+    "VLLM_PIPELINE_PARALLEL_SIZE": args.vllm_pipeline_parallel_size,
+    "VLLM_SERVER_COUNT": args.vllm_server_count,
+    "VLLM_AGENT_TASKS_PER_SERVER": args.vllm_agent_tasks_per_server,
+    "VLLM_ROUTER_PORT": args.vllm_router_port,
+    "VLLM_GPU_MEMORY_UTILIZATION": args.vllm_gpu_memory_utilization,
+    "VLLM_DTYPE": args.vllm_dtype,
+    "VLLM_ENABLE_AUTO_TOOL_CHOICE": "1"
+    if args.vllm_enable_auto_tool_choice
+    else "0",
+    "VLLM_TOOL_CALL_PARSER": args.vllm_tool_call_parser,
+    "VLLM_DISTRIBUTED_EXECUTOR_BACKEND": (
+        args.vllm_distributed_executor_backend or ""
+    ),
+    "CONFIG_NUM_WORKERS": args.num_workers,
+}
+for key, value in values.items():
+    print(f"{key}={shlex.quote(str(value))}")
+PY
+}
+
+CONFIG_PRESET_PATH="$(resolve_config_preset_path "$CONFIG_PRESET")"
+eval "$(resolve_eval_config "$CONFIG_PRESET_PATH")"
 
 if [[ "$FOREGROUND" != "1" ]]; then
   command -v tmux >/dev/null 2>&1 || die "tmux is required for supervised pod launches"
@@ -301,7 +269,7 @@ if [[ "$FOREGROUND" != "1" ]]; then
     if [[ "$SKIP_SWEBENCH_EVAL" == "1" ]]; then
       command+=" --skip-swebench-eval"
     fi
-    command+=" --context-mode $(quote_args "$CONTEXT_MODE")"
+    command+=" --config $(quote_args "$CONFIG_PRESET_PATH")"
     command+=" --output-dir $(quote_args "$OUTPUT_DIR")"
     tmux new-session -d -s "$TMUX_SESSION" "set -euo pipefail; $command 2>&1 | tee -a $(quote_args "$TMUX_LOG_PATH")"
     echo "launched tmux session: $TMUX_SESSION"
@@ -615,6 +583,7 @@ vllm_context_signature() {
   local port="$2"
   cat <<EOF
 CONTEXT_MODE=$CONTEXT_MODE
+CONFIG_PRESET_PATH=$CONFIG_PRESET_PATH
 MODEL_ID=$MODEL_ID
 SERVED_MODEL_NAME=$SERVED_MODEL_NAME
 MAX_INPUT_TOKENS=$MAX_INPUT_TOKENS
@@ -624,6 +593,8 @@ VLLM_DTYPE=$VLLM_DTYPE
 VLLM_GPU_MEMORY_UTILIZATION=$VLLM_GPU_MEMORY_UTILIZATION
 VLLM_DISTRIBUTED_EXECUTOR_BACKEND=$VLLM_DISTRIBUTED_EXECUTOR_BACKEND
 VLLM_ENFORCE_EAGER=$VLLM_ENFORCE_EAGER
+VLLM_ENABLE_AUTO_TOOL_CHOICE=$VLLM_ENABLE_AUTO_TOOL_CHOICE
+VLLM_TOOL_CALL_PARSER=$VLLM_TOOL_CALL_PARSER
 GPU=$gpu
 PORT=$port
 EOF
@@ -666,6 +637,7 @@ ensure_vllm_server() {
   local cuda_visible_arg=()
   local vllm_long_context_env=()
   local vllm_rope_arg=()
+  local vllm_tool_args=()
   if [[ "$VLLM_ENFORCE_EAGER" == "1" || "$VLLM_ENFORCE_EAGER" == "true" ]]; then
     vllm_eager_arg=(--enforce-eager)
   fi
@@ -683,8 +655,14 @@ ensure_vllm_server() {
   if [[ -n "$VLLM_ROPE_SCALING" ]]; then
     vllm_rope_arg=(--rope-scaling "$VLLM_ROPE_SCALING")
   fi
+  if [[ "$VLLM_ENABLE_AUTO_TOOL_CHOICE" == "1" || "$VLLM_ENABLE_AUTO_TOOL_CHOICE" == "true" ]]; then
+    vllm_tool_args=(--enable-auto-tool-choice)
+    if [[ -n "$VLLM_TOOL_CALL_PARSER" ]]; then
+      vllm_tool_args+=(--tool-call-parser "$VLLM_TOOL_CALL_PARSER")
+    fi
+  fi
   tmux new-session -d -s "$session" \
-    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") $(quote_args "${vllm_long_context_env[@]}") $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host 0.0.0.0 --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len $(quote_args "$VLLM_MAX_MODEL_LEN") $(quote_args "${vllm_rope_arg[@]}") --tensor-parallel-size 1 --pipeline-parallel-size 1 --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") --enable-auto-tool-choice --tool-call-parser hermes $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
+    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") $(quote_args "${vllm_long_context_env[@]}") $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host $(quote_args "$VLLM_HOST") --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len $(quote_args "$VLLM_MAX_MODEL_LEN") $(quote_args "${vllm_rope_arg[@]}") --tensor-parallel-size $(quote_args "$VLLM_TENSOR_PARALLEL_SIZE") --pipeline-parallel-size $(quote_args "$VLLM_PIPELINE_PARALLEL_SIZE") --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") $(quote_args "${vllm_tool_args[@]}") $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
 
   for _ in $(seq 1 240); do
     if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1; then
@@ -706,6 +684,7 @@ ensure_vllm_router() {
   expected_context="$(
     {
       printf "CONTEXT_MODE=%s\n" "$CONTEXT_MODE"
+      printf "CONFIG_PRESET_PATH=%s\n" "$CONFIG_PRESET_PATH"
       printf "VLLM_ROUTER_PORT=%s\n" "$VLLM_ROUTER_PORT"
       printf "VLLM_AGENT_TASKS_PER_SERVER=%s\n" "$VLLM_AGENT_TASKS_PER_SERVER"
       printf "LLM_API_KEY_SET=%s\n" "1"
@@ -768,46 +747,22 @@ POD_IP="${POD_IP:-$(pod_ip)}"
 ensure_vllm_stack "$POD_IP"
 
 TOTAL_AGENT_WORKERS=$((VLLM_SERVER_COUNT * VLLM_AGENT_TASKS_PER_SERVER))
-if [[ -n "${NUM_WORKERS:-}" ]]; then
-  EVAL_NUM_WORKERS="$NUM_WORKERS"
-elif [[ -n "$EVAL_LIMIT" && "$EVAL_LIMIT" -gt 0 && "$EVAL_LIMIT" -lt "$TOTAL_AGENT_WORKERS" ]]; then
+if [[ -n "$EVAL_LIMIT" && "$EVAL_LIMIT" -gt 0 && "$EVAL_LIMIT" -lt "$TOTAL_AGENT_WORKERS" ]]; then
   EVAL_NUM_WORKERS="$EVAL_LIMIT"
+elif [[ "$CONFIG_NUM_WORKERS" -gt 0 ]]; then
+  EVAL_NUM_WORKERS="$CONFIG_NUM_WORKERS"
 else
   EVAL_NUM_WORKERS="$TOTAL_AGENT_WORKERS"
 fi
 
 eval_args=(
-  --model-id "$MODEL_ID"
-  --served-model-name "$SERVED_MODEL_NAME"
-  --litellm-model "$LITELLM_MODEL"
+  "@$CONFIG_PRESET_PATH"
   --base-url "http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"
-  --api-key "$LLM_API_KEY"
-  --context-mode "$CONTEXT_MODE"
-  --max-input-tokens "$MAX_INPUT_TOKENS"
   --output-dir "$OUTPUT_DIR"
   --openhands-dir "$OPENHANDS_DIR"
   --openhands-ref "$OPENHANDS_REF"
   --num-workers "$EVAL_NUM_WORKERS"
-  --vllm-tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
-  --vllm-pipeline-parallel-size "$VLLM_PIPELINE_PARALLEL_SIZE"
-  --vllm-server-count "$VLLM_SERVER_COUNT"
-  --vllm-agent-tasks-per-server "$VLLM_AGENT_TASKS_PER_SERVER"
-  --vllm-router-port "$VLLM_ROUTER_PORT"
-  --vllm-max-model-len "$VLLM_MAX_MODEL_LEN"
-  --vllm-gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
-  --vllm-dtype "$VLLM_DTYPE"
-  --vllm-distributed-executor-backend "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND"
 )
-if [[ -n "$VLLM_ROPE_SCALING" ]]; then
-  eval_args+=(--vllm-rope-scaling "$VLLM_ROPE_SCALING")
-else
-  eval_args+=(--vllm-rope-scaling none)
-fi
-if [[ "$VLLM_ENFORCE_EAGER" == "1" || "$VLLM_ENFORCE_EAGER" == "true" ]]; then
-  eval_args+=(--vllm-enforce-eager)
-else
-  eval_args+=(--no-vllm-enforce-eager)
-fi
 
 if [[ -n "$EVAL_LIMIT" ]]; then
   eval_args+=(--eval-limit "$EVAL_LIMIT")
@@ -822,6 +777,7 @@ if [[ "$SKIP_SWEBENCH_EVAL" == "1" ]]; then
 fi
 
 PATH="$EVAL_VENV/bin:$PATH" \
+  LLM_API_KEY="$LLM_API_KEY" \
   POETRY_VIRTUALENVS_PATH=/workspace/venvs/poetry-pod \
   POETRY_CACHE_DIR=/workspace/.cache/poetry-pod \
   "$EVAL_VENV/bin/python" scripts/openhands_swebench_eval.py "${eval_args[@]}"

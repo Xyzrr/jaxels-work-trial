@@ -830,6 +830,31 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertTrue(args.validate_first_step_checkpoint)
         self.assertEqual(args.workspace_root, train._detected_workspace_root())
 
+    def test_default_training_recipe_is_loaded_from_preset(self):
+        default_args = train.parse_args([])
+        explicit_args = train.parse_args([f"@{train.DEFAULT_TRAINING_PRESET}"])
+
+        for field in (
+            "model_id",
+            "model_revision",
+            "dataset_id",
+            "source_dataset_revision",
+            "max_length",
+            "buckets",
+            "bucket_cp",
+            "num_train_epochs",
+            "global_batch_size",
+            "learning_rate",
+            "min_learning_rate",
+            "warmup_ratio",
+            "enable_fp8",
+            "compile",
+            "checkpoint_interval",
+            "checkpoint_async_mode",
+            "nproc_per_node",
+        ):
+            self.assertEqual(getattr(default_args, field), getattr(explicit_args, field))
+
     def test_production_mode_accepts_full_default_training_recipe(self):
         args = self._validate_default_production_launch_args()
 
@@ -1193,7 +1218,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self._validate_default_production_launch_args(extra_args)
 
-    def test_launch_env_file_sets_defaults_before_full_parse(self):
+    def test_launch_env_file_is_secret_only_not_experiment_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / ".env"
             env_file.write_text(
@@ -1205,6 +1230,7 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                         "SWEHERO_BUCKET_CP=1024:1",
                         "ENABLE_FP8=0 # disable for test",
                         "WANDB_RUN_NAME='dotenv-run'",
+                        "HF_TOKEN='secret-token'",
                     ]
                 )
             )
@@ -1213,19 +1239,20 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 loaded_env_file = train.load_launch_env_file(argv)
                 args = train.parse_args(argv, env_file_default=loaded_env_file)
+                hf_token = os.environ["HF_TOKEN"]
 
         self.assertEqual(args.env_file, str(env_file))
-        self.assertEqual(args.num_examples, 7)
-        self.assertEqual(args.max_streamed_examples, 11)
-        self.assertEqual(args.buckets, "1024")
-        self.assertEqual(args.bucket_cp, "1024:1")
-        self.assertFalse(args.enable_fp8)
-        self.assertEqual(args.wandb_run_name, "dotenv-run")
+        self.assertEqual(args.num_examples, train.DEFAULT_NUM_EXAMPLES)
+        self.assertEqual(args.max_streamed_examples, train.DEFAULT_MAX_STREAMED_EXAMPLES)
+        self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
+        self.assertTrue(args.enable_fp8)
+        self.assertEqual(args.wandb_run_name, "qwen25-coder7b-swehero-tt")
+        self.assertEqual(hf_token, "secret-token")
 
     def test_cli_flags_override_launch_env_file_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / ".env"
-            env_file.write_text("NUM_EXAMPLES=7\nENABLE_FP8=0\n")
+            env_file.write_text("HF_TOKEN=secret\n")
             argv = [
                 "--env-file",
                 str(env_file),
@@ -1268,35 +1295,28 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
         self.assertEqual(args.num_examples, 7)
         self.assertFalse(args.enable_fp8)
 
-    def test_process_env_overrides_launch_env_file_defaults(self):
+    def test_process_env_does_not_override_preset_or_cli_settings(self):
+        with patch.dict(
+            os.environ,
+            {
+                "NUM_EXAMPLES": "13",
+                "ENABLE_FP8": "0",
+                "SWEHERO_BUCKETS": "1024",
+            },
+            clear=True,
+        ):
+            args = train.parse_args(["--num-examples", "3"])
+
+        self.assertEqual(args.num_examples, 3)
+        self.assertEqual(train.parse_bucket_list(args.buckets), train.DEFAULT_BUCKETS)
+        self.assertTrue(args.enable_fp8)
+
+    def test_argfile_values_are_validated_by_argparse_types(self):
         with tempfile.TemporaryDirectory() as tmp:
-            env_file = Path(tmp) / ".env"
-            env_file.write_text("NUM_EXAMPLES=7\n")
-            argv = ["--env-file", str(env_file)]
-
-            with patch.dict(os.environ, {"NUM_EXAMPLES": "13"}, clear=True):
-                loaded_env_file = train.load_launch_env_file(argv)
-                args = train.parse_args(argv, env_file_default=loaded_env_file)
-
-        self.assertEqual(args.num_examples, 13)
-
-    def test_env_numeric_and_boolean_values_are_strict(self):
-        cases = [
-            ({"ENABLE_FP8": "maybe"}, "ENABLE_FP8 must be a boolean"),
-            ({"PRODUCTION_MODE": "maybe"}, "PRODUCTION_MODE must be a boolean"),
-            (
-                {"VALIDATE_FIRST_STEP_CHECKPOINT": "maybe"},
-                "VALIDATE_FIRST_STEP_CHECKPOINT must be a boolean",
-            ),
-            ({"NUM_EXAMPLES": "abc"}, "NUM_EXAMPLES must be an integer"),
-            ({"PROFILER_REPEAT": "abc"}, "PROFILER_REPEAT must be an integer"),
-            ({"LEARNING_RATE": "nan"}, "LEARNING_RATE must be finite"),
-        ]
-        for env, message in cases:
-            with self.subTest(env=env):
-                with patch.dict(os.environ, env, clear=True):
-                    with self.assertRaisesRegex(ValueError, message):
-                        train.parse_args([])
+            argfile = Path(tmp) / "bad.args"
+            argfile.write_text("--num-examples abc\n")
+            with self.assertRaises(SystemExit):
+                train.parse_args([f"@{argfile}"])
 
     def test_launch_input_validation_rejects_bad_numeric_values(self):
         cases = [
@@ -1618,15 +1638,10 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                     train.load_launch_env_file(["--env-file", str(missing)])
 
     def test_default_launch_env_file_is_optional(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "missing.env"
-            with (
-                patch.dict(os.environ, {}, clear=True),
-                patch.object(train.smoke, "ENV_FILE", str(missing)),
-            ):
-                loaded_env_file = train.load_launch_env_file([])
+        with patch.dict(os.environ, {}, clear=True):
+            loaded_env_file = train.load_launch_env_file([])
 
-        self.assertEqual(loaded_env_file, str(missing))
+        self.assertEqual(loaded_env_file, train.DEFAULT_ENV_FILE)
 
     def test_expected_qwen_yarn_rope_config_tracks_128k_extension(self):
         rope = train.expected_qwen_yarn_rope_config()
@@ -3093,22 +3108,17 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             "1",
         )
 
-    def test_hidden_torchtitan_env_inputs_are_recorded_as_launch_args(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(
-            os.environ,
-            {
-                "SWEHERO_OPTIMIZER_IMPL": "fused",
-                "SWEHERO_TRAINING_DTYPE": "bfloat16",
-                "SWEHERO_MP_PARAM_DTYPE": "float32",
-                "SWEHERO_MP_REDUCE_DTYPE": "float32",
-                "SWEHERO_FSDP_RESHARD_AFTER_FORWARD": "always",
-                "SWEHERO_DETECT_ANOMALY": "1",
-                "CUDA_DEVICE_MAX_CONNECTIONS": "2",
-                "TORCH_NCCL_ASYNC_ERROR_HANDLING": "3",
-            },
-            clear=True,
-        ):
+    def test_torchtitan_stage_settings_are_recorded_as_launch_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
             args, manifest, plan = self._resume_test_setup(tmp)
+            args.optimizer_impl = "fused"
+            args.training_dtype = "bfloat16"
+            args.mixed_precision_param_dtype = "float32"
+            args.mixed_precision_reduce_dtype = "float32"
+            args.fsdp_reshard_after_forward = "always"
+            args.detect_anomaly = True
+            args.cuda_device_max_connections = "2"
+            args.torch_nccl_async_error_handling = "3"
             spec = train.build_run_spec(args, plan, manifest)
             first_env = spec["plan"]["stages"][0]["env_overrides"]
 
@@ -3217,13 +3227,9 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
                 "--max-streamed-examples",
                 "100",
             ]
-            with patch.dict(
-                os.environ,
-                {"SWEHERO_TRAINING_DTYPE": "bfloat16"},
-                clear=True,
-            ):
-                args, manifest, plan = self._resume_test_setup(tmp)
-                train.write_or_validate_run_spec(args, plan, manifest)
+            args, manifest, plan = self._resume_test_setup(tmp)
+            args.training_dtype = "bfloat16"
+            train.write_or_validate_run_spec(args, plan, manifest)
 
             with patch.dict(os.environ, {}, clear=True):
                 changed = train.parse_args(base_argv)
@@ -3589,8 +3595,8 @@ class QwenSweHeroTorchTitanLauncherTests(unittest.TestCase):
             train.MODEL_REVISION,
         )
 
-    def test_dataset_revision_alias_pins_source_revision(self):
-        args = train.parse_args(["--dataset-revision", "legacy-sha"])
+    def test_source_dataset_revision_pins_source_revision(self):
+        args = train.parse_args(["--source-dataset-revision", "legacy-sha"])
 
         self.assertEqual(args.source_dataset_revision, "legacy-sha")
 

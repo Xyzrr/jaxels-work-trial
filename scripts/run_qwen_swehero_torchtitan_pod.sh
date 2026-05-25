@@ -72,7 +72,7 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-default_out_dir = os.environ.get("OUT_DIR") or sys.argv[2]
+default_out_dir = sys.argv[2]
 tokens: list[str] = []
 
 
@@ -287,6 +287,5 @@ ensure_pod_git_checkout
 "$SETUP_SCRIPT" --venv "$VENV_PATH"
 
 export PATH="$VENV_PATH/bin:$PATH"
-export TORCHRUN_BIN="${TORCHRUN_BIN:-$VENV_PATH/bin/torchrun}"
 
 exec "$VENV_PATH/bin/python" "$ROOT_DIR/scripts/qwen_swehero_train.py" "$@"

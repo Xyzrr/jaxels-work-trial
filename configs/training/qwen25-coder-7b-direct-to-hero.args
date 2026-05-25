@@ -1,0 +1,80 @@
+# Qwen2.5-Coder-7B direct-to-hero SWE-HERO SFT recipe.
+#
+# This preset carries the paper-faithful training configuration that used to
+# live in launcher defaults. Keep experiment changes in a copied preset and
+# use normal CLI flags after the preset for one-off overrides.
+
+--model-id Qwen/Qwen2.5-Coder-7B-Instruct
+--model-revision c03e6d358207e414f1eca0bb1891e29f1db0e242
+--dataset-id swe-hero-openhands-trajectories-5b2ed21-one-rollout
+--source-dataset-id nvidia/SWE-Hero-openhands-trajectories
+--source-dataset-revision 5b2ed21270ad773a50163e2999c510f0cbb92cfa
+--build-dataset-if-missing
+--source-dataset-rows-per-shard 2048
+--source-dataset-build-batch-size 64
+
+--num-examples 0
+--max-streamed-examples 0
+--shuffle-buffer 2048
+--seed 17
+--max-length 131072
+--long-example-policy error
+--buckets 32768,65536,131072
+--bucket-curriculum short-to-long
+--bucket-cp 32768:2,65536:4,131072:8
+--min-trainable-tokens 1
+
+--num-train-epochs 3
+--max-steps 0
+--global-batch-size 32
+--local-batch-size 1
+--learning-rate 1e-5
+--min-learning-rate 1e-8
+--warmup-ratio 0.1
+--weight-decay 0.0
+--max-grad-norm 1.0
+--optimizer-impl foreach
+
+--attention-backend sdpa
+--enable-fp8
+--fp8-recipe rowwise
+--compile
+--training-dtype float32
+--mixed-precision-param-dtype bfloat16
+--mixed-precision-reduce-dtype bfloat16
+--fsdp-reshard-after-forward never
+--activation-checkpoint-mode full
+--chunked-ce-chunks 8
+
+--checkpoint-interval 25
+--checkpoint-async-mode async
+--validate-first-step-checkpoint
+--metrics-log-freq 1
+
+--min-free-disk-gb 100
+--min-free-gpu-memory-gb 60
+--min-free-cpu-memory-gb 32
+--min-write-throughput-mb-s 50
+--write-throughput-probe-mb 64
+
+--no-enable-profiler
+--profiler-trace-folder profiling/traces
+--profiler-freq 10
+--profiler-active 1
+--profiler-warmup 3
+--no-enable-memory-snapshot
+--memory-snapshot-folder profiling/memory_snapshot
+
+--nproc-per-node 8
+--nnodes 1
+--node-rank 0
+--rdzv-backend c10d
+--rdzv-endpoint localhost:0
+--rdzv-id ""
+--log-rank 0
+--torchrun-log-rank-filter 0
+--cuda-device-max-connections 1
+--torch-nccl-async-error-handling 1
+
+--no-production-mode
+--no-production-acceptance-smoke

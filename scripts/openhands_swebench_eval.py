@@ -34,11 +34,9 @@ from pathlib import Path
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from scripts import qwen_swehero_smoke as smoke
-
-
 DEFAULT_OPENHANDS_REPO = "https://github.com/OpenHands/OpenHands.git"
 DEFAULT_OPENHANDS_REF = "0.62.0"
+DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
 DEFAULT_DATASET = "princeton-nlp/SWE-bench_Verified"
 DEFAULT_SPLIT = "test"
 DEFAULT_AGENT = "CodeActAgent"
@@ -68,6 +66,13 @@ DEFAULT_VLLM_ROUTER_PORT = 8090
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.90
 DEFAULT_VLLM_DTYPE = "bfloat16"
 DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND = "mp"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EVAL_PRESET = (
+    REPO_ROOT
+    / "configs"
+    / "eval"
+    / "openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args"
+)
 CONTEXT_MODE_PAPER_YARN_128K = "paper-yarn-128k"
 CONTEXT_MODE_BASE_NATIVE_32K = "base-native-32k"
 CONTEXT_MODE_BASE_PAPER_YARN_128K = "base-paper-yarn-128k"
@@ -255,35 +260,33 @@ def validate_context_args(args: argparse.Namespace) -> None:
         )
 
 
-def _env(name: str, default: str) -> str:
-    value = os.environ.get(name)
-    return default if value is None or value == "" else value
+class EvalArgumentParser(argparse.ArgumentParser):
+    def convert_arg_line_to_args(self, arg_line: str) -> list[str]:
+        stripped = arg_line.strip()
+        if not stripped or stripped.startswith("#"):
+            return []
+        return shlex.split(stripped)
 
 
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    return default if value is None or value == "" else int(value)
+def _argv_with_default_preset(
+    argv: list[str] | None,
+    *,
+    default_preset: Path = DEFAULT_EVAL_PRESET,
+) -> list[str]:
+    values = list(sys.argv[1:] if argv is None else argv)
+    if any(value.startswith("@") for value in values):
+        return values
+    return [f"@{default_preset}", *values]
 
 
-def _env_optional_int(name: str, default: int | None) -> int | None:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    if value.lower() in {"none", "null", "off", "false", "disabled", "unbounded"}:
+def _optional_positive_int(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"none", "null", "off", "false", "disabled", "unbounded"}:
         return None
-    return int(value)
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    return default if value is None or value == "" else float(value)
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive or 'none'")
+    return parsed
 
 
 def _toml_string(value: str) -> str:
@@ -1012,47 +1015,40 @@ def run_eval(args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run/prepare OpenHands SWE-bench Verified pass@1 eval for Qwen2.5-Coder-7B."
+    argv = _argv_with_default_preset(argv)
+    parser = EvalArgumentParser(
+        description="Run/prepare OpenHands SWE-bench Verified pass@1 eval for Qwen2.5-Coder-7B.",
+        fromfile_prefix_chars="@",
     )
-    parser.add_argument("--model-id", default=_env("MODEL_ID", smoke.MODEL_ID))
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument(
         "--served-model-name",
-        default=_env("SERVED_MODEL_NAME", ""),
+        default="",
         help="Name exposed by vLLM/SGLang. Defaults to --model-id.",
     )
     parser.add_argument(
         "--litellm-model",
-        default=_env("LITELLM_MODEL", ""),
+        default="",
         help="Full LiteLLM model string. Defaults to openai/<served-model-name>.",
     )
     parser.add_argument(
         "--base-url",
-        default=_env("LLM_BASE_URL", DEFAULT_BASE_URL),
+        default=DEFAULT_BASE_URL,
         help="OpenAI-compatible endpoint. The pod launcher sets this to the GPU pod IP.",
     )
     parser.add_argument(
-        "--api-key",
-        default=_env("LLM_API_KEY", _env("OPENAI_API_KEY", DEFAULT_API_KEY)),
-    )
-    parser.add_argument(
-        "--api-key-source",
-        default="LLM_API_KEY/OPENAI_API_KEY/default",
-        help="Metadata-only description; the actual API key is not written there.",
-    )
-    parser.add_argument(
         "--custom-llm-provider",
-        default=_env("CUSTOM_LLM_PROVIDER", ""),
+        default="",
     )
     parser.add_argument(
         "--native-tool-calling",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("NATIVE_TOOL_CALLING", True),
+        default=True,
     )
     parser.add_argument(
         "--tool-choice",
         choices=("required", "auto", "none"),
-        default=_env("TOOL_CHOICE", DEFAULT_TOOL_CHOICE),
+        default=DEFAULT_TOOL_CHOICE,
         help=(
             "OpenAI tool_choice sent through OpenHands completion_kwargs. "
             "Qwen2.5-Coder loops under OpenHands with auto in smoke tests, "
@@ -1062,28 +1058,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--drop-params",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("DROP_PARAMS", False),
+        default=False,
     )
     parser.add_argument(
         "--disable-vision",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("DISABLE_VISION", True),
+        default=True,
     )
     parser.add_argument(
         "--temperature",
         type=float,
-        default=_env_float("TEMPERATURE", PAPER_TEMPERATURE),
+        default=PAPER_TEMPERATURE,
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=_env_float("TOP_P", PAPER_TOP_P),
+        default=PAPER_TOP_P,
     )
-    parser.add_argument("--top-k", type=int, default=_env_int("TOP_K", PAPER_TOP_K))
+    parser.add_argument("--top-k", type=int, default=PAPER_TOP_K)
     parser.add_argument(
         "--tool-call-preflight",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("TOOL_CALL_PREFLIGHT", True),
+        default=True,
         help=(
             "Require an OpenAI-compatible /chat/completions request to return "
             "structured message.tool_calls before eval."
@@ -1092,13 +1088,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--tool-call-preflight-timeout",
         type=int,
-        default=_env_int("TOOL_CALL_PREFLIGHT_TIMEOUT", 120),
+        default=120,
         help="Seconds to wait for the vLLM tool-call preflight request.",
     )
     parser.add_argument(
         "--context-mode",
         choices=CONTEXT_MODES,
-        default=_env("CONTEXT_MODE", DEFAULT_CONTEXT_MODE),
+        default=DEFAULT_CONTEXT_MODE,
         help=(
             "Evaluation context budget. Use base-native-32k for an as-released "
             "base-model baseline, or base-paper-yarn-128k for a context-matched "
@@ -1108,80 +1104,66 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-input-tokens",
         type=int,
-        default=_env_optional_int("MAX_INPUT_TOKENS", None),
+        default=None,
     )
     parser.add_argument(
         "--max-output-tokens",
-        type=int,
-        default=_env_optional_int("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
+        type=_optional_positive_int,
+        default=DEFAULT_MAX_OUTPUT_TOKENS,
         help=(
             "Bound each OpenHands model turn. Leaving this unbounded lets "
             "LiteLLM request the rest of the 128k context as output tokens, "
             "which is unstable with vLLM structured decoding."
         ),
     )
-    parser.add_argument(
-        "--no-max-output-tokens",
-        action="store_true",
-        help=(
-            "Ablation-only switch: omit max_output_tokens from the generated "
-            "OpenHands config."
-        ),
-    )
-    parser.add_argument("--timeout", type=int, default=_env_int("LLM_TIMEOUT", 300))
-    parser.add_argument("--dataset", default=_env("DATASET", DEFAULT_DATASET))
-    parser.add_argument("--split", default=_env("SPLIT", DEFAULT_SPLIT))
+    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--dataset", default=DEFAULT_DATASET)
+    parser.add_argument("--split", default=DEFAULT_SPLIT)
     parser.add_argument(
         "--eval-limit",
         type=int,
         default=None,
         help="Limit tasks for smoke runs. Omit for all 500 Verified tasks.",
     )
-    parser.add_argument("--agent", default=_env("AGENT", DEFAULT_AGENT))
+    parser.add_argument("--agent", default=DEFAULT_AGENT)
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=_env_int("MAX_ITERATIONS", PAPER_MAX_ITERATIONS),
+        default=PAPER_MAX_ITERATIONS,
     )
-    default_workers = _env_int(
-        "NUM_WORKERS",
-        _env_int("VLLM_SERVER_COUNT", DEFAULT_VLLM_SERVER_COUNT)
-        * _env_int(
-            "VLLM_AGENT_TASKS_PER_SERVER", DEFAULT_VLLM_AGENT_TASKS_PER_SERVER
-        ),
-    )
+    default_workers = DEFAULT_VLLM_SERVER_COUNT * DEFAULT_VLLM_AGENT_TASKS_PER_SERVER
     parser.add_argument("--num-workers", type=int, default=default_workers)
     parser.add_argument(
         "--eval-note",
-        default=_env("EVAL_NOTE", ""),
+        default="",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(_env("OUT_DIR", str(DEFAULT_OUTPUT_DIR))),
+        default=DEFAULT_OUTPUT_DIR,
     )
     parser.add_argument(
-        "--openhands-repo", default=_env("OPENHANDS_REPO", DEFAULT_OPENHANDS_REPO)
+        "--openhands-repo", default=DEFAULT_OPENHANDS_REPO
     )
     parser.add_argument(
-        "--openhands-ref", default=_env("OPENHANDS_REF", DEFAULT_OPENHANDS_REF)
+        "--openhands-ref", default=DEFAULT_OPENHANDS_REF
     )
     parser.add_argument(
         "--openhands-dir",
         type=Path,
-        default=Path(_env("OPENHANDS_DIR", "eval-runs/OpenHands")),
+        default=Path("eval-runs/OpenHands"),
     )
     parser.add_argument("--model-config-name", default=DEFAULT_MODEL_CONFIG_NAME)
     parser.add_argument("--agent-config-name", default=DEFAULT_AGENT_CONFIG_NAME)
     parser.add_argument(
         "--runtime",
         choices=("docker", "remote"),
-        default=_env("RUNTIME", "docker"),
+        default="docker",
         help="OpenHands runtime backend. Docker is the paper default.",
     )
     parser.add_argument(
         "--docker-smoke-image",
-        default=_env("DOCKER_SMOKE_IMAGE", DEFAULT_DOCKER_SMOKE_IMAGE),
+        default=DEFAULT_DOCKER_SMOKE_IMAGE,
         help=(
             "Image used by the Docker preflight container-run check. "
             "The default is tiny and catches unprivileged pod/userns failures."
@@ -1190,23 +1172,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-docker-run-check",
         action="store_true",
-        default=_env_bool("SKIP_DOCKER_RUN_CHECK", False),
+        default=False,
         help="Skip the preflight docker run --rm smoke container.",
     )
     parser.add_argument(
         "--skip-docker-buildx-check",
         action="store_true",
-        default=_env_bool("SKIP_DOCKER_BUILDX_CHECK", False),
+        default=False,
         help="Skip the preflight docker buildx version check.",
     )
-    parser.add_argument("--vllm-host", default=_env("VLLM_HOST", "0.0.0.0"))
-    parser.add_argument("--vllm-port", type=int, default=_env_int("VLLM_PORT", 8000))
+    parser.add_argument("--vllm-host", default="0.0.0.0")
+    parser.add_argument("--vllm-port", type=int, default=8000)
     parser.add_argument(
         "--vllm-tensor-parallel-size",
         type=int,
-        default=_env_int(
-            "VLLM_TENSOR_PARALLEL_SIZE", DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
-        ),
+        default=DEFAULT_VLLM_TENSOR_PARALLEL_SIZE,
         help=(
             "Tensor-parallel degree for each vLLM server. The canonical pod "
             "launcher keeps this at 1 and runs one vLLM replica per GPU."
@@ -1215,9 +1195,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vllm-pipeline-parallel-size",
         type=int,
-        default=_env_int(
-            "VLLM_PIPELINE_PARALLEL_SIZE", DEFAULT_VLLM_PIPELINE_PARALLEL_SIZE
-        ),
+        default=DEFAULT_VLLM_PIPELINE_PARALLEL_SIZE,
         help=(
             "Pipeline-parallel degree for each vLLM server. The canonical pod "
             "launcher keeps this at 1 and runs one vLLM replica per GPU."
@@ -1226,25 +1204,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vllm-server-count",
         type=int,
-        default=_env_int("VLLM_SERVER_COUNT", DEFAULT_VLLM_SERVER_COUNT),
+        default=DEFAULT_VLLM_SERVER_COUNT,
     )
     parser.add_argument(
         "--vllm-agent-tasks-per-server",
         type=int,
-        default=_env_int(
-            "VLLM_AGENT_TASKS_PER_SERVER", DEFAULT_VLLM_AGENT_TASKS_PER_SERVER
-        ),
+        default=DEFAULT_VLLM_AGENT_TASKS_PER_SERVER,
         help="Concurrent OpenHands workers allocated per vLLM replica.",
     )
     parser.add_argument(
         "--vllm-router-port",
         type=int,
-        default=_env_int("VLLM_ROUTER_PORT", DEFAULT_VLLM_ROUTER_PORT),
+        default=DEFAULT_VLLM_ROUTER_PORT,
     )
     parser.add_argument(
         "--vllm-max-model-len",
         type=int,
-        default=_env_optional_int("VLLM_MAX_MODEL_LEN", None),
+        default=None,
         help=(
             "vLLM server context limit. Defaults to the selected context mode "
             "and must be at least --max-input-tokens."
@@ -1252,7 +1228,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--vllm-rope-scaling",
-        default=_env("VLLM_ROPE_SCALING", "auto"),
+        default="auto",
         help=(
             "RoPE scaling JSON passed to vLLM. The default, auto, uses YaRN "
             "for the 128k modes and no override for base-native-32k."
@@ -1261,42 +1237,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vllm-gpu-memory-utilization",
         type=float,
-        default=_env_float(
-            "VLLM_GPU_MEMORY_UTILIZATION", DEFAULT_VLLM_GPU_MEMORY_UTILIZATION
-        ),
+        default=DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
     )
     parser.add_argument(
         "--vllm-dtype",
-        default=_env("VLLM_DTYPE", DEFAULT_VLLM_DTYPE),
+        default=DEFAULT_VLLM_DTYPE,
     )
     parser.add_argument(
         "--vllm-enable-auto-tool-choice",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("VLLM_ENABLE_AUTO_TOOL_CHOICE", True),
+        default=True,
     )
     parser.add_argument(
         "--vllm-tool-call-parser",
-        default=_env("VLLM_TOOL_CALL_PARSER", "hermes"),
+        default="hermes",
     )
     parser.add_argument(
         "--vllm-distributed-executor-backend",
-        default=_env(
-            "VLLM_DISTRIBUTED_EXECUTOR_BACKEND",
-            DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND,
-        ),
+        default=DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND,
     )
     parser.add_argument(
         "--vllm-enforce-eager",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("VLLM_ENFORCE_EAGER", True),
+        default=True,
     )
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--preflight-only", action="store_true")
-    parser.add_argument("--skip-preflight", action="store_true")
-    parser.add_argument("--skip-llm-endpoint-check", action="store_true")
-    parser.add_argument("--skip-swebench-eval", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", default=False)
+    parser.add_argument("--preflight-only", action="store_true", default=False)
+    parser.add_argument("--skip-preflight", action="store_true", default=False)
+    parser.add_argument("--skip-llm-endpoint-check", action="store_true", default=False)
+    parser.add_argument("--skip-swebench-eval", action="store_true", default=False)
     args = parser.parse_args(argv)
 
+    args.api_key = os.environ.get("LLM_API_KEY") or DEFAULT_API_KEY
+    if os.environ.get("LLM_API_KEY"):
+        args.api_key_source = "LLM_API_KEY"
+    else:
+        args.api_key_source = "default"
     if not args.served_model_name:
         args.served_model_name = args.model_id
     if not args.litellm_model:
@@ -1312,8 +1288,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not args.eval_note:
         args.eval_note = context_spec.default_eval_note
     validate_context_args(args)
-    if args.no_max_output_tokens:
-        args.max_output_tokens = None
     if args.eval_limit is not None and args.eval_limit <= 0:
         raise ValueError("--eval-limit must be positive when provided")
     if not args.base_url and not args.dry_run:

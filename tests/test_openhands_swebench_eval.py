@@ -7,6 +7,8 @@ from unittest import mock
 
 from scripts import openhands_swebench_eval as eval_script
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 class OpenHandsSweBenchEvalTests(unittest.TestCase):
     def _args(self, *extra: str):
@@ -113,15 +115,23 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertNotIn("custom_llm_provider", config)
 
     def test_max_output_tokens_can_be_omitted_for_ablation(self):
-        args = self._args("--no-max-output-tokens")
+        args = self._args("--max-output-tokens", "none")
         config = eval_script.build_openhands_config(args)
 
         self.assertIsNone(args.max_output_tokens)
         self.assertNotIn("max_output_tokens", config)
 
+    def test_api_key_is_llm_api_key_env_only(self):
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "sk-ignored"}, clear=True):
+            args = self._args()
+
+        self.assertEqual(args.api_key, "local-llm")
+        self.assertEqual(args.api_key_source, "default")
+
     def test_write_scaffold_records_commands_without_leaking_real_api_key(self):
-        args = self._args("--api-key", "sk-real-secret")
-        paths, commands = eval_script.write_scaffold(args)
+        with mock.patch.dict("os.environ", {"LLM_API_KEY": "sk-real-secret"}):
+            args = self._args()
+            paths, commands = eval_script.write_scaffold(args)
 
         self.assertTrue(paths.config_path.exists())
         self.assertTrue(paths.commands_path.exists())
@@ -199,6 +209,37 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         metadata = json.loads(paths.metadata_path.read_text())
         self.assertEqual(metadata["context"]["mode"], "base-paper-yarn-128k")
         self.assertEqual(metadata["context"]["vllm_rope_scaling"]["rope_type"], "yarn")
+
+    def test_eval_presets_swap_context_contracts(self):
+        cases = [
+            (
+                "openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args",
+                "paper-yarn-128k",
+                131_072,
+                "swehero-qwen25-coder7b-pass1",
+            ),
+            (
+                "openhands-swebench-verified-qwen25-coder-7b-base-native-32k.args",
+                "base-native-32k",
+                32_768,
+                "base-native-32k-pass1",
+            ),
+            (
+                "openhands-swebench-verified-qwen25-coder-7b-base-paper-yarn-128k.args",
+                "base-paper-yarn-128k",
+                131_072,
+                "base-paper-yarn-128k-pass1",
+            ),
+        ]
+
+        for filename, mode, max_tokens, eval_note in cases:
+            preset = REPO_ROOT / "configs" / "eval" / filename
+            args = self._args(f"@{preset}")
+
+            self.assertEqual(args.context_mode, mode)
+            self.assertEqual(args.max_input_tokens, max_tokens)
+            self.assertEqual(args.vllm_max_model_len, max_tokens)
+            self.assertEqual(args.eval_note, eval_note)
 
     def test_base_native_32k_rejects_forced_128k_context(self):
         with self.assertRaisesRegex(ValueError, "base-native-32k requires"):

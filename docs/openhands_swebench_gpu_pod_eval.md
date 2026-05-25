@@ -10,6 +10,34 @@ The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
 Use `scripts/run_openhands_swebench_eval_pod.sh` from inside that pod. Do not
 run OpenHands or SWE-bench from the laptop.
 
+## Configuration Presets
+
+Eval experiment settings live in argparse preset files under `configs/eval/`.
+The pod launcher defaults to:
+
+```text
+configs/eval/openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args
+```
+
+That preset encodes the paper-aligned Qwen2.5-Coder-7B SWE-bench Verified
+pass@1 eval: local model path, served model name, OpenHands settings, sampling,
+128k YaRN context, vLLM sizing, and the 4096-token per-turn output cap used for
+structured tool-call stability. The Python entrypoint also accepts `@...`
+argparse files directly, but canonical pod launches should pass presets with
+`--config PATH`.
+
+For a different eval, copy a preset, edit the copied file, and swap the
+`--config` path. Use primitive CLI flags after the preset only for one-off run
+controls such as `--eval-limit`, `--output-dir`, `--preflight-only`, and
+`--skip-swebench-eval`. Do not add convenience aliases for those flags.
+
+Environment variables are reserved for secrets and pod/runtime plumbing:
+`LLM_API_KEY`, `WORKSPACE_ROOT`, `VLLM_VENV`, `VLLM_REQUIREMENTS_PATH`,
+`VLLM_FORCE_RESTART`, `VLLM_VISIBLE_DEVICES`, `EVAL_VENV`,
+`OPENHANDS_EVAL_POETRY_VERSION`, `REQUIRED_GPU_COUNT`,
+`SWEHERO_POD_GIT_BRANCH`, and tmux/uv path controls. The API key is env-only;
+set `LLM_API_KEY` when the default `local-llm` key is not appropriate.
+
 ## Pod Requirement
 
 `midtraining-dev` must be created from `manifests/midtraining-hostpath.yaml`.
@@ -44,7 +72,7 @@ branch="$(git branch --show-current)"
 git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --smoke
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --eval-limit 1
 '
 ```
 
@@ -55,7 +83,7 @@ branch="$(git branch --show-current)"
 git push -u origin "$branch"
 kubectl exec -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --smoke --no-attach
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --eval-limit 1 --no-attach
 '
 ```
 
@@ -72,7 +100,7 @@ branch="$(git branch --show-current)"
 git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --full
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh
 '
 ```
 
@@ -86,8 +114,8 @@ branch="$(git branch --show-current)"
 git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --full \
-  --context-mode base-native-32k \
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh \
+  --config configs/eval/openhands-swebench-verified-qwen25-coder-7b-base-native-32k.args \
   --run-id qwen25-coder7b-base-native32k-pass1
 '
 ```
@@ -97,13 +125,13 @@ branch="$(git branch --show-current)"
 git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --full \
-  --context-mode base-paper-yarn-128k \
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh \
+  --config configs/eval/openhands-swebench-verified-qwen25-coder-7b-base-paper-yarn-128k.args \
   --run-id qwen25-coder7b-base-yarn128k-pass1
 '
 ```
 
-`--context-mode` controls the eval context contract:
+The preset's `--context-mode` controls the eval context contract:
 
 - `base-native-32k`: evaluates the released base model inside its native
   32,768-token context window. vLLM starts with `--max-model-len 32768`, no
@@ -119,8 +147,8 @@ SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --
 - `paper-yarn-128k`: the default for SFT/checkpoint evals that are meant to
   match the paper's 128k OpenHands setup.
 
-Changing `CONTEXT_MODE`, `VLLM_MAX_MODEL_LEN`, or `VLLM_ROPE_SCALING` changes
-the vLLM server contract. The launcher writes a context signature under
+Changing a preset's context mode, vLLM max length, or RoPE scaling changes the
+vLLM server contract. The launcher writes a context signature under
 `/workspace/runlogs/<vllm-session>.context` and restarts tmux-managed vLLM
 servers when the requested signature does not match the live endpoint. If a
 non-launcher process is still bound to the port, the launcher stops instead of
@@ -142,45 +170,42 @@ SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --
 The tool-call preflight must return structured `message.tool_calls` for
 Qwen2.5-Coder. If it returns plain assistant text, the eval should not start.
 
-## Defaults
+## Preset Defaults
 
-The launcher defaults are:
+The default eval preset resolves to the experiment settings below. These are
+argparse values, not environment variables:
 
 ```text
-MODEL_ID=/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
-SERVED_MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct
-LITELLM_MODEL=openai/Qwen/Qwen2.5-Coder-7B-Instruct
-LLM_API_KEY=local-llm
-CONTEXT_MODE=paper-yarn-128k
-MAX_INPUT_TOKENS=131072
-VLLM_MAX_MODEL_LEN=131072
-VLLM_ROPE_SCALING={"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}
-VLLM_VENV=/workspace/venvs/openhands-vllm
-VLLM_REQUIREMENTS_PATH=/workspace/jaxels-work-trial/requirements/openhands-vllm.txt
-EVAL_VENV=/workspace/venvs/openhands-eval-pod-py312
-OPENHANDS_DIR=/workspace/eval-runs/OpenHands
-OPENHANDS_REF=0.62.0
-OPENHANDS_EVAL_POETRY_VERSION=2.1.3
-MAX_OUTPUT_TOKENS=8192
-VLLM_ENFORCE_EAGER=1
-VLLM_TENSOR_PARALLEL_SIZE=1
-VLLM_PIPELINE_PARALLEL_SIZE=1
-VLLM_SERVER_COUNT=8
-VLLM_AGENT_TASKS_PER_SERVER=24
-VLLM_ROUTER_PORT=8090
-VLLM_GPU_MEMORY_UTILIZATION=0.90
-VLLM_DTYPE=bfloat16
-VLLM_DISTRIBUTED_EXECUTOR_BACKEND=mp
-REQUIRED_GPU_COUNT=8
+--model-id /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
+--served-model-name Qwen/Qwen2.5-Coder-7B-Instruct
+--litellm-model openai/Qwen/Qwen2.5-Coder-7B-Instruct
+--context-mode paper-yarn-128k
+--max-output-tokens 4096
+--temperature 0.7
+--top-p 0.8
+--top-k 20
+--tool-choice required
+--max-iterations 100
+--num-workers 192
+--openhands-ref 0.62.0
+--vllm-max-model-len 131072
+--vllm-rope-scaling auto
+--vllm-server-count 8
+--vllm-agent-tasks-per-server 24
+--vllm-router-port 8090
+--vllm-gpu-memory-utilization 0.90
+--vllm-dtype bfloat16
+--vllm-distributed-executor-backend mp
+--vllm-enforce-eager
 ```
 
 The launcher starts replicas on ports `8000..8007` and exposes the router on
-port `8090`. `VLLM_AGENT_TASKS_PER_SERVER` controls how many concurrent
-OpenHands workers are budgeted per vLLM replica; the default full-run worker
-count is `8 * 24 = 192`.
+port `8090`. `--vllm-agent-tasks-per-server` controls how many concurrent
+OpenHands workers are budgeted per vLLM replica; the default preset's full-run
+worker count is `8 * 24 = 192`.
 
-Set `MAX_OUTPUT_TOKENS=none` only for ablations that intentionally reproduce
-unbounded-output behavior.
+Set `--max-output-tokens none` only in an explicit preset or one-off CLI
+override for ablations that intentionally reproduce unbounded-output behavior.
 
 Output defaults to:
 
@@ -205,15 +230,15 @@ Override with `--output-dir PATH` when a stable path is needed.
 7. Creates or repairs the Python 3.12 vLLM environment from
    `requirements/openhands-vllm.txt` before starting any missing vLLM server.
 8. Starts one vLLM tmux session per GPU if the endpoints are not already up.
-   The default uses eager execution plus the 8192-token output cap for
+   The default preset uses eager execution plus the 4096-token output cap for
    structured tool-call decoding stability.
 9. Starts `scripts/openai_vllm_router.py` in a pod tmux session, routing to the
    per-GPU vLLM replicas with the configured per-replica concurrency limit.
-10. Syncs the OpenHands evaluation dependencies from the `OPENHANDS_REF`
-   checkout's lockfile.
+10. Syncs the OpenHands evaluation dependencies from the preset's
+   `--openhands-ref` checkout lockfile.
 11. Runs `scripts/openhands_swebench_eval.py` with the router as the model
    endpoint, `tool_choice=required`, bounded per-turn output, and
-   `VLLM_SERVER_COUNT * VLLM_AGENT_TASKS_PER_SERVER` workers for full runs.
+   `--vllm-server-count * --vllm-agent-tasks-per-server` workers for full runs.
 12. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
 
 For the 7B smoke, a healthy run should show `used_real_tools: true` and
