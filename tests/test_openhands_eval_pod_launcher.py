@@ -44,6 +44,13 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
 
         self.assertIn('"$VLLM_VENV/bin/vllm") serve', script)
         self.assertIn("CUDA_VISIBLE_DEVICES=\"$gpu\"", script)
+        self.assertIn('CONTEXT_MODE="${CONTEXT_MODE:-paper-yarn-128k}"', script)
+        self.assertIn('PAPER_YARN_ROPE_SCALING=', script)
+        self.assertIn("--context-mode \"$CONTEXT_MODE\"", script)
+        self.assertIn("--max-input-tokens \"$MAX_INPUT_TOKENS\"", script)
+        self.assertIn("--vllm-max-model-len \"$VLLM_MAX_MODEL_LEN\"", script)
+        self.assertIn("--rope-scaling", script)
+        self.assertIn("vllm_context_signature", script)
         self.assertIn("scripts/openai_vllm_router.py", script)
         self.assertIn('VLLM_AGENT_TASKS_PER_SERVER="${VLLM_AGENT_TASKS_PER_SERVER:-24}"', script)
         self.assertIn("--enable-auto-tool-choice", script)

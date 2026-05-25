@@ -13,6 +13,9 @@ Options:
   --smoke                 Run one SWE-bench Verified instance.
   --eval-limit N          Run N instances. Omit for the full Verified split.
   --full                  Clear any eval limit and run the full Verified split.
+  --context-mode MODE     paper-yarn-128k, base-native-32k, or base-paper-yarn-128k.
+  --base-native-32k       Shortcut for --context-mode base-native-32k.
+  --base-paper-yarn-128k  Shortcut for --context-mode base-paper-yarn-128k.
   --preflight-only        Check vLLM tool calls and Docker, then exit.
   --skip-swebench-eval    Generate patches without running SWE-bench grading.
   --output-dir PATH       Eval output directory. Defaults to a timestamped pod path.
@@ -28,8 +31,12 @@ Environment overrides:
   SERVED_MODEL_NAME       Default: Qwen/Qwen2.5-Coder-7B-Instruct
   LITELLM_MODEL           Default: openai/Qwen/Qwen2.5-Coder-7B-Instruct
   LLM_API_KEY             Default: local-llm
+  CONTEXT_MODE            Default: paper-yarn-128k
+  MAX_INPUT_TOKENS        Default: context-mode dependent.
   VLLM_VENV               Default: /workspace/venvs/openhands-vllm
   VLLM_REQUIREMENTS_PATH  Default: requirements/openhands-vllm.txt
+  VLLM_MAX_MODEL_LEN      Default: context-mode dependent.
+  VLLM_ROPE_SCALING       Default: auto. 128k modes use YaRN; 32k native does not.
   VLLM_TENSOR_PARALLEL_SIZE
                           Default: 1
   VLLM_PIPELINE_PARALLEL_SIZE
@@ -69,16 +76,25 @@ quote_args() {
   printf "%q " "$@"
 }
 
+readonly QWEN_NATIVE_CONTEXT_LENGTH=32768
+readonly PAPER_CONTEXT_LENGTH=131072
+readonly PAPER_YARN_ROPE_SCALING='{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}'
+
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace/jaxels-work-trial}"
 MODEL_ID="${MODEL_ID:-/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen2.5-Coder-7B-Instruct}"
 LITELLM_MODEL="${LITELLM_MODEL:-openai/Qwen/Qwen2.5-Coder-7B-Instruct}"
 LLM_API_KEY="${LLM_API_KEY:-local-llm}"
+CONTEXT_MODE="${CONTEXT_MODE:-paper-yarn-128k}"
+MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-}"
 VLLM_VENV="${VLLM_VENV:-/workspace/venvs/openhands-vllm}"
 VLLM_REQUIREMENTS_PATH="${VLLM_REQUIREMENTS_PATH:-$ROOT_DIR/requirements/openhands-vllm.txt}"
 VLLM_PYTHON_VERSION="${VLLM_PYTHON_VERSION:-3.12}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_VISIBLE_DEVICES="${VLLM_VISIBLE_DEVICES:-${VLLM_GPU:-}}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-}"
+VLLM_ROPE_SCALING="${VLLM_ROPE_SCALING:-auto}"
+VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-auto}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_PIPELINE_PARALLEL_SIZE="${VLLM_PIPELINE_PARALLEL_SIZE:-1}"
@@ -145,6 +161,23 @@ while (($#)); do
       EVAL_LIMIT=""
       shift
       ;;
+    --context-mode)
+      [[ $# -ge 2 ]] || die "--context-mode requires a value"
+      CONTEXT_MODE="$2"
+      shift 2
+      ;;
+    --base-native-32k)
+      CONTEXT_MODE="base-native-32k"
+      shift
+      ;;
+    --base-paper-yarn-128k)
+      CONTEXT_MODE="base-paper-yarn-128k"
+      shift
+      ;;
+    --paper-yarn-128k)
+      CONTEXT_MODE="paper-yarn-128k"
+      shift
+      ;;
     --preflight-only)
       PREFLIGHT_ONLY=1
       shift
@@ -191,6 +224,65 @@ while (($#)); do
   esac
 done
 
+resolve_context_mode() {
+  local default_max_input_tokens
+  local default_vllm_max_model_len
+  local default_vllm_rope_scaling
+  local default_vllm_allow_long
+
+  case "$CONTEXT_MODE" in
+    paper-yarn-128k|base-paper-yarn-128k)
+      default_max_input_tokens="$PAPER_CONTEXT_LENGTH"
+      default_vllm_max_model_len="$PAPER_CONTEXT_LENGTH"
+      default_vllm_rope_scaling="$PAPER_YARN_ROPE_SCALING"
+      default_vllm_allow_long=1
+      ;;
+    base-native-32k)
+      default_max_input_tokens="$QWEN_NATIVE_CONTEXT_LENGTH"
+      default_vllm_max_model_len="$QWEN_NATIVE_CONTEXT_LENGTH"
+      default_vllm_rope_scaling=""
+      default_vllm_allow_long=0
+      ;;
+    *)
+      die "unknown CONTEXT_MODE: $CONTEXT_MODE"
+      ;;
+  esac
+
+  MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-$default_max_input_tokens}"
+  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$default_vllm_max_model_len}"
+  if [[ "$VLLM_ROPE_SCALING" == "auto" ]]; then
+    VLLM_ROPE_SCALING="$default_vllm_rope_scaling"
+  fi
+  local rope_scaling_lower
+  rope_scaling_lower="$(printf "%s" "$VLLM_ROPE_SCALING" | tr "[:upper:]" "[:lower:]")"
+  case "$rope_scaling_lower" in
+    none|null|off|false|disabled)
+      VLLM_ROPE_SCALING=""
+      ;;
+  esac
+  if [[ "$VLLM_ALLOW_LONG_MAX_MODEL_LEN" == "auto" ]]; then
+    VLLM_ALLOW_LONG_MAX_MODEL_LEN="$default_vllm_allow_long"
+  fi
+
+  [[ "$MAX_INPUT_TOKENS" =~ ^[0-9]+$ ]] || die "MAX_INPUT_TOKENS must be an integer"
+  [[ "$VLLM_MAX_MODEL_LEN" =~ ^[0-9]+$ ]] || die "VLLM_MAX_MODEL_LEN must be an integer"
+  (( VLLM_MAX_MODEL_LEN >= MAX_INPUT_TOKENS )) || \
+    die "VLLM_MAX_MODEL_LEN must be >= MAX_INPUT_TOKENS"
+
+  if [[ "$CONTEXT_MODE" == "base-native-32k" ]]; then
+    (( MAX_INPUT_TOKENS <= QWEN_NATIVE_CONTEXT_LENGTH )) || \
+      die "base-native-32k requires MAX_INPUT_TOKENS <= ${QWEN_NATIVE_CONTEXT_LENGTH}"
+    (( VLLM_MAX_MODEL_LEN <= QWEN_NATIVE_CONTEXT_LENGTH )) || \
+      die "base-native-32k requires VLLM_MAX_MODEL_LEN <= ${QWEN_NATIVE_CONTEXT_LENGTH}"
+    [[ -z "$VLLM_ROPE_SCALING" ]] || \
+      die "base-native-32k must not set VLLM_ROPE_SCALING"
+  elif (( VLLM_MAX_MODEL_LEN > QWEN_NATIVE_CONTEXT_LENGTH )) && [[ -z "$VLLM_ROPE_SCALING" ]]; then
+    die "$CONTEXT_MODE requires explicit VLLM_ROPE_SCALING for >32k context"
+  fi
+}
+
+resolve_context_mode
+
 if [[ "$FOREGROUND" != "1" ]]; then
   command -v tmux >/dev/null 2>&1 || die "tmux is required for supervised pod launches"
   mkdir -p "$TMUX_LOG_DIR"
@@ -208,6 +300,7 @@ if [[ "$FOREGROUND" != "1" ]]; then
     if [[ "$SKIP_SWEBENCH_EVAL" == "1" ]]; then
       command+=" --skip-swebench-eval"
     fi
+    command+=" --context-mode $(quote_args "$CONTEXT_MODE")"
     command+=" --output-dir $(quote_args "$OUTPUT_DIR")"
     tmux new-session -d -s "$TMUX_SESSION" "set -euo pipefail; $command 2>&1 | tee -a $(quote_args "$TMUX_LOG_PATH")"
     echo "launched tmux session: $TMUX_SESSION"
@@ -471,7 +564,7 @@ if [[ -n "$VLLM_VISIBLE_DEVICES" && "$VLLM_VISIBLE_DEVICES" != "all" && "$VLLM_S
 fi
 
 cd "$WORKSPACE_ROOT"
-mkdir -p /workspace/runlogs "$OUTPUT_DIR"
+mkdir -p "$TMUX_LOG_DIR" /workspace/runlogs "$OUTPUT_DIR"
 
 ensure_docker() {
   if ! docker info >/dev/null 2>&1; then
@@ -515,17 +608,52 @@ vllm_session_name() {
   printf "%s-%s" "$VLLM_TMUX_SESSION_PREFIX" "$gpu"
 }
 
+vllm_context_signature() {
+  local gpu="$1"
+  local port="$2"
+  cat <<EOF
+CONTEXT_MODE=$CONTEXT_MODE
+MODEL_ID=$MODEL_ID
+SERVED_MODEL_NAME=$SERVED_MODEL_NAME
+MAX_INPUT_TOKENS=$MAX_INPUT_TOKENS
+VLLM_MAX_MODEL_LEN=$VLLM_MAX_MODEL_LEN
+VLLM_ROPE_SCALING=$VLLM_ROPE_SCALING
+VLLM_DTYPE=$VLLM_DTYPE
+VLLM_GPU_MEMORY_UTILIZATION=$VLLM_GPU_MEMORY_UTILIZATION
+VLLM_DISTRIBUTED_EXECUTOR_BACKEND=$VLLM_DISTRIBUTED_EXECUTOR_BACKEND
+VLLM_ENFORCE_EAGER=$VLLM_ENFORCE_EAGER
+GPU=$gpu
+PORT=$port
+EOF
+}
+
 ensure_vllm_server() {
   local ip="$1"
   local gpu="$2"
   local port="$3"
   local session="$4"
   local base_url="http://${ip}:${port}/v1"
+  local context_path="${TMUX_LOG_DIR}/${session}.context"
+  local expected_context
+  expected_context="$(vllm_context_signature "$gpu" "$port")"
   if [[ "$VLLM_FORCE_RESTART" == "1" || "$VLLM_FORCE_RESTART" == "true" ]]; then
     tmux kill-session -t "$session" 2>/dev/null || true
   fi
   if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1; then
-    return
+    if [[ "$VLLM_FORCE_RESTART" != "1" && "$VLLM_FORCE_RESTART" != "true" ]] \
+      && [[ -f "$context_path" ]] \
+      && [[ "$(cat "$context_path")" == "$expected_context" ]]; then
+      return
+    fi
+    echo "restarting vLLM endpoint on ${base_url} for context mode ${CONTEXT_MODE}"
+    tmux kill-session -t "$session" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1 || break
+      sleep 1
+    done
+    if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1; then
+      die "non-matching vLLM endpoint is still serving on ${base_url}; stop it or set a different VLLM_PORT"
+    fi
   fi
 
   ensure_vllm_python
@@ -534,6 +662,8 @@ ensure_vllm_server() {
   local vllm_eager_arg=()
   local vllm_distributed_arg=()
   local cuda_visible_arg=()
+  local vllm_long_context_env=()
+  local vllm_rope_arg=()
   if [[ "$VLLM_ENFORCE_EAGER" == "1" || "$VLLM_ENFORCE_EAGER" == "true" ]]; then
     vllm_eager_arg=(--enforce-eager)
   fi
@@ -545,11 +675,20 @@ ensure_vllm_server() {
   else
     cuda_visible_arg=(CUDA_VISIBLE_DEVICES="$gpu")
   fi
+  if [[ "$VLLM_ALLOW_LONG_MAX_MODEL_LEN" == "1" || "$VLLM_ALLOW_LONG_MAX_MODEL_LEN" == "true" ]]; then
+    vllm_long_context_env=(VLLM_ALLOW_LONG_MAX_MODEL_LEN=1)
+  fi
+  if [[ -n "$VLLM_ROPE_SCALING" ]]; then
+    vllm_rope_arg=(--rope-scaling "$VLLM_ROPE_SCALING")
+  fi
   tmux new-session -d -s "$session" \
-    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host 0.0.0.0 --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len 131072 --tensor-parallel-size 1 --pipeline-parallel-size 1 --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") --enable-auto-tool-choice --tool-call-parser hermes $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
+    "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "${cuda_visible_arg[@]}") $(quote_args "${vllm_long_context_env[@]}") $(quote_args "$VLLM_VENV/bin/vllm") serve $(quote_args "$MODEL_ID") --host 0.0.0.0 --port $(quote_args "$port") --api-key $(quote_args "$LLM_API_KEY") --served-model-name $(quote_args "$SERVED_MODEL_NAME") --max-model-len $(quote_args "$VLLM_MAX_MODEL_LEN") $(quote_args "${vllm_rope_arg[@]}") --tensor-parallel-size 1 --pipeline-parallel-size 1 --gpu-memory-utilization $(quote_args "$VLLM_GPU_MEMORY_UTILIZATION") --dtype $(quote_args "$VLLM_DTYPE") --enable-auto-tool-choice --tool-call-parser hermes $(quote_args "${vllm_distributed_arg[@]}") $(quote_args "${vllm_eager_arg[@]}") > /workspace/runlogs/${session}.log 2>&1"
 
   for _ in $(seq 1 240); do
-    curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1 && return
+    if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${base_url}/models" >/dev/null 2>&1; then
+      printf "%s\n" "$expected_context" > "$context_path"
+      return
+    fi
     sleep 2
   done
   die "vLLM did not become ready; see /workspace/runlogs/${session}.log"
@@ -560,18 +699,45 @@ ensure_vllm_router() {
   local router_url="http://${ip}:${VLLM_ROUTER_PORT}/v1"
   shift
   local backend_args=("$@")
+  local context_path="${TMUX_LOG_DIR}/${VLLM_ROUTER_TMUX_SESSION}.context"
+  local expected_context
+  expected_context="$(
+    {
+      printf "CONTEXT_MODE=%s\n" "$CONTEXT_MODE"
+      printf "VLLM_ROUTER_PORT=%s\n" "$VLLM_ROUTER_PORT"
+      printf "VLLM_AGENT_TASKS_PER_SERVER=%s\n" "$VLLM_AGENT_TASKS_PER_SERVER"
+      printf "LLM_API_KEY_SET=%s\n" "1"
+      printf "BACKEND=%s\n" "${backend_args[@]}"
+    }
+  )"
   if [[ "$VLLM_FORCE_RESTART" == "1" || "$VLLM_FORCE_RESTART" == "true" ]]; then
     tmux kill-session -t "$VLLM_ROUTER_TMUX_SESSION" 2>/dev/null || true
   fi
   if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${router_url}/models" >/dev/null 2>&1; then
-    return
+    if [[ "$VLLM_FORCE_RESTART" != "1" && "$VLLM_FORCE_RESTART" != "true" ]] \
+      && [[ -f "$context_path" ]] \
+      && [[ "$(cat "$context_path")" == "$expected_context" ]]; then
+      return
+    fi
+    echo "restarting vLLM router on ${router_url} for context mode ${CONTEXT_MODE}"
+    tmux kill-session -t "$VLLM_ROUTER_TMUX_SESSION" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${router_url}/models" >/dev/null 2>&1 || break
+      sleep 1
+    done
+    if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${router_url}/models" >/dev/null 2>&1; then
+      die "non-matching vLLM router is still serving on ${router_url}; stop it or set a different VLLM_ROUTER_PORT"
+    fi
   fi
   tmux kill-session -t "$VLLM_ROUTER_TMUX_SESSION" 2>/dev/null || true
   tmux new-session -d -s "$VLLM_ROUTER_TMUX_SESSION" \
     "cd $(quote_args "$WORKSPACE_ROOT") && $(quote_args "$EVAL_VENV/bin/python") scripts/openai_vllm_router.py --listen-host 0.0.0.0 --listen-port $(quote_args "$VLLM_ROUTER_PORT") --api-key $(quote_args "$LLM_API_KEY") --per-backend-concurrency $(quote_args "$VLLM_AGENT_TASKS_PER_SERVER") $(quote_args "${backend_args[@]}") > /workspace/runlogs/${VLLM_ROUTER_TMUX_SESSION}.log 2>&1"
 
   for _ in $(seq 1 90); do
-    curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${router_url}/models" >/dev/null 2>&1 && return
+    if curl -fsS -H "Authorization: Bearer ${LLM_API_KEY}" "${router_url}/models" >/dev/null 2>&1; then
+      printf "%s\n" "$expected_context" > "$context_path"
+      return
+    fi
     sleep 1
   done
   die "vLLM router did not become ready; see /workspace/runlogs/${VLLM_ROUTER_TMUX_SESSION}.log"
@@ -614,6 +780,8 @@ eval_args=(
   --litellm-model "$LITELLM_MODEL"
   --base-url "http://${POD_IP}:${VLLM_ROUTER_PORT}/v1"
   --api-key "$LLM_API_KEY"
+  --context-mode "$CONTEXT_MODE"
+  --max-input-tokens "$MAX_INPUT_TOKENS"
   --output-dir "$OUTPUT_DIR"
   --openhands-dir "$OPENHANDS_DIR"
   --openhands-ref "$OPENHANDS_REF"
@@ -623,10 +791,16 @@ eval_args=(
   --vllm-server-count "$VLLM_SERVER_COUNT"
   --vllm-agent-tasks-per-server "$VLLM_AGENT_TASKS_PER_SERVER"
   --vllm-router-port "$VLLM_ROUTER_PORT"
+  --vllm-max-model-len "$VLLM_MAX_MODEL_LEN"
   --vllm-gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
   --vllm-dtype "$VLLM_DTYPE"
   --vllm-distributed-executor-backend "$VLLM_DISTRIBUTED_EXECUTOR_BACKEND"
 )
+if [[ -n "$VLLM_ROPE_SCALING" ]]; then
+  eval_args+=(--vllm-rope-scaling "$VLLM_ROPE_SCALING")
+else
+  eval_args+=(--vllm-rope-scaling none)
+fi
 if [[ "$VLLM_ENFORCE_EAGER" == "1" || "$VLLM_ENFORCE_EAGER" == "true" ]]; then
   eval_args+=(--vllm-enforce-eager)
 else

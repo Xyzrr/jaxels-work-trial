@@ -70,6 +70,50 @@ scripts/run_openhands_swebench_eval_pod.sh --full
 '
 ```
 
+## Base Model Eval Modes
+
+For a full base-model comparison against an SFT checkpoint, run both base modes
+with explicit run IDs:
+
+```bash
+kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
+cd /workspace/jaxels-work-trial
+scripts/run_openhands_swebench_eval_pod.sh --full --base-native-32k \
+  --run-id qwen25-coder7b-base-native32k-pass1
+'
+```
+
+```bash
+kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
+cd /workspace/jaxels-work-trial
+scripts/run_openhands_swebench_eval_pod.sh --full --base-paper-yarn-128k \
+  --run-id qwen25-coder7b-base-yarn128k-pass1
+'
+```
+
+The modes mean different things:
+
+- `base-native-32k`: evaluates the released base model inside its native
+  32,768-token context window. vLLM starts with `--max-model-len 32768`, no
+  YaRN `--rope-scaling`, and OpenHands is configured with
+  `max_input_tokens = 32768`. This is the clean "as shipped" base baseline.
+  Because OpenHands 0.62.0 sends `max_output_tokens` to the model while its
+  `max_input_tokens` field is not a hard truncation mechanism, this mode may
+  surface real native-context request failures on longer trajectories.
+- `base-paper-yarn-128k`: evaluates the same base model with the paper-style
+  131,072-token context budget. vLLM starts with `--max-model-len 131072` plus
+  YaRN rope scaling from the native 32k window, and OpenHands is configured
+  with `max_input_tokens = 131072`. This is the context-matched base control.
+- `paper-yarn-128k`: the default for SFT/checkpoint evals that are meant to
+  match the paper's 128k OpenHands setup.
+
+Changing `CONTEXT_MODE`, `VLLM_MAX_MODEL_LEN`, or `VLLM_ROPE_SCALING` changes
+the vLLM server contract. The launcher writes a context signature under
+`/workspace/runlogs/<vllm-session>.context` and restarts tmux-managed vLLM
+servers when the requested signature does not match the live endpoint. If a
+non-launcher process is still bound to the port, the launcher stops instead of
+silently reusing it.
+
 ## Preflight Only
 
 Check the pod runtime, Docker, vLLM, and structured tool calling:
@@ -93,6 +137,10 @@ MODEL_ID=/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
 SERVED_MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct
 LITELLM_MODEL=openai/Qwen/Qwen2.5-Coder-7B-Instruct
 LLM_API_KEY=local-llm
+CONTEXT_MODE=paper-yarn-128k
+MAX_INPUT_TOKENS=131072
+VLLM_MAX_MODEL_LEN=131072
+VLLM_ROPE_SCALING={"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}
 VLLM_VENV=/workspace/venvs/openhands-vllm
 VLLM_REQUIREMENTS_PATH=/workspace/jaxels-work-trial/requirements/openhands-vllm.txt
 EVAL_VENV=/workspace/venvs/openhands-eval-pod-py312

@@ -51,6 +51,8 @@ DEFAULT_OUTPUT_DIR = Path("eval-runs/openhands-swebench-verified-pass1")
 # The canonical wrapper invokes that backend inside the GPU pod.
 SWE_BENCH_DOCKER_ENVIRONMENT = "local"
 PAPER_CONTEXT_LENGTH = 131_072
+QWEN_NATIVE_CONTEXT_LENGTH = 32_768
+PAPER_YARN_FACTOR = PAPER_CONTEXT_LENGTH / QWEN_NATIVE_CONTEXT_LENGTH
 PAPER_MAX_ITERATIONS = 100
 PAPER_TEMPERATURE = 0.7
 PAPER_TOP_P = 0.8
@@ -66,6 +68,20 @@ DEFAULT_VLLM_ROUTER_PORT = 8090
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.90
 DEFAULT_VLLM_DTYPE = "bfloat16"
 DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND = "mp"
+CONTEXT_MODE_PAPER_YARN_128K = "paper-yarn-128k"
+CONTEXT_MODE_BASE_NATIVE_32K = "base-native-32k"
+CONTEXT_MODE_BASE_PAPER_YARN_128K = "base-paper-yarn-128k"
+CONTEXT_MODES = (
+    CONTEXT_MODE_PAPER_YARN_128K,
+    CONTEXT_MODE_BASE_NATIVE_32K,
+    CONTEXT_MODE_BASE_PAPER_YARN_128K,
+)
+DEFAULT_CONTEXT_MODE = CONTEXT_MODE_PAPER_YARN_128K
+PAPER_YARN_ROPE_SCALING = {
+    "rope_type": "yarn",
+    "factor": PAPER_YARN_FACTOR,
+    "original_max_position_embeddings": QWEN_NATIVE_CONTEXT_LENGTH,
+}
 TOOL_CALL_PREFLIGHT_NAME = "report_eval_preflight"
 TOOL_CALL_PREFLIGHT_TOOL = {
     "type": "function",
@@ -112,6 +128,131 @@ class EvalCommands:
     run_infer: list[str]
     run_eval: list[str]
     serve_vllm: list[str]
+
+
+@dataclass(frozen=True)
+class ContextModeSpec:
+    mode: str
+    description: str
+    max_input_tokens: int
+    vllm_max_model_len: int
+    vllm_rope_scaling: str | None
+    default_eval_note: str
+
+
+def paper_yarn_rope_scaling_json() -> str:
+    return json.dumps(PAPER_YARN_ROPE_SCALING, separators=(",", ":"))
+
+
+def context_mode_spec(mode: str) -> ContextModeSpec:
+    if mode == CONTEXT_MODE_PAPER_YARN_128K:
+        return ContextModeSpec(
+            mode=mode,
+            description=(
+                "Paper-aligned 128k context using YaRN scaling from the "
+                "Qwen2.5-Coder native 32k window."
+            ),
+            max_input_tokens=PAPER_CONTEXT_LENGTH,
+            vllm_max_model_len=PAPER_CONTEXT_LENGTH,
+            vllm_rope_scaling=paper_yarn_rope_scaling_json(),
+            default_eval_note="swehero-qwen25-coder7b-pass1",
+        )
+    if mode == CONTEXT_MODE_BASE_NATIVE_32K:
+        return ContextModeSpec(
+            mode=mode,
+            description=(
+                "Released base-model baseline at Qwen2.5-Coder's native 32k "
+                "context, without long-context rope overrides."
+            ),
+            max_input_tokens=QWEN_NATIVE_CONTEXT_LENGTH,
+            vllm_max_model_len=QWEN_NATIVE_CONTEXT_LENGTH,
+            vllm_rope_scaling=None,
+            default_eval_note="base-native-32k-pass1",
+        )
+    if mode == CONTEXT_MODE_BASE_PAPER_YARN_128K:
+        return ContextModeSpec(
+            mode=mode,
+            description=(
+                "Base-model control with the same 128k YaRN context budget as "
+                "the paper-aligned SFT evaluation."
+            ),
+            max_input_tokens=PAPER_CONTEXT_LENGTH,
+            vllm_max_model_len=PAPER_CONTEXT_LENGTH,
+            vllm_rope_scaling=paper_yarn_rope_scaling_json(),
+            default_eval_note="base-paper-yarn-128k-pass1",
+        )
+    raise ValueError(f"unknown context mode: {mode}")
+
+
+def normalize_optional_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value.lower() in {"", "none", "null", "off", "false", "disabled"}:
+        return None
+    return value
+
+
+def resolve_vllm_rope_scaling(
+    requested: str | None, context_spec: ContextModeSpec
+) -> str | None:
+    requested = normalize_optional_value(requested)
+    if requested is None:
+        return None
+    if requested.lower() == "auto":
+        return context_spec.vllm_rope_scaling
+    return requested
+
+
+def decoded_vllm_rope_scaling(value: str | None) -> object:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def validate_context_args(args: argparse.Namespace) -> None:
+    if args.context_mode == CONTEXT_MODE_BASE_NATIVE_32K:
+        if args.max_input_tokens > QWEN_NATIVE_CONTEXT_LENGTH:
+            raise ValueError(
+                f"{CONTEXT_MODE_BASE_NATIVE_32K} requires "
+                f"--max-input-tokens <= {QWEN_NATIVE_CONTEXT_LENGTH}; use "
+                f"{CONTEXT_MODE_BASE_PAPER_YARN_128K} for the 128k base-model "
+                "control."
+            )
+        if args.vllm_max_model_len > QWEN_NATIVE_CONTEXT_LENGTH:
+            raise ValueError(
+                f"{CONTEXT_MODE_BASE_NATIVE_32K} requires "
+                f"--vllm-max-model-len <= {QWEN_NATIVE_CONTEXT_LENGTH}; use "
+                f"{CONTEXT_MODE_BASE_PAPER_YARN_128K} for the 128k base-model "
+                "control."
+            )
+        if args.vllm_rope_scaling is not None:
+            raise ValueError(
+                f"{CONTEXT_MODE_BASE_NATIVE_32K} must not set "
+                "--vllm-rope-scaling; it is the no-YaRN native-context "
+                "baseline."
+            )
+        if args.vllm_max_model_len < args.max_input_tokens:
+            raise ValueError(
+                "--vllm-max-model-len must be greater than or equal to "
+                "--max-input-tokens"
+            )
+        return
+
+    if args.vllm_max_model_len < args.max_input_tokens:
+        raise ValueError(
+            "--vllm-max-model-len must be greater than or equal to "
+            "--max-input-tokens"
+        )
+
+    if args.vllm_max_model_len > QWEN_NATIVE_CONTEXT_LENGTH and not args.vllm_rope_scaling:
+        raise ValueError(
+            f"{args.context_mode} extends Qwen2.5-Coder beyond "
+            f"{QWEN_NATIVE_CONTEXT_LENGTH} tokens and requires explicit "
+            "vLLM YaRN rope scaling."
+        )
 
 
 def _env(name: str, default: str) -> str:
@@ -318,8 +459,10 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
         "--served-model-name",
         served_model_name,
         "--max-model-len",
-        str(args.max_input_tokens),
+        str(args.vllm_max_model_len),
     ]
+    if args.vllm_rope_scaling:
+        serve_vllm.extend(["--rope-scaling", args.vllm_rope_scaling])
     if args.vllm_tensor_parallel_size:
         serve_vllm.extend(
             ["--tensor-parallel-size", str(args.vllm_tensor_parallel_size)]
@@ -385,6 +528,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
+            "context_mode": args.context_mode,
             "max_input_tokens": args.max_input_tokens,
             "max_output_tokens": args.max_output_tokens,
             "max_interaction_rounds": args.max_iterations,
@@ -394,6 +538,7 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
         "paper_caveats": [
             "The paper says reported results average three evaluation passes; this scaffold defaults to one pass@1 run per user request.",
             "The paper does not publish an exact OpenHands git commit; openhands_ref is recorded explicitly.",
+            "The base-native-32k and base-paper-yarn-128k modes are controls for base-model comparison; the paper's final eval description fixes 128k context for trained models.",
         ],
         "openhands": {
             "repo": args.openhands_repo,
@@ -411,6 +556,17 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "tool_choice": args.tool_choice if args.native_tool_calling else None,
             "tool_call_preflight": args.tool_call_preflight,
         },
+        "context": {
+            "mode": args.context_mode,
+            "description": context_mode_spec(args.context_mode).description,
+            "qwen_native_context_tokens": QWEN_NATIVE_CONTEXT_LENGTH,
+            "paper_context_tokens": PAPER_CONTEXT_LENGTH,
+            "max_input_tokens": args.max_input_tokens,
+            "vllm_max_model_len": args.vllm_max_model_len,
+            "vllm_rope_scaling": decoded_vllm_rope_scaling(
+                args.vllm_rope_scaling
+            ),
+        },
         "dataset": {
             "name": args.dataset,
             "split": args.split,
@@ -427,6 +583,8 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "vllm_server_count": args.vllm_server_count,
             "vllm_agent_tasks_per_server": args.vllm_agent_tasks_per_server,
             "vllm_router_port": args.vllm_router_port,
+            "vllm_max_model_len": args.vllm_max_model_len,
+            "vllm_rope_scaling": args.vllm_rope_scaling,
             "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
             "vllm_dtype": args.vllm_dtype,
             "vllm_distributed_executor_backend": (
@@ -938,9 +1096,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds to wait for the vLLM tool-call preflight request.",
     )
     parser.add_argument(
+        "--context-mode",
+        choices=CONTEXT_MODES,
+        default=_env("CONTEXT_MODE", DEFAULT_CONTEXT_MODE),
+        help=(
+            "Evaluation context budget. Use base-native-32k for an as-released "
+            "base-model baseline, or base-paper-yarn-128k for a context-matched "
+            "base-model control."
+        ),
+    )
+    parser.add_argument(
         "--max-input-tokens",
         type=int,
-        default=_env_int("MAX_INPUT_TOKENS", PAPER_CONTEXT_LENGTH),
+        default=_env_optional_int("MAX_INPUT_TOKENS", None),
     )
     parser.add_argument(
         "--max-output-tokens",
@@ -985,7 +1153,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=default_workers)
     parser.add_argument(
         "--eval-note",
-        default=_env("EVAL_NOTE", "swehero-qwen25-coder7b-pass1"),
+        default=_env("EVAL_NOTE", ""),
     )
     parser.add_argument(
         "--output-dir",
@@ -1074,6 +1242,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env_int("VLLM_ROUTER_PORT", DEFAULT_VLLM_ROUTER_PORT),
     )
     parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=_env_optional_int("VLLM_MAX_MODEL_LEN", None),
+        help=(
+            "vLLM server context limit. Defaults to the selected context mode "
+            "and must be at least --max-input-tokens."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-rope-scaling",
+        default=_env("VLLM_ROPE_SCALING", "auto"),
+        help=(
+            "RoPE scaling JSON passed to vLLM. The default, auto, uses YaRN "
+            "for the 128k modes and no override for base-native-32k."
+        ),
+    )
+    parser.add_argument(
         "--vllm-gpu-memory-utilization",
         type=float,
         default=_env_float(
@@ -1116,6 +1301,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.served_model_name = args.model_id
     if not args.litellm_model:
         args.litellm_model = None
+    context_spec = context_mode_spec(args.context_mode)
+    if args.max_input_tokens is None:
+        args.max_input_tokens = context_spec.max_input_tokens
+    if args.vllm_max_model_len is None:
+        args.vllm_max_model_len = context_spec.vllm_max_model_len
+    args.vllm_rope_scaling = resolve_vllm_rope_scaling(
+        args.vllm_rope_scaling, context_spec
+    )
+    if not args.eval_note:
+        args.eval_note = context_spec.default_eval_note
+    validate_context_args(args)
     if args.no_max_output_tokens:
         args.max_output_tokens = None
     if args.eval_limit is not None and args.eval_limit <= 0:

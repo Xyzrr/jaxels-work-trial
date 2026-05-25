@@ -35,11 +35,22 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertEqual(args.split, "test")
         self.assertEqual(args.agent, "CodeActAgent")
         self.assertEqual(args.max_iterations, 100)
+        self.assertEqual(args.context_mode, "paper-yarn-128k")
         self.assertEqual(args.max_input_tokens, 131_072)
+        self.assertEqual(args.vllm_max_model_len, 131_072)
+        self.assertEqual(
+            json.loads(args.vllm_rope_scaling),
+            {
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32_768,
+            },
+        )
         self.assertEqual(args.temperature, 0.7)
         self.assertEqual(args.top_p, 0.8)
         self.assertEqual(args.top_k, 20)
         self.assertEqual(args.max_output_tokens, 8192)
+        self.assertEqual(args.eval_note, "swehero-qwen25-coder7b-pass1")
         self.assertIsNone(args.eval_limit)
         self.assertTrue(args.native_tool_calling)
         self.assertEqual(args.tool_choice, "required")
@@ -126,11 +137,22 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
             "evaluation/benchmarks/swe_bench/scripts/eval_infer.sh",
             commands.run_eval,
         )
+        self.assertEqual(metadata["context"]["mode"], "paper-yarn-128k")
+        self.assertEqual(metadata["context"]["max_input_tokens"], 131_072)
+        self.assertEqual(metadata["context"]["vllm_max_model_len"], 131_072)
+        self.assertEqual(metadata["context"]["vllm_rope_scaling"]["rope_type"], "yarn")
 
     def test_vllm_command_enables_qwen_native_tool_calling(self):
         args = self._args()
         _paths, commands = eval_script.write_scaffold(args)
 
+        self.assertIn("--max-model-len", commands.serve_vllm)
+        self.assertIn("131072", commands.serve_vllm)
+        self.assertIn("--rope-scaling", commands.serve_vllm)
+        self.assertIn(
+            '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}',
+            commands.serve_vllm,
+        )
         self.assertIn("--enable-auto-tool-choice", commands.serve_vllm)
         self.assertIn("--tool-call-parser", commands.serve_vllm)
         self.assertIn("hermes", commands.serve_vllm)
@@ -145,6 +167,47 @@ class OpenHandsSweBenchEvalTests(unittest.TestCase):
         self.assertIn("--distributed-executor-backend", commands.serve_vllm)
         self.assertIn("mp", commands.serve_vllm)
         self.assertIn("--enforce-eager", commands.serve_vllm)
+
+    def test_base_native_32k_context_mode_uses_native_context_without_yarn(self):
+        args = self._args("--context-mode", "base-native-32k")
+        paths, commands = eval_script.write_scaffold(args)
+
+        self.assertEqual(args.max_input_tokens, 32_768)
+        self.assertEqual(args.vllm_max_model_len, 32_768)
+        self.assertIsNone(args.vllm_rope_scaling)
+        self.assertEqual(args.eval_note, "base-native-32k-pass1")
+        self.assertNotIn("--rope-scaling", commands.serve_vllm)
+        self.assertIn("32768", commands.serve_vllm)
+        config = paths.config_path.read_text()
+        self.assertIn("max_input_tokens = 32768", config)
+        metadata = json.loads(paths.metadata_path.read_text())
+        self.assertEqual(metadata["context"]["mode"], "base-native-32k")
+        self.assertIsNone(metadata["context"]["vllm_rope_scaling"])
+
+    def test_base_paper_yarn_128k_context_mode_uses_context_matched_yarn(self):
+        args = self._args("--context-mode", "base-paper-yarn-128k")
+        paths, commands = eval_script.write_scaffold(args)
+
+        self.assertEqual(args.max_input_tokens, 131_072)
+        self.assertEqual(args.vllm_max_model_len, 131_072)
+        self.assertEqual(args.eval_note, "base-paper-yarn-128k-pass1")
+        self.assertIn("--rope-scaling", commands.serve_vllm)
+        self.assertIn(
+            '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}',
+            commands.serve_vllm,
+        )
+        metadata = json.loads(paths.metadata_path.read_text())
+        self.assertEqual(metadata["context"]["mode"], "base-paper-yarn-128k")
+        self.assertEqual(metadata["context"]["vllm_rope_scaling"]["rope_type"], "yarn")
+
+    def test_base_native_32k_rejects_forced_128k_context(self):
+        with self.assertRaisesRegex(ValueError, "base-native-32k requires"):
+            self._args(
+                "--context-mode",
+                "base-native-32k",
+                "--max-input-tokens",
+                "131072",
+            )
 
     def test_summarize_report_computes_pass_at_1_from_resolved_ids(self):
         report_path = Path(self.tempdir.name) / "report.json"
