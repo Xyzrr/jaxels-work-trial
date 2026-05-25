@@ -26,6 +26,11 @@ spec:
           command -v ssh >/dev/null 2>&1 || missing_packages+=(openssh-client)
           command -v cc >/dev/null 2>&1 || missing_packages+=(build-essential)
           command -v lspci >/dev/null 2>&1 || missing_packages+=(pciutils)
+          command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
+          command -v docker >/dev/null 2>&1 || missing_packages+=(docker.io)
+          command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
+          command -v python3 >/dev/null 2>&1 || missing_packages+=(python3 python3-venv python3-pip)
+          docker buildx version >/dev/null 2>&1 || missing_packages+=(docker-buildx)
           if ((${#missing_packages[@]})); then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
@@ -38,6 +43,8 @@ spec:
             --install-dir /workspace/python \
             --no-bin
           sleep infinity
+      securityContext:
+        privileged: true
       resources:
         limits:
           nvidia.com/gpu: 8
@@ -49,8 +56,14 @@ spec:
       volumeMounts:
         - name: workspace
           mountPath: /workspace
+        - name: docker-graph
+          mountPath: /var/lib/docker
   volumes:
     - name: workspace
       hostPath:
         path: /workspace
         type: Directory
+    - name: docker-graph
+      hostPath:
+        path: /workspace/pod-docker-data/midtraining-dev
+        type: DirectoryOrCreate

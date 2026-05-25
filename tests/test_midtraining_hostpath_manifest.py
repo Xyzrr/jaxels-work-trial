@@ -31,9 +31,24 @@ class MidtrainingHostpathManifestTests(unittest.TestCase):
             manifest,
         )
         self.assertIn(
+            "command -v docker >/dev/null 2>&1 || missing_packages+=(docker.io)",
+            manifest,
+        )
+        self.assertIn(
+            "docker buildx version >/dev/null 2>&1 || missing_packages+=(docker-buildx)",
+            manifest,
+        )
+        self.assertIn(
+            "command -v curl >/dev/null 2>&1 || missing_packages+=(curl)",
+            manifest,
+        )
+        self.assertIn(
             'apt-get install -y --no-install-recommends "${missing_packages[@]}"',
             manifest,
         )
+        self.assertIn("securityContext:\n        privileged: true", manifest)
+        self.assertIn("mountPath: /var/lib/docker", manifest)
+        self.assertIn("path: /workspace/pod-docker-data/midtraining-dev", manifest)
 
 
 if __name__ == "__main__":
