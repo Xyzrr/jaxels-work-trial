@@ -7,8 +7,41 @@ VENV_PATH="${TORCHTITAN_POD_VENV:-/workspace/venvs/torchtitan-swehero-cu128}"
 SETUP_SCRIPT="${TORCHTITAN_POD_SETUP_SCRIPT:-$ROOT_DIR/scripts/setup_torchtitan_pod_venv.sh}"
 DEFAULT_OUT_DIR="/workspace/qwen25-coder7b-swehero-torchtitan"
 
+# shellcheck source=scripts/pod_git_guard.sh
+source "$ROOT_DIR/scripts/pod_git_guard.sh"
+
 shell_quote() {
   printf "%q" "$1"
+}
+
+should_enforce_pod_git_guard() {
+  case "${SWEHERO_POD_GIT_ENFORCE:-auto}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    0|false|FALSE|no|NO|off|OFF)
+      return 1
+      ;;
+    auto|AUTO|"")
+      [[ "$ROOT_DIR" == "${SWEHERO_POD_GIT_ROOT:-/workspace/jaxels-work-trial}" ]]
+      return
+      ;;
+    *)
+      cat >&2 <<EOF
+SWEHERO_POD_GIT_ENFORCE must be auto, 1, or 0; got:
+  $SWEHERO_POD_GIT_ENFORCE
+EOF
+      exit 2
+      ;;
+  esac
+}
+
+ensure_pod_git_checkout() {
+  should_enforce_pod_git_guard || return 0
+  swehero_require_pod_git_checkout \
+    "$ROOT_DIR" \
+    "${SWEHERO_POD_GIT_BRANCH:-}" \
+    "TorchTitan pod execution directory"
 }
 
 python_for_arg_parsing() {
@@ -197,6 +230,8 @@ EOF
     exit 0
   fi
 
+  ensure_pod_git_checkout
+
   local env_file
   env_file="$(mktemp "$env_dir/$session_name.env.XXXXXX")"
   chmod 600 "$env_file"
@@ -246,6 +281,8 @@ EOF
 if should_use_tmux_supervisor "$@"; then
   attach_or_create_tmux_session "$@"
 fi
+
+ensure_pod_git_checkout
 
 "$SETUP_SCRIPT" --venv "$VENV_PATH"
 

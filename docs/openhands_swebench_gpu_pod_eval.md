@@ -40,18 +40,22 @@ can report a reachable daemon while still failing container execution.
 Run a one-instance smoke:
 
 ```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_openhands_swebench_eval_pod.sh --smoke
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --smoke
 '
 ```
 
 For a non-attached launch:
 
 ```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
 kubectl exec -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_openhands_swebench_eval_pod.sh --smoke --no-attach
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --smoke --no-attach
 '
 ```
 
@@ -64,9 +68,11 @@ The launcher creates a tmux session named
 Run the full SWE-bench Verified split:
 
 ```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_openhands_swebench_eval_pod.sh --full
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --full
 '
 ```
 
@@ -76,18 +82,22 @@ For a full base-model comparison against an SFT checkpoint, run both base
 context modes with explicit run IDs:
 
 ```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_openhands_swebench_eval_pod.sh --full \
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --full \
   --context-mode base-native-32k \
   --run-id qwen25-coder7b-base-native32k-pass1
 '
 ```
 
 ```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_openhands_swebench_eval_pod.sh --full \
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --full \
   --context-mode base-paper-yarn-128k \
   --run-id qwen25-coder7b-base-yarn128k-pass1
 '
@@ -121,9 +131,11 @@ silently reusing it.
 Check the pod runtime, Docker, vLLM, and structured tool calling:
 
 ```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
 kubectl exec -it -n midtraining midtraining-dev -- bash -lc '
 cd /workspace/jaxels-work-trial
-scripts/run_openhands_swebench_eval_pod.sh --preflight-only --foreground
+SWEHERO_POD_GIT_BRANCH='"$branch"' scripts/run_openhands_swebench_eval_pod.sh --preflight-only --foreground
 '
 ```
 
@@ -181,25 +193,28 @@ Override with `--output-dir PATH` when a stable path is needed.
 ## What the Launcher Does
 
 1. Refuses to run on macOS or outside `/workspace`.
-2. Bootstraps and verifies the pinned `uv 0.11.16` binary if the pod does not
+2. Refuses to launch a new run unless `SWEHERO_POD_GIT_BRANCH` names the
+   current local worktree branch and `/workspace/jaxels-work-trial` is clean,
+   checked out to that branch, and fast-forwarded to `origin/<branch>`.
+3. Bootstraps and verifies the pinned `uv 0.11.16` binary if the pod does not
    already have it.
-3. Starts `dockerd` in a pod tmux session if needed.
-4. Verifies Docker by running a real container and checking Buildx.
-5. Creates or repairs the Python 3.12 eval environment, including
+4. Starts `dockerd` in a pod tmux session if needed.
+5. Verifies Docker by running a real container and checking Buildx.
+6. Creates or repairs the Python 3.12 eval environment, including
    `poetry==2.1.3`.
-6. Creates or repairs the Python 3.12 vLLM environment from
+7. Creates or repairs the Python 3.12 vLLM environment from
    `requirements/openhands-vllm.txt` before starting any missing vLLM server.
-7. Starts one vLLM tmux session per GPU if the endpoints are not already up.
+8. Starts one vLLM tmux session per GPU if the endpoints are not already up.
    The default uses eager execution plus the 8192-token output cap for
    structured tool-call decoding stability.
-8. Starts `scripts/openai_vllm_router.py` in a pod tmux session, routing to the
+9. Starts `scripts/openai_vllm_router.py` in a pod tmux session, routing to the
    per-GPU vLLM replicas with the configured per-replica concurrency limit.
-9. Syncs the OpenHands evaluation dependencies from the `OPENHANDS_REF`
+10. Syncs the OpenHands evaluation dependencies from the `OPENHANDS_REF`
    checkout's lockfile.
-10. Runs `scripts/openhands_swebench_eval.py` with the router as the model
+11. Runs `scripts/openhands_swebench_eval.py` with the router as the model
    endpoint, `tool_choice=required`, bounded per-turn output, and
    `VLLM_SERVER_COUNT * VLLM_AGENT_TASKS_PER_SERVER` workers for full runs.
-11. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
+12. Prints `agent_tool_use` and the SWE-bench pass@1 summary.
 
 For the 7B smoke, a healthy run should show `used_real_tools: true` and
 structured `tool_calls` in the preflight before reporting pass@1. `loop_errors`

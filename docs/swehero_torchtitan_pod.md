@@ -8,6 +8,7 @@ The canonical pod runtime is:
 
 ```bash
 cd /workspace/jaxels-work-trial
+export SWEHERO_POD_GIT_BRANCH=your-local-branch
 scripts/run_qwen_swehero_torchtitan_pod.sh \
   --out-dir /workspace/qwen25-coder7b-swehero-torchtitan \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
@@ -98,6 +99,26 @@ KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
   kubectl exec -n midtraining midtraining-dev -- \
     bash -lc 'ssh -T git@github.com || true; git -C /workspace/jaxels-work-trial pull --ff-only'
 ```
+
+Before launching a new canonical training session from the workstation, pass the
+current local worktree branch into the pod:
+
+```bash
+branch="$(git branch --show-current)"
+git push -u origin "$branch"
+KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
+  kubectl exec -it -n midtraining midtraining-dev -- \
+    env SWEHERO_POD_GIT_BRANCH="$branch" bash -lc '
+cd /workspace/jaxels-work-trial
+scripts/run_qwen_swehero_torchtitan_pod.sh @configs/swehero-7b.args
+'
+```
+
+For a new launch, the wrapper refuses to run unless
+`/workspace/jaxels-work-trial` is clean, checked out to that branch, and
+fast-forwardable to the current `origin/<branch>` head. It fails instead of
+discarding dirty files or pod-local commits that have not been pushed. Reruns
+that only reconnect to an existing tmux session do not mutate the checkout.
 
 The CUDA base image does not include Python. The pod entrypoint uses the pinned
 `/workspace/uv/uv-0.11.16/uv` binary to install CPython 3.10.12 under

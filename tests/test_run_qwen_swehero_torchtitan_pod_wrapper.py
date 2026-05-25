@@ -86,6 +86,7 @@ class QwenSweHeroPodWrapperTests(unittest.TestCase):
             "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
             "TORCHTITAN_POD_VENV": str(tmp / "venv"),
             "TORCHTITAN_POD_SETUP_SCRIPT": str(tmp / "setup.sh"),
+            "SWEHERO_POD_GIT_ENFORCE": "0",
             "SWEHERO_POD_TMUX_LOG_DIR": str(tmp / "runlogs"),
             "SWEHERO_POD_TMUX_ENV_DIR": str(tmp / "tmux-env"),
             "FAKE_RUNTIME_LOG": str(runtime_log),

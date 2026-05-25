@@ -18,6 +18,14 @@ class OpenHandsEvalPodLauncherTests(unittest.TestCase):
         self.assertNotIn("127.0.0.1", script)
         self.assertNotIn("openhands" + "-eval-driver", script)
 
+    def test_launcher_enforces_pushed_clean_pod_git_checkout(self):
+        script = SCRIPT.read_text()
+
+        self.assertIn('source "$ROOT_DIR/scripts/pod_git_guard.sh"', script)
+        self.assertIn("swehero_require_pod_git_checkout", script)
+        self.assertIn("SWEHERO_POD_GIT_BRANCH", script)
+        self.assertIn("OpenHands eval pod execution directory", script)
+
     def test_launcher_verifies_docker_and_buildx(self):
         script = SCRIPT.read_text()
 
