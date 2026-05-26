@@ -1,9 +1,13 @@
 # Python uv Project
 
-The repository is a modern `uv` Python project for all local automation,
-tests, linting, and formatting. The vendored `torchtitan/` tree remains outside
-this project boundary and must not be modified or managed by this
-`pyproject.toml`.
+The repository is a modern `uv` Python project for local automation, tests,
+linting, and formatting. It is not the machine-learning runtime. The local
+environment runs launchers, validators, config parsing, and lightweight unit
+tests; it does not train models, serve vLLM, or import the full CUDA/PyTorch
+stack used in the GPU pod.
+
+The vendored `torchtitan/` tree remains outside this project boundary and must
+not be modified or managed by this `pyproject.toml`.
 
 ## Pinned Toolchain
 
@@ -21,6 +25,14 @@ The GPU pod runtime still has two runtime-specific Python contracts:
   launchers.
 
 Those pod runtimes are intentionally separate from the local project venv.
+PyTorch, CUDA wheels, TorchAO FP8 support, Triton kernels, vLLM, OpenHands, and
+SWE-bench have tight and sometimes conflicting dependency constraints. Keeping
+them out of the local `uv.lock` prevents a tooling sync from silently changing
+the numerical training stack, model-serving behavior, or grader environment.
+
+The local `uv.lock` should therefore stay small: it pins developer tooling.
+Training and eval runtime pins live in `requirements/` and are repaired inside
+the pod before a run starts.
 
 ## Local Setup
 
@@ -51,9 +63,24 @@ interleaved.
 
 GitHub Actions runs the same command in `.github/workflows/validation.yml`.
 
+These checks prove that project-owned Python automation and configuration
+plumbing still behave as expected. They are intentionally not a substitute for
+GPU-pod validation: changes to model architecture, tokenizer assets, sequence
+length, precision, distributed training, vLLM sizing, or SWE-bench grading must
+be verified through the workflow-specific pod commands documented in
+`docs/swehero_torchtitan_pod.md` and
+`docs/openhands_swebench_gpu_pod_eval.md`.
+
 ## Script Policy
 
 Project automation should be Python, not bash.
+
+The reason is reproducibility, not syntax preference. Python launchers can parse
+the same argparse preset files that define model/data/hyperparameter choices,
+record those resolved choices in run specs, and test subprocess assembly without
+starting an expensive GPU job. Shell snippets are still fine inside generated
+pod commands when they are the interface exposed by `kubectl`, `tmux`, Docker,
+or a third-party tool.
 
 Workstation/local entry points that depend on the project environment should
 use:
@@ -87,6 +114,13 @@ as explicit Python subprocess orchestration and cover the behavior with pytest.
 configuration, Ruff configuration, and CI intentionally exclude it. Do not add
 `torchtitan/` to project package discovery, lint targets, format targets, or
 dependency management.
+
+Experiment configuration has its own boundary as well. Model checkpoints,
+dataset revisions, context lengths, batch sizes, optimizers, precision modes,
+vLLM tensor parallelism, and grader settings should live in argparse preset
+files under `configs/`, not in `pyproject.toml`, `uv.lock`, or ad hoc
+environment variables. That keeps each ML run reviewable by reading one preset
+plus the run spec it produces.
 
 Generated data, credentials, checkpoints, run artifacts, datasets, and
 experiment scratch logs remain out of git. The script conversion experiment
