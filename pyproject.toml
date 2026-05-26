@@ -2,10 +2,19 @@
 name = "jaxels-work-trial"
 version = "0.1.0"
 description = "Prototype mid-training and evaluation pipeline for SWE traces."
+# Local development runs on Python 3.12. Pod runtimes are intentionally separate:
+# TorchTitan training uses its own Python 3.10/CUDA venv, and OpenHands/vLLM eval
+# uses pod-side Python 3.12 venvs. Do not infer model or experiment behavior from
+# this local interpreter constraint.
 requires-python = "==3.12.*"
+# Runtime dependencies stay out of the local project venv. Training and eval
+# stacks are pinned in requirements/* and repaired inside the GPU pod because
+# CUDA, PyTorch, vLLM, OpenHands, and SWE-bench have incompatible constraints.
 dependencies = []
 
 [dependency-groups]
+# Keep local validation tooling small and pinned. The repo's Python package is
+# automation around ML workflows, not the TorchTitan/vLLM runtime itself.
 dev = [
     "pytest==9.0.3",
     "ruff==0.15.14",
@@ -13,10 +22,14 @@ dev = [
 
 [tool.uv]
 required-version = "==0.11.16"
+# This repo is not installed as a Python package during local validation. Scripts
+# import through pythonpath=["."] below so entry points remain explicit files.
 package = false
 python-preference = "managed"
 
 [tool.pytest.ini_options]
+# Tests cover the project scripts and config plumbing. Vendored TorchTitan tests
+# are not discovered here because torchtitan/ is treated as third-party source.
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
@@ -25,7 +38,11 @@ addopts = "-ra"
 target-version = "py312"
 line-length = 88
 extend-exclude = [
+    # Vendored TorchTitan is maintained upstream and intentionally excluded from
+    # project lint/format ownership.
     "torchtitan",
+    # Local credentials, generated datasets, checkpoints, and eval/training run
+    # artifacts can be huge and are not source code.
     "tmp",
     "datasets",
     "outputs",
@@ -35,6 +52,11 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
+# Use a broad lint profile for project-owned automation so launchers fail early
+# on ambiguous subprocess, path, typing, datetime, and exception-handling code.
+# The per-file ignores below document deliberate exceptions for large ML
+# orchestration scripts where strict generic style rules would obscure the
+# experiment contract rather than clarify it.
 select = [
     "A",
     "ARG",
@@ -82,6 +104,10 @@ select = [
     "YTT",
 ]
 ignore = [
+    # These global ignores preserve pragmatic script ergonomics: launchers often
+    # need boolean flags, subprocess commands, user-facing error strings, and
+    # explicit prints. Security-sensitive shell/process calls are reviewed in the
+    # concrete scripts instead of blindly forbidden by generic lint rules.
     "BLE001",
     "COM812",
     "E501",
@@ -111,6 +137,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/openhands_swebench_eval.py" = [
+    # The eval scaffold has many explicit branches because OpenHands, SWE-bench,
+    # vLLM, and SWE-Lego each have different reproducibility contracts. Keep
+    # those branches local and commented instead of hiding them behind generic
+    # abstractions.
     "C901",
     "B905",
     "ARG001",
@@ -128,6 +158,10 @@ ignore = [
     "SIM105",
 ]
 "scripts/qwen_swehero_train.py" = [
+    # The training launcher records a large number of ML settings directly:
+    # model, tokenizer, dataset, sequence length, optimizer, distributed launch,
+    # checkpointing, and pod runtime metadata. Its size is intentional so those
+    # decisions stay auditable in one entry point.
     "C901",
     "B905",
     "ARG001",
@@ -149,28 +183,41 @@ ignore = [
     "UP022",
 ]
 "scripts/prepare_swehero_historical_one_rollout.py" = [
+    # Lazy imports keep optional Hugging Face/data dependencies out of cheap
+    # paths until the dataset materialization workflow actually needs them.
     "PLC0415",
 ]
 "scripts/qwen_swehero_gpu_lifecycle_smoke.py" = [
     "SIM102",
 ]
 "scripts/qwen_swehero_logits_parity.py" = [
+    # Parity code compares two model-loading paths and imports heavyweight model
+    # libraries only after argument/preflight validation.
     "C401",
     "PLC0415",
     "PLW2901",
 ]
 "scripts/qwen_swehero_smoke.py" = [
+    # Smoke tests intentionally defer tokenizer/model imports until after cheap
+    # local setup checks so failures are faster and easier to interpret.
     "ARG002",
     "PLC0415",
 ]
 "scripts/refresh_swehero_context_capped_one_rollout.py" = [
+    # Refresh logic uses local lazy imports for optional data/tokenizer packages
+    # and explicit loop variables for readability in curation decisions.
     "B007",
     "PLC0415",
 ]
 "scripts/setup_torchtitan_pod_venv.py" = [
+    # Pod bootstrap code imports verification dependencies lazily because the
+    # purpose of the script is to create/repair those dependencies.
     "PLC0415",
 ]
 "tests/**" = [
+    # Tests use subprocess shims, literal fixtures, and direct assertions to make
+    # training/eval contracts obvious. Relaxing these rules keeps tests readable
+    # without weakening lint on production scripts.
     "ARG",
     "B905",
     "FBT",
@@ -189,7 +236,11 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["scripts"]
+# These packages are optional or pod-only in many local runs, but marking them as
+# third-party keeps import sorting stable when tests use lightweight stubs.
 known-third-party = ["datasets", "pyarrow", "torch", "transformers"]
 
 [tool.ruff.format]
+# CI and local validation use LF so generated diffs are stable across macOS and
+# Linux pod environments.
 line-ending = "lf"
