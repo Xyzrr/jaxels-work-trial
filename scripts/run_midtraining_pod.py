@@ -1,4 +1,18 @@
 #!/usr/bin/env -S uv run python
+"""Workstation entrypoint for launching midtraining workloads on the GPU pod.
+
+This script is intentionally a pod transport wrapper, not an ML experiment
+launcher. Training/eval decisions such as model checkpoint, dataset, context
+length, optimizer, OpenHands stack, and grading behavior belong in preset files
+or in the pod-side workload arguments. This wrapper only makes sure the
+workstation state is reproducible in the pod and then execs the selected
+pod-side script.
+
+That separation matters for readability: a future experiment can reuse the
+same Kubernetes handoff without inheriting hidden SWE-Hero, Qwen, vLLM, or
+OpenHands defaults from this file.
+"""
+
 from __future__ import annotations
 
 import os
@@ -13,6 +27,11 @@ from scripts.pod_utils import command_output, die, exec_process, repo_root, run
 
 ROOT_DIR = repo_root()
 DEFAULT_KUBECONFIG = ROOT_DIR / "tmp" / "pod-creds" / "kubeconfig.yaml"
+
+# Forward only secrets and runtime plumbing. Experiment settings are deliberately
+# excluded: model IDs, datasets, context modes, sampling parameters, optimizer
+# settings, and eval stack choices should travel through explicit preset/CLI
+# arguments so the launched run can be reproduced from command history.
 FORWARDED_ENV_NAMES = (
     "HF_TOKEN",
     "HUGGING_FACE_HUB_TOKEN",
@@ -71,6 +90,8 @@ starts the selected workload from the pod checkout.
 
 
 def selected_workload_script(workload: str) -> str:
+    """Map human workload aliases to the concrete pod-side script."""
+
     match workload:
         case "train" | "training" | "torchtitan":
             return "scripts/run_qwen_swehero_torchtitan_pod.py"
@@ -83,6 +104,8 @@ def selected_workload_script(workload: str) -> str:
 
 
 def require_clean_local_checkout() -> None:
+    """Refuse launches that would not match the pushed branch inside the pod."""
+
     status = command_output(["git", "-C", str(ROOT_DIR), "status", "--porcelain=v1"])
     if status:
         print(
@@ -98,6 +121,8 @@ def require_clean_local_checkout() -> None:
 
 
 def parse_launcher(argv: list[str]) -> tuple[dict[str, object], str, list[str]]:
+    """Parse only meta-launcher options and leave workload args untouched."""
+
     options: dict[str, object] = {
         "kubeconfig": str(DEFAULT_KUBECONFIG),
         "namespace": "midtraining",
@@ -127,6 +152,8 @@ def parse_launcher(argv: list[str]) -> tuple[dict[str, object], str, list[str]]:
             index += 2
             continue
         if arg == "--no-push":
+            # Useful for local/test invocations where the caller is explicitly
+            # responsible for making the pod checkout match --branch.
             options["push_branch"] = False
             index += 1
             continue
@@ -146,6 +173,8 @@ def parse_launcher(argv: list[str]) -> tuple[dict[str, object], str, list[str]]:
         print(USAGE, end="", file=sys.stderr)
         raise SystemExit(2)
     workload = remaining[0]
+    # Everything after the workload is passed verbatim to the pod script. That
+    # is where experiment presets and one-off overrides belong.
     return options, workload, remaining[1:]
 
 
@@ -177,6 +206,10 @@ def main(argv: list[str] | None = None) -> int:
         die(f"kubeconfig not found: {kubeconfig}")
 
     if push_branch:
+        # Pod workloads run from the branch checked out under /workspace, not
+        # from the workstation filesystem. Push only from a clean checkout so
+        # training/eval metadata can point at a commit that actually contains
+        # the code being executed.
         require_clean_local_checkout()
         run(["git", "-C", str(ROOT_DIR), "push", "-u", "origin", branch])
 
@@ -189,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
         kubectl_tty_args = ["-it"]
 
     workspace_root = str(options["workspace_root"])
+
+    # These three variables describe the pod checkout contract. The legacy
+    # SWEHERO_POD_GIT_BRANCH name remains because pod-side guards already use
+    # it, but it applies to all current midtraining workloads.
     env_args = [
         f"SWEHERO_POD_GIT_BRANCH={branch}",
         f"MIDTRAINING_POD_WORKSPACE_ROOT={workspace_root}",
@@ -200,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
         if env_name in os.environ
     )
 
+    # Use bash -lc with "$1"/shift so workspace_root and workload paths are
+    # passed as arguments rather than interpolated into a shell string. The
+    # final command is the pod-side script plus workload_args exactly as the user
+    # supplied them.
     exec_process(
         [
             "kubectl",
