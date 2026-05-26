@@ -1,3 +1,15 @@
+"""Tests for refreshing the SWE-HERO one-rollout artifact under a context cap.
+
+The refresh script keeps the original "one rollout per task" selection wherever
+possible, but replaces rows that do not fit Qwen/OpenHands training context.
+These tests document the ML-facing contract: context length is checked after
+causal-LM shifting, replacement rows must preserve the original rollout ranking,
+and a cached artifact is reusable only when the tokenizer and context-filter
+settings still match.
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
 import tempfile
@@ -9,14 +21,18 @@ from scripts import refresh_swehero_context_capped_one_rollout as refresh
 
 
 class CharacterTokenizer:
+    """Tiny tokenizer where one character consumes one context position."""
+
     bos_id = None
     eos_id = None
 
-    def encode(self, text, **_kwargs):
+    def encode(self, text: str, **_kwargs: object) -> list[int]:
         return list(range(len(text)))
 
 
-def selected_row(trajectory_id, rank):
+def selected_row(trajectory_id: str, rank: tuple[int, int, int]):
+    """Build a selected rollout with the same ranking tuple as the raw builder."""
+
     evaluation = prep.RowEvaluation(
         accepted=True,
         reject_reasons=(),
@@ -45,7 +61,13 @@ def selected_row(trajectory_id, rank):
     )
 
 
-def context_selected_row(instance_id, trajectory_id, rank, shifted_length, fits):
+def context_selected_row(
+    instance_id: str,
+    trajectory_id: str,
+    rank: tuple[int, int, int],
+    shifted_length: int,
+    fits: bool,
+):
     base = selected_row(trajectory_id, rank).selected
     selected = prep.SelectedRow(
         instance_id=instance_id,
@@ -67,11 +89,18 @@ def context_selected_row(instance_id, trajectory_id, rank, shifted_length, fits)
     )
 
 
-def write_json(path, payload):
+def write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def make_tokenizer(tmp_path, *, tokenizer_json=b"json", tokenizer_config=b"config"):
+def make_tokenizer(
+    tmp_path: Path,
+    *,
+    tokenizer_json: bytes = b"json",
+    tokenizer_config: bytes = b"config",
+) -> Path:
+    """Create tokenizer files whose hashes can act as artifact fingerprints."""
+
     tokenizer_path = tmp_path / "tokenizer"
     tokenizer_path.mkdir()
     (tokenizer_path / "tokenizer.json").write_bytes(tokenizer_json)
@@ -79,7 +108,11 @@ def make_tokenizer(tmp_path, *, tokenizer_json=b"json", tokenizer_config=b"confi
     return tokenizer_path
 
 
-def make_args(tmp_path, tokenizer_path, **overrides):
+def make_args(
+    tmp_path: Path,
+    tokenizer_path: Path,
+    **overrides: object,
+) -> argparse.Namespace:
     values = {
         "batch_size": 64,
         "dataset_id": "dataset",
@@ -98,7 +131,15 @@ def make_args(tmp_path, tokenizer_path, **overrides):
     return argparse.Namespace(**values)
 
 
-def make_artifact(tmp_path, args, *, max_final=99, counts=None):
+def make_artifact(
+    tmp_path: Path,
+    args: argparse.Namespace,
+    *,
+    max_final: int = 99,
+    counts: dict[str, int] | None = None,
+) -> dict[str, object]:
+    """Write the minimal refreshed artifact metadata used by cache checks."""
+
     counts = counts or {
         "current_over_context_rows": 1,
         "current_selected_rows": 2,
@@ -146,7 +187,7 @@ def make_artifact(tmp_path, args, *, max_final=99, counts=None):
 
 
 class TestRefreshSweHeroContextCappedOneRollout:
-    def test_qwen_context_evaluation_uses_shifted_input_length(self):
+    def test_qwen_context_evaluation_uses_shifted_input_length(self) -> None:
         row = {
             "trajectory": [
                 {"role": "system", "content": "system"},
@@ -173,16 +214,23 @@ class TestRefreshSweHeroContextCappedOneRollout:
             max_shifted_context=uncapped.shifted_input_length - 1,
         )
 
+        # Causal language models train by predicting token n+1 from tokens up to
+        # n. Training therefore feeds token_ids[:-1], not the full token stream,
+        # so the context cap must be compared with shifted_input_length.
         assert uncapped.shifted_input_length == uncapped.token_count - 1
         assert exact_cap.fits_context
         assert not under_cap.fits_context
 
-    def test_replacement_selection_preserves_original_rank_order(self):
+    def test_replacement_selection_preserves_original_rank_order(self) -> None:
         current = selected_row("current", (1, 10, 5))
         fewer_errors = selected_row("fewer-errors", (0, 50, 6))
         shorter = selected_row("shorter", (1, 5, 7))
         later_tie = selected_row("later-tie", (1, 10, 8))
 
+        # The context refresh adds one constraint: the row must fit the Qwen
+        # context. Among fitting candidates it must keep the raw artifact's rank
+        # order, so this refresh remains a context-capped version of the original
+        # selection rather than a new preference policy.
         assert (
             refresh.select_better_context_row(
                 current, fewer_errors
@@ -198,7 +246,7 @@ class TestRefreshSweHeroContextCappedOneRollout:
             == "current"
         )
 
-    def test_manifest_parser_restores_reject_reason_tuple(self):
+    def test_manifest_parser_restores_reject_reason_tuple(self) -> None:
         payload = {
             "instance_id": "task",
             "trajectory_id": "trajectory",
@@ -221,7 +269,7 @@ class TestRefreshSweHeroContextCappedOneRollout:
         assert selected.selection_rank == (0, 2, 42)
         assert selected.evaluation.reject_reasons == ()
 
-    def test_current_artifact_metadata_short_circuits_exact_refresh(self):
+    def test_current_artifact_metadata_short_circuits_exact_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             tokenizer_path = make_tokenizer(tmp_path)
@@ -235,10 +283,13 @@ class TestRefreshSweHeroContextCappedOneRollout:
             ):
                 summary = refresh.refresh_dataset(args)
 
+        # A current artifact should be reused without rescanning source parquet.
+        # Reuse is safe only because the metadata stores the context cap,
+        # tokenizer hashes, source revision, and final maximum shifted length.
         assert summary.final_selected_rows == 2
         assert summary.replacement_rows == 1
 
-    def test_current_artifact_rejects_stale_metadata_and_changed_settings(self):
+    def test_current_artifact_rejects_stale_metadata_and_changed_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             tokenizer_path = make_tokenizer(tmp_path)
@@ -259,6 +310,8 @@ class TestRefreshSweHeroContextCappedOneRollout:
                 context_filter=refresh.context_filter_contract(changed_settings_args),
             )
             assert not changed_settings_status.is_current
+            # Including the final model patch changes the serialized text and can
+            # change token length, so it is part of the context-filter contract.
             assert (
                 "context_filter.include_model_patch changed"
                 in changed_settings_status.reasons
@@ -271,6 +324,9 @@ class TestRefreshSweHeroContextCappedOneRollout:
                 context_filter=refresh.context_filter_contract(args),
             )
             assert not changed_tokenizer_status.is_current
+            # The tokenizer defines how text becomes token IDs. A changed
+            # tokenizer can move a row across the context boundary even when the
+            # raw OpenHands text is unchanged.
             assert (
                 "context_filter.tokenizer_json_sha256 changed"
                 in changed_tokenizer_status.reasons
@@ -285,9 +341,11 @@ class TestRefreshSweHeroContextCappedOneRollout:
                 tmp_path, args, context_filter=stale_context_filter
             )
             assert not stale_status.is_current
+            # Even matching settings are insufficient if the artifact itself says
+            # a final selected row exceeds the requested shifted-context cap.
             assert "final context maximum exceeds requested cap" in stale_status.reasons
 
-    def test_stale_metadata_falls_back_to_over_context_exact_refresh(self):
+    def test_stale_metadata_falls_back_to_over_context_exact_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             tokenizer_path = make_tokenizer(tmp_path)
@@ -326,6 +384,9 @@ class TestRefreshSweHeroContextCappedOneRollout:
                             with mock.patch.object(refresh, "write_dataset") as write:
                                 summary = refresh.refresh_dataset(args)
 
+        # The stale artifact has one selected row that no longer fits. The refresh
+        # should replace it with the best same-task fitting rollout rather than
+        # dropping the task or keeping the over-context row.
         assert summary.current_over_context_rows == 1
         assert summary.replacement_rows == 1
         assert summary.final_selected_rows == 1
@@ -337,7 +398,7 @@ class TestRefreshSweHeroContextCappedOneRollout:
             write_kwargs["report"]["replaced"][0]["new_trajectory_id"] == "new-fitting"
         )
 
-    def test_optimized_fallback_matches_exact_refresh_outputs(self):
+    def test_optimized_fallback_matches_exact_refresh_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             tokenizer_path = make_tokenizer(tmp_path)
@@ -376,6 +437,10 @@ class TestRefreshSweHeroContextCappedOneRollout:
                     summary = func()
                     return summary, write.call_args.kwargs
 
+            # _refresh_dataset_exact is the straightforward full path. The public
+            # refresh_dataset entrypoint may use cached metadata and optimized
+            # rescans, but it must produce the same summary, report, and selected
+            # trajectories when a fallback refresh is needed.
             exact_summary, exact_write = run_once(
                 lambda: refresh._refresh_dataset_exact(
                     args, context_filter=refresh.context_filter_contract(args)
