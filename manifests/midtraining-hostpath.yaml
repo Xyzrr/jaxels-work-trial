@@ -10,16 +10,29 @@ metadata:
   namespace: midtraining
 spec:
   restartPolicy: Never
+  # Pin this long-lived development pod to the known 8xH100 node. Training and
+  # eval presets assume all eight local GPUs are available in one pod, so moving
+  # this to a different node is a hardware/runtime change.
   nodeSelector:
     kubernetes.io/hostname: gpu-dp-8sd75-hxggv
   containers:
     - name: trainer
+      # The CUDA base image is intentionally thin. Startup below repairs only the
+      # tools needed by the training/eval launchers and then idles so the real
+      # Python environments can be pinned under /workspace.
       image: nvidia/cuda:12.8.0-base-ubuntu22.04
       imagePullPolicy: IfNotPresent
       command:
         - bash
         - -lc
         - |
+          # Install pod launch prerequisites only when missing. The base image
+          # does not define the ML experiment; model, data, context length, and
+          # optimizer choices come from repo presets. These packages support the
+          # shared runtime: tmux for reconnectable GPU jobs, git/ssh for pinned
+          # code checkout, cc for Torch/Triton compilation, lspci for GPU
+          # diagnostics, Docker/Buildx for SWE-bench grading, curl/jq for API
+          # preflights, and Python for one-time uv bootstrapping.
           missing_packages=()
           command -v tmux >/dev/null 2>&1 || missing_packages+=(tmux)
           command -v git >/dev/null 2>&1 || missing_packages+=(git)
@@ -37,6 +50,11 @@ spec:
             apt-get install -y --no-install-recommends "${missing_packages[@]}"
             rm -rf /var/lib/apt/lists/*
           fi
+          # Git credentials are optional because some local inspection does not
+          # need GitHub access. Production training/eval launches do need a
+          # pushed branch, so when the secret is present we install a strict SSH
+          # config from the mounted key and known_hosts file instead of trusting
+          # a live ssh-keyscan during pod startup.
           if [[ -f /var/run/midtraining-git-ssh/id_ed25519 ]]; then
             if [[ -f /var/run/midtraining-git-ssh/known_hosts ]]; then
               install -d -m 700 /root/.ssh
@@ -63,41 +81,65 @@ spec:
               echo "midtraining-git-ssh secret is missing known_hosts; skipping Git SSH setup" >&2
             fi
           fi
+          # uv installs CPython under the persistent /workspace mount. That keeps
+          # TorchTitan and eval virtualenv repairs independent of the container
+          # image and repeatable across pod recreations.
           export UV_CACHE_DIR=/workspace/.cache/uv
           export UV_PYTHON_INSTALL_DIR=/workspace/python
           /workspace/uv/uv-0.11.16/uv python install 3.10.12 \
             --install-dir /workspace/python \
             --no-bin
           sleep infinity
+      # OpenHands/SWE-bench grading needs Docker-in-pod to build and run task
+      # runtime images. Privileged mode is intentional for this dedicated GPU
+      # pod and is validated by the eval preflight before model work starts.
       securityContext:
         privileged: true
       resources:
         limits:
+          # The canonical training recipe uses tensor/context parallelism across
+          # all eight H100s, while eval presets either run one vLLM replica per
+          # GPU or one 8-way tensor-parallel vLLM server.
           nvidia.com/gpu: 8
       env:
         - name: HF_HOME
+          # Keep model/tokenizer downloads on the persistent workspace volume so
+          # repeated training/eval launches do not re-fetch large HF artifacts.
           value: /workspace/.cache/huggingface
         - name: TORCH_HOME
+          # Keep PyTorch kernel/model caches persistent across pod restarts.
           value: /workspace/.cache/torch
       volumeMounts:
         - name: workspace
+          # Shared durable workspace for repo checkout, uv installs, virtualenvs,
+          # datasets, model assets, checkpoints, eval outputs, and run logs.
           mountPath: /workspace
         - name: docker-graph
+          # Persist Docker layers so SWE-bench/OpenHands runtime images built by
+          # prebuild jobs are reused by later eval runs.
           mountPath: /var/lib/docker
         - name: git-ssh
+          # Read-only GitHub SSH material used by the pod checkout guard.
           mountPath: /var/run/midtraining-git-ssh
           readOnly: true
   volumes:
     - name: workspace
       hostPath:
+        # The launchers require /workspace as a real node directory/mountpoint;
+        # they reject noncanonical roots for production runs.
         path: /workspace
         type: Directory
     - name: docker-graph
       hostPath:
+        # Docker state is intentionally separate from the repo checkout but still
+        # under /workspace so it survives pod recreation on the same node.
         path: /workspace/pod-docker-data/midtraining-dev
         type: DirectoryOrCreate
     - name: git-ssh
       secret:
+        # Optional keeps local pod startup possible before credentials are
+        # provisioned. Production launches that need GitHub access still fail
+        # later if the checkout guard cannot fetch the selected branch.
         secretName: midtraining-git-ssh
         optional: true
         defaultMode: 0400
