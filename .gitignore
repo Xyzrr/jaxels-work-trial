@@ -8,6 +8,10 @@ Thumbs.db
 *~
 
 # Local environment and secrets
+# Dotenv files carry runtime credentials such as HF_TOKEN, WANDB_API_KEY,
+# LLM_API_KEY, and pod-specific paths. Keep the example template tracked, but
+# never commit a real file that could grant model, cluster, or eval-provider
+# access.
 .env
 .env.*
 !.env.example
@@ -22,10 +26,14 @@ john-key.pub
 kubeconfig.yaml
 
 # Python
+# The root .python-version is intentionally tracked below because it pins local
+# tooling to Python 3.12.13. Pod ML runtimes are separate: TorchTitan training
+# repairs its own CUDA/Python venv, and OpenHands/vLLM evals repair theirs.
 __pycache__/
 *.py[cod]
 *$py.class
 .python-version
+!.python-version
 .venv/
 venv/
 env/
@@ -62,6 +70,9 @@ node_modules/
 coverage/
 
 # Training, eval, and experiment outputs
+# These directories hold generated run specs, checkpoints, W&B/TensorBoard
+# logs, eval reports, and other large reproducibility artifacts. Commit the
+# code/config that can recreate them, not the outputs themselves.
 /artifacts/
 /outputs/
 /runs/
@@ -78,6 +89,10 @@ coverage/
 /ray_results/
 
 # Data, repo corpora, and benchmark workspaces
+# SWE trace datasets, cloned task repositories, Docker workspaces, and pod
+# scratch directories can be huge and may contain third-party source snapshots
+# or benchmark task state. Keep stable dataset recipes and manifests in git;
+# keep materialized corpora outside it.
 /data/
 /datasets/
 /corpora/
@@ -95,6 +110,9 @@ coverage/
 /benchmarks/cache/
 
 # Model/checkpoint artifacts
+# Model weights and tokenizer/checkpoint exports are too large for source
+# control and often have their own license or access boundary. Training/eval
+# presets should pin model IDs, revisions, and asset paths instead.
 /checkpoints/
 /ckpts/
 /models/
@@ -111,6 +129,9 @@ coverage/
 *.onnx
 
 # Generated traces and large run records
+# Profiler traces, structured logs, SQLite caches, and TensorBoard event streams
+# are diagnostics from a particular run. They are useful locally, but they are
+# not the canonical definition of an ML experiment.
 *.log
 *.jsonl.tmp
 *.trace
@@ -123,6 +144,9 @@ events.out.tfevents.*
 core
 
 # Distributed training and cluster launchers
+# These files are process-local launch byproducts from torchrun, Slurm, or other
+# cluster supervisors. Reproducibility should come from committed presets and
+# run metadata, not stale rank logs or hostfiles.
 slurm-*.out
 slurm-*.err
 *.pid

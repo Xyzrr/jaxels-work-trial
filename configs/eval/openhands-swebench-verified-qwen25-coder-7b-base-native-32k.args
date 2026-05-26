@@ -1,0 +1,99 @@
+# Base-model control at Qwen2.5-Coder's native 32k context.
+#
+# This preset answers a narrow comparison question: how does the released
+# Qwen2.5-Coder-7B-Instruct checkpoint perform in OpenHands/SWE-bench without
+# the SFT checkpoint and without extending the model past its native context
+# window? Keep it separate from the 128k YaRN controls so regressions can be
+# attributed to training, context extension, or harness changes.
+
+# Model identity. The pod serves the local Hugging Face snapshot, while the
+# served/LiteLLM names stay on the public Qwen id for OpenAI-compatible routing
+# and comparable metadata. This is the same asset path used by the 128k Qwen
+# presets; only the context contract differs.
+--model-id /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
+--served-model-name Qwen/Qwen2.5-Coder-7B-Instruct
+--litellm-model openai/Qwen/Qwen2.5-Coder-7B-Instruct
+
+# vLLM is the local OpenAI-compatible provider, so the pod launcher supplies the
+# base URL and API key at runtime instead of selecting an external provider here.
+--custom-llm-provider ""
+
+# OpenHands' CodeActAgent acts through structured tool calls. Keeping native
+# tool calling required makes this base-model control exercise the same action
+# interface as the SFT eval, so differences are about model/context behavior
+# rather than a different agent protocol.
+--native-tool-calling
+--tool-choice required
+--no-drop-params
+
+# SWE-bench tasks are text-only, so vision is off. These sampling values match
+# the paper-aligned OpenHands setup: temperature controls randomness, top-p keeps
+# the sampled probability mass bounded, and top-k limits the candidate-token set.
+--disable-vision
+--temperature 0.7
+--top-p 0.8
+--top-k 20
+--tool-call-preflight
+--tool-call-preflight-timeout 120
+
+# Native context control. Qwen2.5-Coder-7B was released with a 32,768-token
+# position window. This preset intentionally passes no YaRN/RoPE override; if an
+# OpenHands trajectory needs more than the native window, surfacing that failure
+# is part of the "as shipped" baseline.
+--context-mode base-native-32k
+
+# The output cap matches the other Qwen/OpenHands presets so tool-call JSON has
+# the same budget. Only input context length is intentionally different here.
+--max-output-tokens 4096
+
+# SWE-bench Verified pass@1 setup. max-iterations bounds the CodeAct
+# observe/think/tool loop, while timeout prevents one difficult repository task
+# from blocking the whole eval indefinitely.
+--timeout 300
+--dataset princeton-nlp/SWE-bench_Verified
+--split test
+--agent CodeActAgent
+--max-iterations 100
+
+# Worker count stays matched to the eight-replica vLLM topology below. That
+# keeps infrastructure load comparable with the 128k Qwen presets even though
+# individual prompts may fail sooner when they exceed the native window.
+--num-workers 192
+
+# Harness versioning. OpenHands behavior and generated config section names are
+# part of the eval contract, so they live in the preset instead of in launcher
+# defaults.
+--openhands-repo https://github.com/OpenHands/OpenHands.git
+--openhands-ref 0.62.0
+--openhands-dir /workspace/eval-runs/OpenHands
+--model-config-name llm.swehero_qwen25_coder7b
+--agent-config-name agent.swehero_openhands
+--runtime docker
+--docker-smoke-image hello-world:latest
+
+# vLLM serving topology. The 7B model fits as a full one-GPU replica, so the pod
+# runs eight independent servers and routes OpenHands workers across them. Tensor
+# and pipeline parallelism stay at 1 because this is not a multi-GPU single-model
+# serving contract.
+--vllm-host 0.0.0.0
+--vllm-port 8000
+--vllm-tensor-parallel-size 1
+--vllm-pipeline-parallel-size 1
+--vllm-server-count 8
+--vllm-agent-tasks-per-server 24
+--vllm-router-port 8090
+
+# Inference numerics. bfloat16 reduces GPU memory versus float32 while keeping a
+# wide exponent range for transformer activations. The memory utilization cap
+# leaves room for vLLM runtime allocations and KV cache instead of filling the
+# device completely.
+--vllm-gpu-memory-utilization 0.90
+--vllm-dtype bfloat16
+
+# Tool-call parsing must match the Qwen/Hermes-style structured calls used by
+# the OpenHands config. Multiprocessing is the local pod executor backend; eager
+# execution keeps the native-context baseline easier to debug.
+--vllm-enable-auto-tool-choice
+--vllm-tool-call-parser hermes
+--vllm-distributed-executor-backend mp
+--vllm-enforce-eager

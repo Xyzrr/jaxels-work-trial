@@ -1,0 +1,93 @@
+# Base-model control with the same 128k YaRN context as the SFT eval.
+#
+# This preset isolates the effect of the fine-tuned checkpoint. It serves the
+# released Qwen2.5-Coder-7B-Instruct base model with the same 128k YaRN context
+# contract used by the SFT/paper-aligned eval, so differences from the SFT run
+# are less likely to be explained by context length alone.
+
+# Model identity. The pod serves the local Hugging Face snapshot, while the
+# served/LiteLLM names stay on the public Qwen id for OpenAI-compatible routing
+# and comparable metadata. This should point at the base checkpoint asset, not a
+# fine-tuned checkpoint, because the context extension is the only intended
+# change from the native base baseline.
+--model-id /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
+--served-model-name Qwen/Qwen2.5-Coder-7B-Instruct
+--litellm-model openai/Qwen/Qwen2.5-Coder-7B-Instruct
+
+# vLLM is the local model server. The pod launcher injects the base URL and API
+# key at runtime, so this preset does not select an external LLM provider.
+--custom-llm-provider ""
+
+# Keep the OpenHands action protocol identical to the SFT eval. CodeActAgent
+# needs structured tool calls for repository edits; requiring native tool calls
+# avoids measuring a different free-form text interaction mode.
+--native-tool-calling
+--tool-choice required
+--no-drop-params
+
+# SWE-bench is text-only, so vision is disabled. The sampling values match the
+# SWE-HERO OpenHands eval contract: temperature controls randomness, top-p bounds
+# cumulative probability mass, and top-k limits the candidate token set.
+--disable-vision
+--temperature 0.7
+--top-p 0.8
+--top-k 20
+--tool-call-preflight
+--tool-call-preflight-timeout 120
+
+# Context-matched base control. Qwen2.5-Coder's native window is 32k tokens, so
+# 128k serving requires YaRN rotary-position scaling. The launcher derives the
+# concrete vLLM max length and RoPE override from this context mode.
+--context-mode base-paper-yarn-128k
+
+# Keep the output budget aligned with the SFT eval. The control should change
+# the checkpoint, not the amount of assistant/tool-call text the model can emit.
+--max-output-tokens 4096
+
+# SWE-bench Verified pass@1 setup. max-iterations bounds the CodeAct
+# observe/think/tool loop, and timeout prevents one repository task from
+# occupying a worker indefinitely.
+--timeout 300
+--dataset princeton-nlp/SWE-bench_Verified
+--split test
+--agent CodeActAgent
+--max-iterations 100
+
+# Match the SFT eval's concurrency: eight one-GPU vLLM replicas, each assigned
+# up to 24 agent tasks through the router, for 192 OpenHands workers total.
+--num-workers 192
+
+# Harness versioning. OpenHands behavior, config section names, and Dockerized
+# SWE-bench glue affect results, so they are preset-level experiment metadata.
+--openhands-repo https://github.com/OpenHands/OpenHands.git
+--openhands-ref 0.62.0
+--openhands-dir /workspace/eval-runs/OpenHands
+--model-config-name llm.swehero_qwen25_coder7b
+--agent-config-name agent.swehero_openhands
+--runtime docker
+--docker-smoke-image hello-world:latest
+
+# vLLM serving topology. The 7B model fits as a full replica on one H100, so this
+# preset uses eight independent one-GPU servers and a router rather than tensor
+# or pipeline parallelism inside one model server.
+--vllm-host 0.0.0.0
+--vllm-port 8000
+--vllm-tensor-parallel-size 1
+--vllm-pipeline-parallel-size 1
+--vllm-server-count 8
+--vllm-agent-tasks-per-server 24
+--vllm-router-port 8090
+
+# Inference numerics. bfloat16 reduces memory compared with float32 while
+# retaining enough exponent range for transformer activations. The 0.90 cap
+# leaves room for KV cache and runtime allocations during 128k serving.
+--vllm-gpu-memory-utilization 0.90
+--vllm-dtype bfloat16
+
+# Tool-call parsing and executor behavior. Hermes parsing matches the
+# Qwen/OpenHands tool-call format. The multiprocessing backend is pod-local, and
+# eager execution keeps the long-context control easier to debug.
+--vllm-enable-auto-tool-choice
+--vllm-tool-call-parser hermes
+--vllm-distributed-executor-backend mp
+--vllm-enforce-eager

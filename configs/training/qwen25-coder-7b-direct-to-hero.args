@@ -1,0 +1,151 @@
+# Qwen2.5-Coder-7B direct-to-hero SWE-HERO SFT recipe.
+#
+# This preset carries the paper-faithful training configuration that used to
+# live in launcher defaults. Keep experiment changes in a copied preset and
+# use normal CLI flags after the preset for one-off overrides.
+#
+# SFT means "supervised fine-tuning": the model is trained to imitate accepted
+# OpenHands assistant actions from SWE-HERO traces. "Direct-to-hero" means this
+# run skips an intermediate SWE-ZERO stage and trains directly on SWE-HERO-style
+# repository-editing trajectories. Every ML choice below is explicit so a run
+# can be reproduced from this file plus the command line.
+
+# Base checkpoint. The model id selects the public Qwen coding assistant, while
+# the revision pins the exact Hugging Face snapshot. Pinning the revision matters
+# because tokenizer files, chat templates, and model weights can change under the
+# same model name and would change the training target.
+--model-id Qwen/Qwen2.5-Coder-7B-Instruct
+--model-revision c03e6d358207e414f1eca0bb1891e29f1db0e242
+
+# Training data. The local artifact is the project's public approximation of
+# the SWE-HERO paper data: one accepted OpenHands rollout per SWE-bench task.
+# The source dataset and revision are recorded so the local artifact can be
+# rebuilt and audited instead of becoming an unexplained Parquet folder.
+--dataset-id swe-hero-openhands-trajectories-5b2ed21-one-rollout
+--source-dataset-id nvidia/SWE-Hero-openhands-trajectories
+--source-dataset-revision 5b2ed21270ad773a50163e2999c510f0cbb92cfa
+
+# Dataset materialization controls. Building if missing keeps pod launches
+# self-contained, while the shard/batch sizes bound memory use when streaming the
+# public source data and selecting the paper-like one-rollout artifact.
+--build-dataset-if-missing
+--source-dataset-rows-per-shard 2048
+--source-dataset-build-batch-size 64
+
+# Example limits. A zero value means "no artificial cap" for the production
+# recipe. Smoke tests override these values instead of editing this preset.
+--num-examples 0
+--max-streamed-examples 0
+
+# Sampling and sequence length. The model learns from long agent traces where
+# earlier observations can affect later edits, so the production recipe trains
+# with a 131,072-token context. The source artifact has already filtered out
+# rows that do not fit this window, so a too-long example is treated as a data
+# bug rather than silently truncated.
+--shuffle-buffer 2048
+--seed 17
+--max-length 131072
+--long-example-policy error
+
+# Bucketed training. Long-context batches waste memory if every trace is padded
+# to 128k tokens. Buckets group examples by length, then context parallelism
+# ("CP") splits the token dimension across GPUs for the longer buckets. The
+# short-to-long curriculum starts with cheaper 32k examples before exercising the
+# full 128k path.
+--buckets 32768,65536,131072
+--bucket-curriculum short-to-long
+--bucket-cp 32768:2,65536:4,131072:8
+
+# Loss guard. The dataloader masks non-target tokens such as user messages and
+# tool observations; at least one trainable assistant token must remain or the
+# batch would contribute no learning signal.
+--min-trainable-tokens 1
+
+# Optimization schedule. Three epochs, batch size 32, and a small 1e-5 learning
+# rate are conservative SFT settings for adapting a pretrained coding model
+# without aggressively overwriting its base capabilities. Warmup ramps the
+# learning rate from near-zero to avoid unstable early updates; min LR keeps the
+# cosine/decay tail nonzero.
+--num-train-epochs 3
+--max-steps 0
+--global-batch-size 32
+--local-batch-size 1
+--learning-rate 1e-5
+--min-learning-rate 1e-8
+--warmup-ratio 0.1
+--weight-decay 0.0
+
+# Update stability. Gradient clipping limits rare large updates from very long
+# traces. The foreach optimizer implementation uses PyTorch's batched tensor
+# update path, which is faster without changing the optimizer math.
+--max-grad-norm 1.0
+--optimizer-impl foreach
+
+# Compute and memory strategy. SDPA uses PyTorch's scaled-dot-product attention
+# backend. FP8 rowwise communication/storage, bfloat16 mixed precision, full
+# activation checkpointing, and chunked cross-entropy all reduce memory pressure
+# enough to make 128k-token SFT feasible on one 8xH100 pod. The training loss is
+# still accumulated in float32 to keep the scalar optimization signal stable.
+--attention-backend sdpa
+--enable-fp8
+--fp8-recipe rowwise
+--compile
+--training-dtype float32
+--mixed-precision-param-dtype bfloat16
+--mixed-precision-reduce-dtype bfloat16
+--fsdp-reshard-after-forward never
+--activation-checkpoint-mode full
+--chunked-ce-chunks 8
+
+# Checkpointing. Frequent async checkpoints are expensive but important for long
+# GPU jobs: they reduce lost work after interruption and the first-step check
+# verifies checkpoint/resume mechanics before a production run has burned hours.
+--checkpoint-interval 25
+--checkpoint-async-mode async
+--validate-first-step-checkpoint
+
+# Log every step because production jobs are few and expensive; sparse metrics
+# would make it harder to diagnose loss spikes, throughput drops, or hangs.
+--metrics-log-freq 1
+
+# Pod preflight resource gates. These fail before distributed training starts if
+# the shared GPU pod lacks enough disk, GPU memory, CPU memory, or write
+# throughput for checkpoints and long-context activations.
+--min-free-disk-gb 100
+--min-free-gpu-memory-gb 60
+--min-free-cpu-memory-gb 32
+--min-write-throughput-mb-s 50
+--write-throughput-probe-mb 64
+
+# Profiling defaults. The production recipe leaves profiler and memory snapshots
+# off because they add overhead and large artifacts. The trace settings stay here
+# so an operator can enable profiling with one CLI flag while preserving the same
+# model/data recipe.
+--no-enable-profiler
+--profiler-trace-folder profiling/traces
+--profiler-freq 10
+--profiler-active 1
+--profiler-warmup 3
+--no-enable-memory-snapshot
+--memory-snapshot-folder profiling/memory_snapshot
+
+# Distributed launch topology. One pod owns all eight local GPUs, so torchrun
+# launches eight local ranks and uses a local c10d rendezvous. NCCL async error
+# handling helps fail the job promptly when one rank/GPU encounters a transport
+# problem instead of leaving the remaining ranks hung.
+--nproc-per-node 8
+--nnodes 1
+--node-rank 0
+--rdzv-backend c10d
+--rdzv-endpoint localhost:0
+--rdzv-id ""
+--log-rank 0
+--torchrun-log-rank-filter 0
+--cuda-device-max-connections 1
+--torch-nccl-async-error-handling 1
+
+# Safety mode. The canonical preset defaults to non-production so smoke and dry
+# runs cannot be confused with the paper-aligned production run. Real production
+# launches opt in with CLI flags after this preset.
+--no-production-mode
+--no-production-acceptance-smoke

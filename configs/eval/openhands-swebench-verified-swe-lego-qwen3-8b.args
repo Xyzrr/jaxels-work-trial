@@ -1,0 +1,117 @@
+# SWE-Lego-Qwen3-8B pass@1 reproduction preset.
+# This uses the SWE-Lego repo's vendored OpenHands-0.53.0 and SWE-bench-4.0.4
+# stack, plus its single 8-way tensor-parallel vLLM serving contract.
+#
+# Treat this as a reproduction preset, not a minor variant of the Qwen2.5
+# OpenHands presets. SWE-Lego changes the model family, OpenHands checkout,
+# SWE-bench grader package, context contract, tool-call assumptions, and vLLM
+# topology at the same time.
+
+# Select the SWE-Lego adapter path in the Python launcher. That adapter clones
+# the whole SWE-Lego repository because its vendored OpenHands and SWE-bench
+# versions are part of the reproduced eval, not replaceable implementation
+# details.
+--eval-stack swe-lego
+
+# Model identity. The model weights are published under SWE-Lego's repository,
+# but vLLM serves them under Qwen/Qwen3-8B because the vendored OpenHands config
+# and LiteLLM routing expect that public Qwen3 served name.
+--model-id SWE-Lego/SWE-Lego-Qwen3-8B
+--served-model-name Qwen/Qwen3-8B
+--litellm-model openai/Qwen/Qwen3-8B
+
+# Qwen3 long-context contract. The checkpoint ships its own long-context
+# position-scaling metadata in config.json, so this mode must not inherit the
+# Qwen2.5 YaRN override used by the SWE-HERO presets.
+--context-mode swe-lego-qwen3-160k
+
+# SWE-Lego uses deterministic decoding for this reproduction path. Temperature
+# zero disables sampling randomness, and top-p/top-k are disabled so the decoded
+# action is the model's highest-probability continuation under the vendored
+# OpenHands prompt.
+--temperature 0.0
+--top-p none
+--top-k none
+
+# SWE-Lego allows longer assistant outputs than the Qwen2.5 presets. That gives
+# the agent room to emit large patch/tool-call payloads under its vendored
+# OpenHands protocol.
+--max-output-tokens 16384
+
+# SWE-bench Verified pass@1 task set. The CodeAct loop and 100-iteration cap are
+# kept comparable with the other OpenHands evals, while the worker count follows
+# SWE-Lego's upstream 24-worker contract rather than being clamped to smoke size.
+--dataset princeton-nlp/SWE-bench_Verified
+--split test
+--agent CodeActAgent
+--max-iterations 100
+--num-workers 24
+
+# Metadata/config names. These names are written into generated OpenHands config
+# and run metadata so outputs can be traced back to the SWE-Lego Qwen3 contract.
+--eval-note swe-lego-qwen3-8b-pass1
+--model-config-name llm.eval_qwen3_8b
+--agent-config-name agent.swe_lego_openhands
+--runtime docker
+
+# Tool/prompt behavior differs intentionally from the Qwen2.5 presets. SWE-Lego
+# relies on its vendored OpenHands/Qwen3 prompt stack instead of this wrapper's
+# native-tool-calling enforcement, plan mode, hint text, or in-context example.
+--omit-native-tool-calling-config
+--no-tool-call-preflight
+--no-enable-plan-mode
+--no-use-hint-text
+--no-add-in-context-learning-example
+--instruction-template-name swe_default.j2
+
+# Vendored stack pin. This commit fixes the OpenHands-0.53.0 and SWE-bench-4.0.4
+# code paths used by SWE-Lego. Changing it changes the grader/inference harness,
+# so it should happen in a copied preset with a new reproduction note.
+--swe-lego-repo https://github.com/SWE-Lego/SWE-Lego.git
+--swe-lego-ref 94704b69aac886e003660e1e0f69f7de163b284e
+--swe-lego-dir /workspace/eval-runs/SWE-Lego
+
+# Poetry version used to bootstrap the vendored OpenHands environment. It is
+# pinned because dependency resolution for older OpenHands/SWE-bench stacks can
+# drift across Poetry releases.
+--openhands-poetry-version 2.1.4
+
+# vLLM topology. Unlike the Qwen2.5 presets, SWE-Lego runs one model server
+# spread across all eight GPUs with tensor parallelism. There is no router
+# because there is only one server endpoint.
+--vllm-host 0.0.0.0
+--vllm-port 8000
+--vllm-tensor-parallel-size 8
+--vllm-pipeline-parallel-size 1
+--vllm-server-count 1
+--vllm-agent-tasks-per-server 24
+--no-vllm-use-router
+
+# Qwen3 context sizing. vLLM reserves a 163,840-token model window while
+# OpenHands caps input at 147,456 tokens through the context mode. The extra room
+# leaves space for generation without exceeding the model server's context.
+--vllm-max-model-len 163840
+--vllm-rope-scaling none
+
+# Concurrency and numerics. max-num-seqs matches the 24 OpenHands workers so
+# vLLM can schedule one sequence per active task. bfloat16 keeps memory use
+# practical for an 8B long-context model while preserving numeric range.
+--vllm-max-num-seqs 24
+--vllm-gpu-memory-utilization 0.90
+--vllm-dtype bfloat16
+
+# Tool-call parsing and executor differences. SWE-Lego's vendored stack does
+# not use vLLM auto tool choice, and the multi-GPU server uses vLLM's default
+# distributed execution path instead of the pod-local multiprocessing backend
+# used by one-GPU Qwen2.5 replicas.
+--no-vllm-enable-auto-tool-choice
+--vllm-distributed-executor-backend none
+--no-vllm-enforce-eager
+
+# Vendored SWE-bench grader settings. Cache at instance level, use a longer
+# timeout for repository tests, and limit grader workers to 10 so Docker grading
+# does not overwhelm the same pod that served the model.
+--swebench-cache-level instance
+--swebench-timeout 500
+--swebench-max-workers 10
+--swebench-run-id openhands

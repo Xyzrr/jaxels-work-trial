@@ -1,0 +1,18 @@
+# Canonical vLLM runtime for OpenHands/SWE-bench evals.
+#
+# This is the human-audited top-level input for the pod-local model server
+# environment. The eval launcher resolves it into a venv-local lock, syncs
+# /workspace/venvs/openhands-vllm from that lock, and runs pip check before
+# starting vLLM.
+#
+# vLLM is the OpenAI-compatible server that feeds OpenHands during SWE-bench
+# evals. Its version controls model loading, long-context serving, tool-call
+# parsing, tensor parallelism, and CUDA/PyTorch dependency choices. Treat
+# changes here as eval-runtime changes, not routine dependency refreshes.
+vllm==0.9.2
+
+# Transformers owns tokenizer/config/model helpers imported by vLLM. vLLM 0.9.2
+# registers its own Ovis/AIMv2 config; newer Transformers releases register
+# AIMv2 too, which makes the vLLM CLI fail at import time. This pin keeps the
+# eval server bootable while preserving the vLLM version above.
+transformers==4.53.3

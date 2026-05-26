@@ -6,9 +6,6 @@
 
 from fnmatch import fnmatch
 
-from requests.exceptions import HTTPError
-from tqdm import tqdm
-
 
 def download_hf_assets(
     repo_id: str,
@@ -17,6 +14,7 @@ def download_hf_assets(
     download_all: bool = False,
     hf_token: str | None = None,
     additional_patterns: list | None = None,
+    revision: str | None = None,
 ) -> None:
     """
     Download relevant files from HuggingFace Hub repository.
@@ -51,11 +49,14 @@ def download_hf_assets(
                                  Required for gated models like Llama.
         additional_patterns (Optional[list]): Additional file patterns to search for and download
                                           from the HuggingFace Hub repository.
+        revision (Optional[str]): HuggingFace revision, branch, tag, or exact commit SHA to download.
         download_all (bool): If True, download all files from the repository
     """
     import os
 
     from huggingface_hub import hf_hub_download, list_repo_files
+    from requests.exceptions import HTTPError
+    from tqdm import tqdm
 
     # Extract model name from repo_id (part after "/")
     if "/" not in repo_id:
@@ -64,6 +65,7 @@ def download_hf_assets(
         )
     model_name = repo_id.split("/")[-1].strip()
     model_dir = os.path.join(local_dir, model_name)
+    repo_label = f"{repo_id}@{revision}" if revision else repo_id
 
     ASSET_PATTERNS = {
         "tokenizer": [
@@ -84,8 +86,12 @@ def download_hf_assets(
         asset_types = [asset_types]
 
     if download_all:
-        print("Downloading all files from repository...")
-        files_found = list_repo_files(repo_id=repo_id, token=hf_token)
+        print(f"Downloading all files from repository {repo_label}...")
+        files_found = list_repo_files(
+            repo_id=repo_id,
+            token=hf_token,
+            revision=revision,
+        )
     else:
         total_patterns = []
         for asset_type in asset_types:
@@ -123,8 +129,12 @@ def download_hf_assets(
 
         try:
             # Get list of available files in the repo
-            print(f"Scanning repository {repo_id} for files...")
-            available_files = list_repo_files(repo_id=repo_id, token=hf_token)
+            print(f"Scanning repository {repo_label} for files...")
+            available_files = list_repo_files(
+                repo_id=repo_id,
+                token=hf_token,
+                revision=revision,
+            )
 
             # Filter for requested asset files
             files_found = [
@@ -143,11 +153,11 @@ def download_hf_assets(
 
                     if not matches_found:
                         print(
-                            f"Warning: No matching files found for asset_type '{asset_type}' in {repo_id}"
+                            f"Warning: No matching files found for asset_type '{asset_type}' in {repo_label}"
                         )
 
             if not files_found:
-                print(f"Warning: No matching files found in {repo_id}")
+                print(f"Warning: No matching files found in {repo_label}")
                 print(f"Available files: {available_files[:10]}...")
                 return
 
@@ -177,6 +187,7 @@ def download_hf_assets(
                     filename=filename,
                     local_dir=model_dir,
                     token=hf_token,
+                    revision=revision,
                 )
                 downloaded_files.append(filename)
                 pbar.update(1)
@@ -218,6 +229,12 @@ if __name__ == "__main__":
         help="HuggingFace API token (required for private repos)",
     )
     parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="HuggingFace revision, branch, tag, or exact commit SHA to download.",
+    )
+    parser.add_argument(
         "--local_dir",
         type=str,
         default="assets/hf/",
@@ -249,10 +266,11 @@ if __name__ == "__main__":
         )
 
     download_hf_assets(
-        args.repo_id,
-        args.local_dir,
-        args.assets,
-        args.all,
-        args.hf_token,
-        args.additional_patterns,
+        repo_id=args.repo_id,
+        local_dir=args.local_dir,
+        asset_types=args.assets,
+        download_all=args.all,
+        hf_token=args.hf_token,
+        additional_patterns=args.additional_patterns,
+        revision=args.revision,
     )
