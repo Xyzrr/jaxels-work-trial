@@ -12,6 +12,27 @@ those presets or narrowly scoped helpers. Do not add new SWE-Hero-only defaults
 to shared TorchTitan launchers unless the behavior is explicitly part of the
 SWE-Hero reproduction.
 
+Training concepts used throughout this runbook:
+
+- Supervised fine-tuning (SFT) means continuing training from an existing base
+  checkpoint while teaching the model to imitate desired assistant outputs. In
+  this project, the desired outputs are OpenHands assistant actions from SWE
+  coding traces; prompts and tool observations remain visible as context but are
+  masked out of the training loss.
+- A context window is the maximum number of tokens the model can attend to at
+  once. The Qwen2.5-Coder checkpoint is native 32k context, while the
+  direct-to-hero recipe intentionally trains with a 131,072-token context using
+  YaRN positional scaling. Changing the context setting changes the ML
+  experiment, not just memory usage.
+- Buckets group examples by token length so short traces are not padded to the
+  full 128k length. Context parallelism (CP) then splits long-token sequences
+  across GPUs for the larger buckets. The bucket/CP table is part of the
+  training recipe because it changes which distributed path each example uses.
+- FP8, bfloat16, activation checkpointing, chunked cross-entropy, and FSDP are
+  memory/throughput choices that make long-context training feasible on the
+  8xH100 pod. They should be changed only as explicit experiments because they
+  affect numerical behavior, checkpoint contents, or both.
+
 The canonical pod runtime is:
 
 ```bash
@@ -219,6 +240,14 @@ torchao==0.18.0.dev20260407+cu128
 torchdata==0.12.0.dev20260408+cpu
 ```
 
+Those three packages are ML runtime dependencies, not ordinary utility
+packages. `torch` supplies tensor math, FSDP distributed training, compiler
+paths, and CUDA kernels. `torchao` supplies the FP8 recipe used to reduce
+long-context memory pressure. `torchdata` supplies data-loading primitives
+expected by vendored TorchTitan. A date or CUDA-build mismatch can pass import
+checks and still fail only after distributed training starts, which is why the
+pod setup verifies them before launch.
+
 The rest of the Python dependencies are installed from the vendored
 TorchTitan requirement file, `torchtitan/.ci/docker/requirements.txt`, plus the
 Hugging Face packages used by our SWE-HERO materialization scripts. Those
@@ -328,6 +357,13 @@ $TORCHTITAN_POD_VENV/bin/python scripts/qwen_swehero_logits_parity.py \
   --reference-context paper-yarn-128k \
   --json-out /workspace/qwen25-coder7b-swehero-parity.json
 ```
+
+Logits are the model's raw next-token scores before softmax turns them into
+probabilities. Matching Hugging Face logits at selected positions proves more
+than "the file loaded": it checks that TorchTitan loaded the same weights, used
+the same tokenizer/config assumptions, and applied the same long-context YaRN
+position encoding. That makes it a cheap preflight for catching model-load or
+context-scaling drift before a multi-hour training job.
 
 `paper-yarn-128k` is the default because the SWE-HERO paper fine-tunes
 Qwen2.5-Coder-Instruct with YaRN extending the native 32k context to 128k.
