@@ -4,6 +4,13 @@ The training entrypoint initializes TorchTitan from Hugging Face safetensors via
 ``Qwen25StateDictAdapter``. This script compares logits from that exact
 TorchTitan load path against ``transformers.AutoModelForCausalLM`` on the same
 weights.
+
+For a language model, "logits" are the raw vocabulary scores before softmax.
+If two loaders produce the same logits for the same prompt and token positions,
+then they are functionally loading the same model for the next-token prediction
+task. That makes this a high-signal preflight before a long training run: it
+checks the model architecture, Hugging Face-to-TorchTitan weight mapping, RoPE /
+YaRN long-context configuration, attention backend choice, and dtype together.
 """
 
 from __future__ import annotations
@@ -22,10 +29,18 @@ from typing import Any
 MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
 MODEL_REVISION = "c03e6d358207e414f1eca0bb1891e29f1db0e242"
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
+
+# The production recipe evaluates the Qwen2.5 checkpoint in the paper's 128k
+# context. Qwen2.5's native context is 32k, so the paper-aligned reference uses
+# YaRN positional scaling rather than the unmodified Hugging Face config.
 PAPER_CONTEXT_LENGTH = 131_072
 QWEN_NATIVE_CONTEXT_LENGTH = 32_768
 QWEN_ROPE_THETA = 1_000_000.0
 PAPER_YARN_FACTOR = PAPER_CONTEXT_LENGTH / QWEN_NATIVE_CONTEXT_LENGTH
+
+# `paper-yarn-128k` validates the training recipe. `standard-hf` is still useful
+# as a diagnostic: it answers whether a mismatch comes from state-dict loading in
+# general or specifically from the long-context override.
 REFERENCE_CONTEXTS = ("paper-yarn-128k", "standard-hf")
 DEFAULT_PROMPT = (
     "Implement a Python function that returns the first duplicate item in a list."
@@ -34,11 +49,15 @@ DEFAULT_PROMPT = (
 
 @dataclass(frozen=True)
 class ReferenceContext:
+    """The positional-encoding shape both model implementations should use."""
+
     max_position_embeddings: int
     rope_scaling: dict[str, Any] | None
 
 
 def reference_context(context: str) -> ReferenceContext:
+    """Resolve a named context mode into concrete positional-encoding settings."""
+
     if context == "standard-hf":
         return ReferenceContext(
             max_position_embeddings=QWEN_NATIVE_CONTEXT_LENGTH,
@@ -57,7 +76,12 @@ def reference_context(context: str) -> ReferenceContext:
 
 
 def patch_hf_config_dict(config: dict[str, Any], context: str) -> dict[str, Any]:
-    """Return an HF config dict for the requested reference context."""
+    """Return an HF config dict for the requested reference context.
+
+    The helper is pure and used by tests. Runtime model loading mutates the
+    Transformers config object in `_apply_reference_to_hf_config`.
+    """
+
     patched = deepcopy(config)
     ref = reference_context(context)
     if context == "standard-hf":
@@ -70,6 +94,13 @@ def patch_hf_config_dict(config: dict[str, Any], context: str) -> dict[str, Any]
 
 
 def default_position_offsets(context: str, max_tokens: int) -> list[int]:
+    """Choose position-ID samples that cover the risky parts of each context.
+
+    A short prompt at position 0 mostly tests ordinary loading. Running the same
+    prompt near 32k and, for YaRN, mid/near 128k tests whether both
+    implementations agree on long-context positional encoding.
+    """
+
     ref = reference_context(context)
     offsets = [0, max(0, QWEN_NATIVE_CONTEXT_LENGTH - max_tokens)]
     if context == "paper-yarn-128k":
@@ -159,6 +190,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dtype",
         choices=("float32", "bfloat16", "float16"),
         default=os.environ.get("HF_LOGITS_PARITY_DTYPE", "float32"),
+        help=(
+            "Numeric dtype for both reference forwards. float32 is slowest but "
+            "tightest for parity because it avoids expected low-precision drift."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -175,6 +210,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tt-attn-backend",
         choices=("sdpa", "flex", "flex_flash", "varlen"),
         default=os.environ.get("HF_LOGITS_PARITY_TT_ATTN", "sdpa"),
+        help=(
+            "TorchTitan attention implementation under test. The training "
+            "launcher uses SDPA/Flex paths when context parallelism is needed."
+        ),
     )
     parser.add_argument(
         "--force-math-attention",
@@ -261,6 +300,8 @@ def _clear_device_cache(torch: Any) -> None:
 
 
 def _apply_reference_to_hf_config(config: Any, context: str) -> dict[str, Any]:
+    """Mutate the Hugging Face config to match the selected parity target."""
+
     ref = reference_context(context)
     summary: dict[str, Any] = {"reference_context": context}
 
@@ -273,13 +314,20 @@ def _apply_reference_to_hf_config(config: Any, context: str) -> dict[str, Any]:
         return summary
 
     rope_scaling = dict(ref.rope_scaling or {})
+
+    # `max_position_embeddings` is the model's advertised context window. The
+    # sliding-window field, when present, must move with it; otherwise some Qwen
+    # code paths can still behave as though attention is capped at the old
+    # native 32k length.
     config.max_position_embeddings = ref.max_position_embeddings
     if hasattr(config, "sliding_window"):
         config.sliding_window = ref.max_position_embeddings
 
-    # Transformers 4.x accepts rope_scaling; newer configs may expose
-    # rope_parameters. Set both when possible so the intended HF reference is
-    # unambiguous across runtime versions.
+    # RoPE is Qwen's positional encoding. YaRN rescales RoPE so the same model
+    # can represent positions beyond its native 32k training window. Transformers
+    # 4.x accepts `rope_scaling`; newer configs may expose `rope_parameters`. Set
+    # both when possible so the intended HF reference is unambiguous across
+    # runtime versions.
     config.rope_scaling = rope_scaling
     rope_parameters = {
         "rope_type": rope_scaling["type"],
@@ -299,14 +347,21 @@ def _apply_reference_to_hf_config(config: Any, context: str) -> dict[str, Any]:
 
 
 def _apply_reference_to_tt_config(model_config: Any, context: str) -> dict[str, Any]:
+    """Mutate the TorchTitan Qwen config to mirror the HF reference context."""
+
     ref = reference_context(context)
     rope = model_config.rope
     if context == "standard-hf":
+        # No long-context scaling: compare against the released model shape.
         rope.max_seq_len = QWEN_NATIVE_CONTEXT_LENGTH
         rope.scaling = "none"
         rope.rope_factor = 1.0
         rope.original_seq_len = QWEN_NATIVE_CONTEXT_LENGTH
     else:
+        # Paper-aligned long-context scaling. These fields must agree with the
+        # HF config above or logits can diverge even when weights are identical,
+        # because each implementation would assign different position vectors to
+        # the same token IDs.
         rope.max_seq_len = ref.max_position_embeddings
         rope.scaling = "yarn"
         rope.rope_factor = PAPER_YARN_FACTOR
@@ -325,6 +380,8 @@ def _apply_reference_to_tt_config(model_config: Any, context: str) -> dict[str, 
 
 
 def _tokenize_prompts(args: argparse.Namespace, torch: Any) -> list[Any]:
+    """Tokenize short prompts once so HF and TorchTitan see identical IDs."""
+
     from transformers import AutoTokenizer
 
     tokenizer_path: str | Path
@@ -347,6 +404,9 @@ def _tokenize_prompts(args: argparse.Namespace, torch: Any) -> list[Any]:
             return_tensors="pt",
         )["input_ids"]
         if encoded.shape[1] > args.max_tokens:
+            # The prompt content is not the benchmark; the position IDs are. A
+            # small token slice keeps the check cheap while still testing the
+            # same positional machinery at several offsets.
             encoded = encoded[:, : args.max_tokens]
         if encoded.shape[1] == 0:
             raise ValueError("tokenized prompt is empty")
@@ -360,6 +420,8 @@ def _validate_offsets(
     encoded_prompts: list[Any],
     max_position_embeddings: int,
 ) -> None:
+    """Reject position samples that would run past the configured context."""
+
     max_prompt_len = max(int(input_ids.shape[1]) for input_ids in encoded_prompts)
     bad = [
         offset
@@ -375,6 +437,13 @@ def _validate_offsets(
 
 
 def _position_ids(torch: Any, input_ids: Any, offset: int, device: Any) -> Any:
+    """Build explicit position IDs so the same prompt can be tested anywhere.
+
+    Normally a decoder-only model would assign positions 0..N-1. Passing
+    position IDs lets us ask, "do both implementations agree if this same prompt
+    appears near the end of the 32k or 128k context?"
+    """
+
     return torch.arange(
         offset,
         offset + input_ids.shape[1],
@@ -392,6 +461,8 @@ def _collect_hf_logits(
     encoded_prompts: list[Any],
     offsets: list[int],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the Hugging Face reference model and capture comparable logits."""
+
     from transformers import AutoConfig, AutoModelForCausalLM
 
     reference_path = args.reference_model_path or args.hf_assets_path
@@ -408,6 +479,10 @@ def _collect_hf_logits(
         **reference_revision_kwargs,
     )
     config_summary = _apply_reference_to_hf_config(config, args.reference_context)
+
+    # Use the same weights but the reference implementation from Transformers.
+    # By default we use eager attention to avoid comparing TorchTitan against a
+    # fused reference kernel whose floating-point order can vary by backend.
     model_kwargs: dict[str, Any] = {
         "config": config,
         "torch_dtype": dtype,
@@ -435,6 +510,9 @@ def _collect_hf_logits(
                     use_cache=False,
                 )
                 key = f"prompt_{prompt_index}:offset_{offset}"
+                # Keep CPU copies so the GPU can be freed before constructing
+                # the TorchTitan model. The parity comparison does not require
+                # gradients or device residency.
                 logits[key] = output.logits.detach().cpu()
 
     del model
@@ -449,6 +527,8 @@ def _load_torchtitan_model(
     dtype: Any,
     device: Any,
 ) -> tuple[Any, dict[str, Any]]:
+    """Build TorchTitan's model and load the same HF safetensors used for SFT."""
+
     _add_repo_paths()
 
     import torch.distributed.checkpoint as dcp
@@ -464,6 +544,9 @@ def _load_torchtitan_model(
         )
 
     if args.force_math_attention and args.tt_attn_backend == "sdpa":
+        # Fused attention kernels can be mathematically equivalent while still
+        # accumulating floating-point operations in a different order. The math
+        # backend makes the comparison stricter and less noisy.
         ScaledDotProductAttention.sdpa_backends = [SDPBackend.MATH]
 
     model_spec = model_registry(
@@ -477,6 +560,10 @@ def _load_torchtitan_model(
         args.reference_context,
     )
 
+    # The meta device allocates module structure without real tensor storage.
+    # TorchTitan models are large enough that constructing empty tensors first,
+    # then loading state dict shards into them, avoids a temporary second copy of
+    # model weights.
     with torch.device("meta"):
         model = model_config.build()
     model.to_empty(device=device)
@@ -487,6 +574,10 @@ def _load_torchtitan_model(
     wrapper = ModelWrapper(model)
     state_dict = wrapper._get_state_dict()
     adapter = model_spec.state_dict_adapter(model_config, str(args.hf_assets_path))
+
+    # The adapter is exactly what the training launcher relies on. It maps
+    # TorchTitan parameter names/shapes to the Hugging Face safetensors layout,
+    # loads those tensors with DCP, then maps them back into the TorchTitan model.
     hf_state_dict = adapter.to_hf(state_dict)
     dcp.load(
         hf_state_dict,
@@ -508,6 +599,8 @@ def _collect_tt_logits(
     encoded_prompts: list[Any],
     offsets: list[int],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run TorchTitan's loaded model on the same token IDs and positions."""
+
     model, config_summary = _load_torchtitan_model(
         args,
         torch=torch,
@@ -522,6 +615,9 @@ def _collect_tt_logits(
             for offset in offsets:
                 position_ids = _position_ids(torch, input_ids, offset, device)
                 key = f"prompt_{prompt_index}:offset_{offset}"
+                # TorchTitan's Qwen forward returns logits directly and accepts
+                # explicit `positions`, which are equivalent to HF `position_ids`
+                # for this parity check.
                 logits[key] = model(input_ids, positions=position_ids).detach().cpu()
 
     del model
@@ -537,6 +633,13 @@ def _compare_logits(
     atol: float,
     rtol: float,
 ) -> tuple[bool, list[dict[str, Any]]]:
+    """Compare logits with absolute and relative floating-point tolerances.
+
+    Bit-for-bit equality is not a useful bar once kernels, dtypes, or device
+    backends differ. `atol + rtol * abs(hf)` is the standard allclose rule: small
+    logits get an absolute tolerance, large logits get proportional slack.
+    """
+
     comparisons = []
     passed = True
     for key in sorted(hf_logits):
@@ -557,6 +660,10 @@ def _compare_logits(
                 "max_abs_diff": float(diff.max().item()),
                 "mean_abs_diff": float(diff.mean().item()),
                 "num_exceeding_tolerance": int(exceed.sum().item()),
+                # The argmax is the token the model would pick greedily at the
+                # final prompt position. It is not a complete parity metric, but
+                # it gives reviewers a quick semantic signal alongside the full
+                # tolerance check.
                 "hf_last_token_argmax": int(last_hf.argmax(dim=-1)[0].item()),
                 "tt_last_token_argmax": int(last_tt.argmax(dim=-1)[0].item()),
             }
@@ -565,6 +672,8 @@ def _compare_logits(
 
 
 def run(argv: list[str] | None = None) -> dict[str, Any]:
+    """Run the end-to-end parity preflight and return a JSON-serializable report."""
+
     args = parse_args(argv)
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be positive")
@@ -574,6 +683,9 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
     dtype = _torch_dtype(torch, args.dtype)
     device = _resolve_device(torch, args.device)
     encoded_prompts = _tokenize_prompts(args, torch)
+
+    # If the user does not provide offsets, sample the boundaries that are most
+    # likely to expose a positional-encoding mismatch.
     offsets = args.position_offsets or default_position_offsets(
         args.reference_context,
         args.max_tokens,
@@ -586,6 +698,8 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
     )
 
     started_at = time.time()
+    # Load/run the two implementations sequentially so the script can run on a
+    # single GPU without needing enough memory for both full models at once.
     hf_logits, hf_config = _collect_hf_logits(
         args,
         torch=torch,
