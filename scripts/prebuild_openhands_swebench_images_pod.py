@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+"""Prebuild OpenHands runtime images for SWE-bench evals on the GPU pod.
+
+OpenHands does not run every SWE-bench task in the same Docker image. Each task
+uses a benchmark-specific base image, and OpenHands then adds its own runtime
+layer containing the agent server code. Building those images during the eval
+would mix model-inference timing with Docker build timing, so this launcher
+warms the image cache ahead of the real pass@1 run.
+
+This file has two layers:
+
+* the outer launcher prepares the pod, OpenHands checkout, Poetry environment,
+  tmux supervision, and reproducibility context; and
+* PREBUILD_IMAGES_CODE runs inside the selected OpenHands checkout so it uses
+  that checkout's exact SWE-bench image-selection and runtime-build helpers.
+"""
+
 from __future__ import annotations
 
 import json
@@ -99,6 +115,13 @@ def local_image_exists(client: docker.DockerClient, image_name: str) -> bool:
 
 
 def runtime_target_image(base_image: str, source_hash: str) -> str:
+    # OpenHands tags runtime images from two ingredients:
+    #
+    # * the SWE-bench base image for a task; and
+    # * a hash of the OpenHands source files that are copied into the runtime.
+    #
+    # That means a rebuild is needed when OpenHands code changes even if the
+    # underlying benchmark image stays the same.
     lock_tag = f"oh_v{openhands_version}_{get_hash_for_lock_files(base_image, False)}"
     return f"{get_runtime_image_repo()}:{lock_tag}_{source_hash}"
 
@@ -109,6 +132,9 @@ def build_runtime_job(job: dict[str, str]) -> str:
         if local_image_exists(client, job["target_image"]):
             return "skipped"
 
+        # DockerRuntimeBuilder uses the same OpenHands runtime-image path as the
+        # eval harness. Keeping browser support disabled matches the generated
+        # OpenHands config, where browsing is not part of the SWE-HERO eval.
         builder = DockerRuntimeBuilder(client)
         image_name = build_runtime_image(
             job["base_image"],
@@ -131,6 +157,9 @@ def build_runtime_job(job: dict[str, str]) -> str:
 
 def main() -> None:
     args = parse_args()
+    # set_dataset_type configures OpenHands' SWE-bench helpers for the dataset
+    # naming convention. The runtime image for an instance is derived from its
+    # SWE-bench instance_id, not from this repo's local experiment names.
     set_dataset_type(args.dataset)
     dataset = load_dataset(args.dataset, split=args.split)
     if args.eval_limit is not None:
@@ -141,11 +170,16 @@ def main() -> None:
     seen_targets: set[str] = set()
     for row in dataset:
         instance_id = row["instance_id"]
+        # swebench_official_image=True asks OpenHands for the official
+        # SWE-bench task environment. That is important because the grader later
+        # evaluates patches inside the same dependency/runtime family.
         base_image = get_instance_docker_image(
             instance_id,
             swebench_official_image=True,
         )
         target_image = runtime_target_image(base_image, source_hash)
+        # Many tasks share one runtime image. Deduplicating by target tag avoids
+        # launching redundant Docker builds while still covering every task.
         if target_image in seen_targets:
             continue
         seen_targets.add(target_image)
@@ -179,6 +213,8 @@ def main() -> None:
     try:
         for index, job in enumerate(jobs, start=1):
             target_image = job["target_image"]
+            # Docker image builds are expensive and persistent on the pod. Treat
+            # a matching local tag as the idempotence boundary for reruns.
             if local_image_exists(probe_client, target_image):
                 skipped += 1
                 print(
@@ -210,6 +246,9 @@ def main() -> None:
             flush=True,
         )
         with ThreadPoolExecutor(max_workers=active_workers) as executor:
+            # Docker can build several independent runtime images concurrently,
+            # but too much parallelism can saturate disk/network and make all
+            # builds slower. The outer launcher defaults to a conservative 4.
             future_to_job = {
                 executor.submit(build_runtime_job, job): job for job in build_jobs
             }
@@ -271,8 +310,12 @@ def resolve_path(raw: str | Path) -> Path:
 
 
 def resolve_eval_config(config_path: Path) -> dict[str, Any]:
+    """Read the eval preset once so image prebuild matches the real eval."""
+
     if not config_path.is_file():
         raise SystemExit(f"eval config preset not found: {config_path}")
+    # Reuse the eval scaffold's argparse rules instead of duplicating dataset,
+    # OpenHands, SWE-Lego, and Docker-runtime semantics in this launcher.
     args = eval_script.parse_args(
         [
             f"@{config_path}",
@@ -330,7 +373,12 @@ def flatten(value: Any, prefix: str = "") -> dict[str, Any]:
 
 
 class PrebuildLauncher:
+    """Coordinate pod setup and OpenHands runtime-image prebuilds."""
+
     def __init__(self) -> None:
+        # Default to the same paper-aligned preset as the eval launcher. Other
+        # model/eval stacks must opt in through --config so image prebuilds track
+        # the exact preset that will later run inference and grading.
         self.config_preset = (
             ROOT_DIR
             / "configs/eval/openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args"
@@ -402,6 +450,8 @@ class PrebuildLauncher:
             die("--replace-session only applies to tmux-supervised launches")
 
     def assign_config(self, values: dict[str, Any]) -> None:
+        """Copy resolved preset fields onto the launcher instance."""
+
         for key, value in values.items():
             setattr(self, key.lower(), value)
         self.config_preset_path = Path(values["CONFIG_PRESET_PATH"])
@@ -410,6 +460,8 @@ class PrebuildLauncher:
             self.openhands_eval_poetry_version = str(
                 values["OPENHANDS_POETRY_VERSION_FROM_CONFIG"]
             )
+        # Runtime image prebuild only makes sense when OpenHands will execute
+        # tasks in Docker. Remote runtimes do not use the local SWE-bench images.
         if self.runtime != "docker":
             die("prebuild only applies to --runtime docker configs")
         self.tmux_log_path = self.tmux_log_dir / f"{self.tmux_session}.log"
@@ -418,6 +470,8 @@ class PrebuildLauncher:
     def build_context(
         self, script_path: Path, foreground_command: str
     ) -> dict[str, Any]:
+        """Build the context used to decide whether an existing tmux job matches."""
+
         git_branch = run(
             ["git", "-C", str(ROOT_DIR), "branch", "--show-current"],
             capture_output=True,
@@ -443,6 +497,9 @@ class PrebuildLauncher:
                 "eval_venv": str(self.eval_venv),
                 "openhands_eval_poetry_version": self.openhands_eval_poetry_version,
             },
+            # These fields are the image-build contract. If any of them differ,
+            # an existing prebuild session may be warming the wrong dataset,
+            # OpenHands runtime code, or SWE-Lego vendored stack.
             "resolved_eval_config": {
                 "eval_stack": self.eval_stack,
                 "dataset": self.dataset,
@@ -461,6 +518,8 @@ class PrebuildLauncher:
         }
 
     def write_tmux_context(self, script_path: Path, foreground_command: str) -> None:
+        """Persist launch context atomically next to the tmux log."""
+
         context = self.build_context(script_path, foreground_command)
         self.tmux_context_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -476,6 +535,8 @@ class PrebuildLauncher:
         Path(tmp_name).replace(self.tmux_context_path)
 
     def compare_tmux_context(self, script_path: Path, foreground_command: str) -> None:
+        """Refuse to attach to a same-name session doing different work."""
+
         requested = comparable_context(
             self.build_context(script_path, foreground_command)
         )
@@ -537,6 +598,8 @@ class PrebuildLauncher:
         raise SystemExit(1)
 
     def foreground_prebuild_pids(self) -> list[int]:
+        """Find foreground workers for this logical prebuild session."""
+
         result = run(["ps", "-eo", "pid=,args="], capture_output=True, check=False)
         pids: list[int] = []
         current_pid = os.getpid()
@@ -609,6 +672,8 @@ class PrebuildLauncher:
             run(["kill", "-KILL", f"-{pgid}"], check=False)
 
     def launch_tmux_if_needed(self) -> None:
+        """Start or attach to a supervised tmux prebuild job."""
+
         if self.foreground:
             return
         pod_startup_common.require_pod_runtime(ROOT_DIR, "tmux")
@@ -638,6 +703,9 @@ class PrebuildLauncher:
                 print(f"tmux session already exists: {self.tmux_session}")
                 launch_session = False
         if launch_session:
+            # Prebuilding images bakes OpenHands source into Docker tags. Ensure
+            # the pod checkout matches the pushed branch before starting a long
+            # image build session.
             pod_startup_common.prepare_pod_checkout(
                 ROOT_DIR,
                 "OpenHands image prebuild pod execution directory",
@@ -705,6 +773,8 @@ class PrebuildLauncher:
             os.killpg(process.pid, signal.SIGKILL)
 
     def run_supervised_foreground_worker(self) -> None:
+        """Run the foreground worker in its own process group for cleanup."""
+
         if shutil.which("setsid") is None:
             die(
                 "setsid not found; recreate the pod with manifests/midtraining-hostpath.yaml"
@@ -737,6 +807,8 @@ class PrebuildLauncher:
             self.terminate_foreground_worker()
 
     def ensure_docker(self) -> None:
+        """Ensure Docker can run the same container flow used by SWE-bench."""
+
         if (
             run(
                 ["docker", "info"],
@@ -781,6 +853,8 @@ class PrebuildLauncher:
             die(
                 "Docker daemon did not become ready; see /workspace/runlogs/openhands-dockerd.log"
             )
+        # The image prebuild path needs both container execution and buildx.
+        # The later SWE-bench grader also depends on this Docker runtime.
         run(
             ["docker", "run", "--rm", self.docker_smoke_image],
             stdout=subprocess.DEVNULL,
@@ -788,7 +862,12 @@ class PrebuildLauncher:
         run(["docker", "buildx", "version"], stdout=subprocess.DEVNULL)
 
     def ensure_openhands_checkout(self) -> None:
+        """Check out the OpenHands code whose runtime layer will be built."""
+
         if self.eval_stack == "swe-lego":
+            # SWE-Lego is reproduced from its vendored stack. Its OpenHands and
+            # SWE-bench directories are under the SWE-Lego checkout, so the whole
+            # repo ref is the source of truth for image prebuilds.
             swe_lego_dir = Path(self.swe_lego_dir)
             if not (swe_lego_dir / ".git").is_dir():
                 swe_lego_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -831,6 +910,8 @@ class PrebuildLauncher:
             return
 
         if not (self.openhands_dir / ".git").is_dir():
+            # The current OpenHands path builds runtime images from a specific
+            # upstream OpenHands ref recorded in the eval preset.
             self.openhands_dir.parent.mkdir(parents=True, exist_ok=True)
             run(
                 [
@@ -885,6 +966,8 @@ class PrebuildLauncher:
         return run([str(python), "-c", code], check=False).returncode == 0
 
     def ensure_eval_python(self) -> None:
+        """Provision the Python environment used to run OpenHands build helpers."""
+
         uv_bin = Path("/workspace/uv/uv-0.11.16/uv")
         if not uv_bin.exists():
             die("uv 0.11.16 not found at /workspace/uv/uv-0.11.16/uv")
@@ -934,6 +1017,8 @@ class PrebuildLauncher:
         )
 
     def ensure_openhands_dependencies(self) -> None:
+        """Install OpenHands evaluation dependencies into the pod venv."""
+
         poetry_env = dict(os.environ)
         poetry_env["PATH"] = f"{self.eval_venv / 'bin'}:{poetry_env.get('PATH', '')}"
         poetry_env["POETRY_VIRTUALENVS_PATH"] = "/workspace/venvs/poetry-pod"
@@ -987,6 +1072,8 @@ class PrebuildLauncher:
             )
 
     def prebuild_images(self) -> None:
+        """Run the embedded prebuild worker inside the selected OpenHands checkout."""
+
         args = [
             "--dataset",
             self.dataset,
@@ -1001,6 +1088,8 @@ class PrebuildLauncher:
         poetry_env["PATH"] = f"{self.eval_venv / 'bin'}:{poetry_env.get('PATH', '')}"
         poetry_env["POETRY_VIRTUALENVS_PATH"] = "/workspace/venvs/poetry-pod"
         poetry_env["POETRY_CACHE_DIR"] = "/workspace/.cache/poetry-pod"
+        # Feed PREBUILD_IMAGES_CODE on stdin so the worker imports OpenHands from
+        # the selected checkout's Poetry environment, not from this repo.
         run(
             ["poetry", "-C", str(self.openhands_dir), "run", "python", "-", *args],
             input=PREBUILD_IMAGES_CODE,
@@ -1008,6 +1097,8 @@ class PrebuildLauncher:
         )
 
     def run_foreground(self) -> None:
+        """Run the full prebuild flow after tmux has selected foreground mode."""
+
         pod_startup_common.require_pod_runtime(
             ROOT_DIR, "docker", "git", "python3", "tmux"
         )
