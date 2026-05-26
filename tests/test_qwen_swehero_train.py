@@ -1,3 +1,19 @@
+"""Tests for the Qwen SWE-HERO TorchTitan training launcher.
+
+The launcher turns OpenHands SWE traces into supervised fine-tuning data for a
+Qwen coding model, then starts TorchTitan distributed training. These tests are
+therefore part unit tests and part executable runbook: they lock down which
+tokens are trainable, how long-context Qwen settings are represented, how data
+is bucketed for memory, and which production guards make a run reproducible.
+
+Most assertions here do not prove that the model becomes better. They prove that
+the intended ML experiment is being launched: same model revision, same dataset
+artifact, same 128k YaRN context, same loss mask, same distributed shape, and
+same resumability/provenance rules.
+"""
+
+from __future__ import annotations
+
 import ast
 import contextlib
 import hashlib
@@ -20,6 +36,14 @@ from scripts import qwen_swehero_train as train
 
 
 class FakeTokenizer:
+    """Character-level tokenizer used when the exact HF vocabulary is irrelevant.
+
+    The production launcher uses the Qwen tokenizer, where one token can cover a
+    word fragment, a symbol, or a special ChatML marker. For many loss-mask tests
+    we only need deterministic token boundaries that round-trip to text, so this
+    fake maps each character to one integer.
+    """
+
     bos_id = None
     eos_id = None
     pad_id = 0
@@ -32,6 +56,8 @@ class FakeTokenizer:
 
 
 class _BatchBackend:
+    """Mimic the batch tokenizer API exposed by Hugging Face tokenizers."""
+
     def __init__(self, owner):
         self.owner = owner
 
@@ -43,6 +69,8 @@ class _BatchBackend:
 
 
 class BatchFakeTokenizer(FakeTokenizer):
+    """Fake tokenizer that proves the optimized batched path is exercised."""
+
     def __init__(self):
         self.batch_calls = 0
         self.encode_calls = 0
@@ -57,6 +85,8 @@ class BatchFakeTokenizer(FakeTokenizer):
 
 
 class TestQwenSweHeroTorchTitanLauncher:
+    """Keep the training wrapper aligned with the paper-facing run contract."""
+
     @staticmethod
     def _legacy_encode_swehero_example(
         tokenizer,
@@ -66,11 +96,21 @@ class TestQwenSweHeroTorchTitanLauncher:
         min_trainable_tokens: int,
         include_model_patch: bool = False,
     ) -> dict[str, object] | None:
+        """Independent reference encoder for regression tests.
+
+        The production encoder has been optimized to batch-tokenize trace
+        segments. This helper keeps the older per-segment algorithm in the test
+        suite so we can prove the optimization did not change the ML data
+        contract: input token IDs, shifted labels, and loss masking.
+        """
+
         token_ids: list[int] = []
         labels: list[int] = []
 
         bos_id = getattr(tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None))
         if bos_id is not None:
+            # A BOS token is prompt framing, not an assistant action copied from
+            # the trace, so it must not contribute to supervised fine-tuning loss.
             token_ids.append(int(bos_id))
             labels.append(train.IGNORE_INDEX)
 
@@ -79,6 +119,10 @@ class TestQwenSweHeroTorchTitanLauncher:
         ):
             ids = train._tokenize_text(tokenizer, text)
             token_ids.extend(ids)
+            # Labels are the next-token targets the model is trained to predict.
+            # IGNORE_INDEX is PyTorch's "do not compute loss here" sentinel; it
+            # masks user prompts, system text, and tool observations while keeping
+            # assistant/action text trainable.
             labels.extend(ids if is_trainable else [train.IGNORE_INDEX] * len(ids))
 
         eos_id = getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None))
@@ -98,6 +142,9 @@ class TestQwenSweHeroTorchTitanLauncher:
         if len(token_ids) < 2:
             return None
 
+        # Causal language models learn "given tokens up to position n, predict
+        # token n+1." The final token has no next-token target, so inputs drop the
+        # last token and labels drop the first token.
         shifted_input_ids = token_ids[:-1]
         shifted_labels = labels[1:]
         trainable_tokens = sum(label != train.IGNORE_INDEX for label in shifted_labels)
@@ -118,6 +165,13 @@ class TestQwenSweHeroTorchTitanLauncher:
         tokenizer,
         examples,
     ) -> dict[str, object]:
+        """Rebuild expected bucket files with the reference encoder.
+
+        Materialization is where ML data choices become durable files. The test
+        mirrors production accounting so later assertions can compare bucket
+        assignment, skipped examples, token-length histograms, and file hashes.
+        """
+
         buckets = train.parse_bucket_list(args.buckets)
         bucket_lines: dict[str, list[str]] = {str(bucket): [] for bucket in buckets}
         bucket_counts: Counter[int] = Counter()
@@ -188,6 +242,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                 else:
                     record = {**encoded, "bucket": bucket, "source_id": source_id}
                     line = json.dumps(record) + "\n"
+                    # A bucket is a fixed sequence length TorchTitan trains with.
+                    # Choosing the smallest fitting bucket avoids padding every
+                    # trace to 128k tokens, which would waste GPU memory and time.
                     bucket_lines[str(bucket)].append(line)
                     bucket_counts[bucket] += 1
                     included_source_ids.append(source_id)
@@ -383,6 +440,8 @@ class TestQwenSweHeroTorchTitanLauncher:
         return args, manifest, plan
 
     def _materialize_with_fake_runtime(self, args, examples=(), *, synthetic=False):
+        """Run data materialization without importing the vendored TorchTitan tree."""
+
         fake_tokenizer_module = types.ModuleType("torchtitan.components.tokenizer")
 
         class FakeHuggingFaceTokenizer(FakeTokenizer):
@@ -395,6 +454,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             patch.dict(
                 sys.modules,
                 {
+                    # The real launcher imports TorchTitan's HuggingFaceTokenizer.
+                    # Tests replace only that boundary so materialization behavior
+                    # can be checked without GPU training dependencies.
                     "torchtitan": types.ModuleType("torchtitan"),
                     "torchtitan.components": types.ModuleType("torchtitan.components"),
                     "torchtitan.components.tokenizer": fake_tokenizer_module,
@@ -511,6 +573,14 @@ class TestQwenSweHeroTorchTitanLauncher:
         )
 
     def _mini_qwen_tokenizer_class(self):
+        """Load the real Qwen tokenizer files through the lightweight library.
+
+        Full Transformers model loading is unnecessary for data-materialization
+        tests. The tokenizers package is enough to verify that ChatML rendering
+        and token IDs match Qwen's actual tokenizer assets when those assets are
+        available locally.
+        """
+
         try:
             from tokenizers import Tokenizer
         except ImportError as exc:
@@ -752,6 +822,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             attention_backend=args.attention_backend,
         )
 
+        # These identities pin the experiment source of truth: the base Qwen
+        # checkpoint, the locally materialized one-rollout SWE-HERO artifact, and
+        # the historical public dataset revision used to build that artifact.
         assert args.model_id == train.MODEL_ID
         assert args.model_revision == train.MODEL_REVISION
         assert args.dataset_id == train.DATASET_ID
@@ -761,7 +834,15 @@ class TestQwenSweHeroTorchTitanLauncher:
         assert args.num_examples == 0
         assert args.max_streamed_examples == 0
         assert args.build_dataset_if_missing
+
+        # The direct-to-hero recipe trains at 128k tokens even though the released
+        # Qwen2.5 model is native 32k. That long context is what lets a full SWE
+        # trace fit in one sequence instead of training on short fragments.
         assert args.max_length == train.PAPER_CONTEXT_LENGTH
+        # These are SFT hyperparameters: epochs decide how many passes over the
+        # data are made, global batch size controls examples per optimizer update,
+        # and the cosine schedule decays from learning_rate to min_learning_rate
+        # after a warmup period that reduces early-step instability.
         assert args.num_train_epochs == 3.0
         assert args.global_batch_size == 32
         assert args.learning_rate == 1e-5
@@ -773,6 +854,11 @@ class TestQwenSweHeroTorchTitanLauncher:
         assert args.rdzv_backend == "c10d"
         assert args.rdzv_endpoint == "localhost:0"
         assert args.rdzv_id == ""
+
+        # FP8 and bfloat16 are memory/performance choices. FP8 reduces some linear
+        # layer compute/storage cost where TorchTitan supports it; bfloat16 keeps
+        # distributed parameter/reduction buffers smaller than float32 while
+        # preserving a broad exponent range.
         assert args.enable_fp8
         assert args.attention_backend == "sdpa"
         assert args.optimizer_impl == "foreach"
@@ -796,6 +882,9 @@ class TestQwenSweHeroTorchTitanLauncher:
         assert args.profiler_active == 1
         assert args.profiler_warmup == 3
         assert not (args.enable_memory_snapshot)
+        # Buckets are the fixed sequence lengths used for each stage. Short 8k
+        # and 16k buckets are intentionally absent because the production recipe
+        # groups those traces into the 32k stage to keep the stage plan simple.
         assert train.parse_bucket_list(args.buckets) == train.DEFAULT_BUCKETS
         assert train.DEFAULT_BUCKETS == (32768, 65536, 131072)
         assert 8192 not in train.DEFAULT_BUCKETS
@@ -833,6 +922,9 @@ class TestQwenSweHeroTorchTitanLauncher:
     def test_production_mode_accepts_full_default_training_recipe(self):
         args = self._validate_default_production_launch_args()
 
+        # Production mode is intentionally strict: no sampled subsets, no bounded
+        # max_steps, and durable metrics enabled, so a completed run is comparable
+        # to the paper-facing baseline rather than a smoke test.
         assert args.production_mode
         assert args.num_examples == 0
         assert args.max_streamed_examples == 0
@@ -872,6 +964,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             ]
         )
 
+        # The acceptance smoke is deliberately opt-in and bounded. It uses real
+        # data and launch validation, but one small single-bucket stage makes it
+        # practical to verify production wiring before spending a full GPU run.
         assert args.production_mode
         assert args.production_acceptance_smoke
         assert args.num_examples == 8
@@ -1141,6 +1236,9 @@ class TestQwenSweHeroTorchTitanLauncher:
         assert lock_path.parent != out_dir
 
     def test_production_mode_rejects_smoke_and_subset_controls(self):
+        # These flags are useful for local iteration, but each one changes the
+        # training population, data preparation, or proof obligations. Production
+        # mode rejects them so "production" always means the full recipe.
         cases = [
             (["--dry-run"], "--dry-run"),
             (["--prepare-data-only"], "--prepare-data-only"),
@@ -1160,6 +1258,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                     self._validate_default_production_launch_args(extra_args)
 
     def test_production_mode_rejects_non_production_training_recipe(self):
+        # Each case changes a meaningful ML contract: context length, bucket/CP
+        # plan, curriculum, optimizer schedule, loss mask, or source artifact.
+        # Rejecting them keeps production runs comparable across restarts.
         cases = [
             (["--max-length", "32768"], "--max-length=131072"),
             (["--buckets", "131072", "--bucket-cp", "131072:8"], "--buckets"),
@@ -1211,6 +1312,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                 args = train.parse_args(argv, env_file_default=loaded_env_file)
                 hf_token = os.environ["HF_TOKEN"]
 
+        # Environment files may provide secrets such as HF_TOKEN, but experiment
+        # choices must come from presets/CLI so the run spec can record one clear
+        # source for model, data, bucket, and precision settings.
         assert args.env_file == str(env_file)
         assert args.num_examples == train.DEFAULT_NUM_EXAMPLES
         assert args.max_streamed_examples == train.DEFAULT_MAX_STREAMED_EXAMPLES
@@ -1277,6 +1381,9 @@ class TestQwenSweHeroTorchTitanLauncher:
         ):
             args = train.parse_args(["--num-examples", "3"])
 
+        # Ambient process variables are deliberately ignored for experiment
+        # config. Otherwise a shell setting could silently change the training
+        # data subset, precision mode, or bucket plan without appearing in argv.
         assert args.num_examples == 3
         assert train.parse_bucket_list(args.buckets) == train.DEFAULT_BUCKETS
         assert args.enable_fp8
@@ -1413,6 +1520,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                     self._validate_launch_args(cli_args)
 
     def test_launch_input_validation_rejects_context_and_bucket_mismatches(self):
+        # max_length is the largest tokenized example allowed into training. It
+        # must fit the paper context and the largest bucket, and every bucket
+        # needs an explicit CP degree so TorchTitan knows how to split sequences.
         with pytest.raises(ValueError, match="paper context"):
             self._validate_launch_args(
                 [
@@ -1620,6 +1730,10 @@ class TestQwenSweHeroTorchTitanLauncher:
     def test_expected_qwen_yarn_rope_config_tracks_128k_extension(self):
         rope = train.expected_qwen_yarn_rope_config()
 
+        # RoPE gives each token position a mathematical encoding. YaRN rescales
+        # that encoding so Qwen can be served/trained at 128k positions instead
+        # of the native 32k window. These values must match the launcher docs and
+        # TorchTitan registry or long-context logits will not be comparable.
         assert rope["rope_type"] == "yarn"
         assert rope["max_position_embeddings"] == train.PAPER_CONTEXT_LENGTH
         assert (
@@ -1636,6 +1750,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             repo_root / "torchtitan/torchtitan/models/qwen2_5/__init__.py"
         ).read_text()
 
+        # TorchTitan consumes YaRN settings under the standard beta_fast and
+        # beta_slow names. This source check protects the vendored registry from
+        # drifting away from the Hugging Face/Qwen terminology used elsewhere.
         assert "max_seq_len=QWEN25_CODER_7B_CONTEXT" in source
         assert "theta=1_000_000.0" in source
         assert 'scaling="yarn"' in source
@@ -1699,6 +1816,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             )
 
         files = {record["path"]: record for record in provenance["files"]}
+        # Model provenance is not just bookkeeping: a hidden config/tokenizer or
+        # safetensors shard change can alter tokenization, architecture, or model
+        # weights while leaving the Python launch code unchanged.
         assert (
             provenance["schema_version"] == train.MODEL_ASSET_PROVENANCE_SCHEMA_VERSION
         )
@@ -1737,6 +1857,8 @@ class TestQwenSweHeroTorchTitanLauncher:
             shard.write_bytes(b"shard")
             summary = train.validate_hf_asset_preflight(args)
 
+        # A sharded safetensors index maps parameter names to files. If an indexed
+        # shard is missing, TorchTitan may fail late or load an incomplete model.
         assert summary["config_model_type"] == "qwen2"
         assert summary["safetensors"]["shard_count"] == 1
         assert summary["safetensors"]["weight_map_entries"] == 1
@@ -1769,6 +1891,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             with pytest.raises(RuntimeError, match="byte size"):
                 train.validate_hf_asset_preflight(args, manifest)
 
+        # The manifest is a promise about the exact model assets used when data
+        # was materialized. Rechecking hashes before launch catches accidental
+        # checkpoint/tokenizer replacement.
         assert summary["manifest_model_assets"]["file_count"] == 5
         assert summary["manifest_model_assets"]["sha256_verified_files"] == 5
 
@@ -2013,6 +2138,9 @@ class TestQwenSweHeroTorchTitanLauncher:
 
             artifact = train._dataset_artifact_metadata(dataset)
 
+        # Dataset provenance records both the selected task manifest and parquet
+        # shards. That lets reviewers distinguish "same training code" from "same
+        # actual SWE traces and rollout selection."
         assert artifact["path"] == str(dataset)
         assert artifact["metadata"] == metadata
         assert artifact["metadata_json"]["sha256"] == artifact["metadata_json_sha256"]
@@ -2035,6 +2163,9 @@ class TestQwenSweHeroTorchTitanLauncher:
         repo_root = Path(__file__).resolve().parents[1]
         source = (repo_root / "torchtitan/torchtitan/models/common/rope.py").read_text()
 
+        # The order matters because YaRN computes a correction range from the fast
+        # and slow beta values. Matching Hugging Face protects long-context
+        # position math rather than merely matching config names.
         fast_index = source.index("cfg.beta_fast * 2 * math.pi")
         slow_index = source.index("cfg.beta_slow * 2 * math.pi")
         assert fast_index < slow_index
@@ -2064,6 +2195,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                 warmup_ratio=0.1,
             )
 
+        # Step counts are rounded per bucket from example count, global batch,
+        # and epochs. cumulative_steps is what lets resumed multi-stage training
+        # know where each bucket ends in the global optimizer schedule.
         assert plan.total_steps == 5
         assert plan.warmup_steps == 1
         assert [stage.bucket for stage in plan.stages] == [32768, 65536]
@@ -2087,6 +2221,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                 bucket_curriculum="long-to-short",
             )
 
+        # The curriculum changes the order in which sequence lengths are seen.
+        # That is an experiment choice because short-to-long and long-to-short can
+        # produce different optimizer states before the largest contexts run.
         assert [stage.bucket for stage in plan.stages] == [65536, 32768]
         assert [stage.steps for stage in plan.stages] == [1, 4]
         assert [stage.cumulative_steps for stage in plan.stages] == [1, 5]
@@ -3411,6 +3548,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                 train.validate_resume_contract(changed, plan, manifest)
 
     def test_varlen_attention_is_rejected_when_any_bucket_uses_cp(self):
+        # Context Parallelism splits one long sequence across ranks. TorchTitan's
+        # varlen attention path currently cannot combine with CP for this recipe,
+        # so CP buckets must use supported SDPA/Flex attention instead.
         with pytest.raises(ValueError, match="VarlenAttention"):
             train.validate_bucket_config(
                 buckets=(32768, 65536),
@@ -3436,6 +3576,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             )
             command = train.build_source_dataset_command(args)
 
+        # The training launcher can rebuild the local one-rollout artifact, but
+        # only by calling the dedicated dataset-prep script with explicit source
+        # revision and sharding controls. It must not silently overwrite data.
         assert "prepare_swehero_historical_one_rollout.py" in " ".join(command)
         assert "--dataset-id" in command
         assert command[command.index("--dataset-id") + 1] == train.SOURCE_DATASET_ID
@@ -3485,6 +3628,8 @@ class TestQwenSweHeroTorchTitanLauncher:
                 train.download_hf_assets_if_requested(args)
 
         command = run.call_args.args[0]
+        # Hugging Face repo names are mutable aliases unless a revision is pinned.
+        # Passing the exact commit keeps tokenization and model weights stable.
         assert "--repo_id" in command
         assert command[command.index("--repo_id") + 1] == train.MODEL_ID
         assert "--revision" in command
@@ -3534,6 +3679,10 @@ class TestQwenSweHeroTorchTitanLauncher:
         )
 
         assert encoded is not None
+        # Only assistant content and assistant tool-call JSON should be trainable.
+        # User/system/tool-observation text is context the model reads, but if it
+        # contributed to loss the model would be trained to imitate the user or
+        # the environment instead of the agent's next action.
         trainable_text = FakeTokenizer().decode(
             label for label in encoded["labels"] if label != train.IGNORE_INDEX
         )
@@ -3575,6 +3724,9 @@ class TestQwenSweHeroTorchTitanLauncher:
         )
         batch_tokenizer = BatchFakeTokenizer()
 
+        # Batch tokenization is a performance optimization for materialization.
+        # It must be byte-for-byte equivalent to the simpler reference encoder
+        # because even one shifted label change changes the training objective.
         actual = train.encode_swehero_example(
             batch_tokenizer,
             example,
@@ -3595,6 +3747,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             ],
         }
 
+        # Truncating a SWE trace would silently drop early context or the target
+        # assistant action. Raising forces the caller to choose an explicit policy
+        # and keeps the training corpus auditable.
         with pytest.raises(train.LongExampleError, match="exceeds --max-length"):
             train.encode_swehero_example(
                 FakeTokenizer(),
@@ -3629,6 +3784,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                 ],
             }
 
+            # The default is fail-closed because dropping overlength examples
+            # changes the training distribution. A skip is allowed only when the
+            # manifest records that choice and which examples were affected.
             with pytest.raises(RuntimeError, match="would have been truncated"):
                 self._materialize_with_fake_runtime(args, [example])
 
@@ -3673,6 +3831,9 @@ class TestQwenSweHeroTorchTitanLauncher:
 
             manifest = self._materialize_with_fake_runtime(args, examples)
 
+        # When skip mode is explicit, the manifest must make both the streamed
+        # population and the included population visible. That is the proof that
+        # the training set changed by excluding the long trace.
         assert manifest["long_example_policy"] == "skip"
         assert manifest["skipped"]["too_long_for_max_length"] == 1
         assert manifest["long_examples_sample"][0]["source_id"] == "too-long"
@@ -3721,6 +3882,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             manifest = self._materialize_with_fake_runtime(args, [example])
             loaded_manifest = train._load_manifest(args.out_dir)
 
+            # Bucket files are the data TorchTitan consumes. The manifest carries
+            # enough hashes/counts to verify that those JSONL files still match
+            # the materialized training examples before a launch or resume.
             assert (
                 manifest["materialized_data_schema_version"]
                 == train.MATERIALIZED_DATA_SCHEMA_VERSION
@@ -3758,6 +3922,10 @@ class TestQwenSweHeroTorchTitanLauncher:
         dataset_path = self._real_swehero_dataset_path()
         hf_assets_path = self._real_qwen_hf_assets_path()
         tokenizer_class = self._mini_qwen_tokenizer_class()
+        # These goldens are hashes of the first real examples after ChatML
+        # rendering, Qwen tokenization, next-token shifting, loss masking, and
+        # bucket assignment. They guard against accidental data-objective drift
+        # when materialization code is optimized.
         golden_rows = [
             {
                 "source_id": "numpy__numpy-9df514382c0b7c8fdaa979f66054285d69afee4d",
@@ -3917,6 +4085,7 @@ class TestQwenSweHeroTorchTitanLauncher:
 
         for golden, (source_id, segments, encoded) in zip(golden_rows, examples):
             assert source_id == golden["source_id"]
+            # Segment hashes catch prompt-format changes before tokenization.
             assert (
                 hashlib.sha256(
                     json.dumps(segments, ensure_ascii=False).encode()
@@ -3930,6 +4099,8 @@ class TestQwenSweHeroTorchTitanLauncher:
                 )
             ) == golden["bucket"]
             assert encoded["trainable_tokens"] == golden["trainable_tokens"]
+            # Token and label hashes catch both tokenizer drift and loss-mask
+            # drift without committing huge token arrays to the test file.
             assert (
                 hashlib.sha256(json.dumps(encoded["input_ids"]).encode()).hexdigest()
                 == golden["input_ids_sha256"]
@@ -4002,6 +4173,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                 manifest = train.materialize_training_buckets(args)
             actual_bucket_text = Path(manifest["bucket_files"]["30000"]).read_text()
 
+        # A tiny max_length forces real examples down the long-example skip path.
+        # The independent legacy encoder proves the optimized materializer skips
+        # the same source IDs and writes the same bucket payloads.
         assert manifest["bucket_counts"] == expected["bucket_counts"]
         assert manifest["bucket_file_integrity"] == expected["bucket_file_integrity"]
         assert (
@@ -4073,6 +4247,9 @@ class TestQwenSweHeroTorchTitanLauncher:
                 warmup_ratio=args.warmup_ratio,
             )
 
+            # Synthetic buckets are not model-quality data. They are minimal
+            # trainable examples for exercising every configured bucket and CP
+            # degree in smoke runs without requiring the full SWE-HERO artifact.
             assert manifest["smoke_synthetic_buckets"]
             assert manifest["smoke_synthetic_examples_per_bucket"] == 2
             assert manifest["bucket_curriculum"] == train.DEFAULT_BUCKET_CURRICULUM
@@ -4549,6 +4726,9 @@ class TestQwenSweHeroTorchTitanLauncher:
 
         rendered = "".join(text for text, _ in train.qwen_openhands_segments(example))
 
+        # Qwen's chat template is ChatML-style <|im_start|>/<|im_end|>. OpenHands
+        # tool observations are rendered as user-side tool_response blocks so the
+        # model reads environment output as context, not as assistant text.
         assert "<|im_start|>system\nsystem prompt<|im_end|>\n" in rendered
         assert "<|im_start|>user\nreported issue<|im_end|>\n" in rendered
         assert (
@@ -4576,6 +4756,8 @@ class TestQwenSweHeroTorchTitanLauncher:
 
         decoded = json.loads(payload)
 
+        # Tool calls must remain valid JSON because OpenHands parses these blocks
+        # back into executable actions during training/eval trace replay.
         assert decoded["name"] == 'quoted"tool'
         assert decoded["arguments"] == {"cmd": 'printf "hello"'}
 
@@ -4592,6 +4774,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             {"name": "execute_bash", "arguments": {"cmd": "pytest -q"}}
         )
 
+        # Some OpenHands traces store function arguments as a JSON string while
+        # others already store a mapping. Preserving the original type avoids
+        # changing the exact text Qwen is trained to emit.
         assert (
             json.loads(
                 string_arguments.removeprefix("\n<tool_call>\n").removesuffix(
@@ -4625,6 +4810,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             str(hf_assets),
             local_files_only=True,
         )
+        # This optional integration check compares our renderer with the official
+        # tokenizer chat template. It is skipped when local HF assets are absent,
+        # but when present it is the strongest proof that formatting matches Qwen.
         cases = [
             [
                 {"role": "system", "content": "system prompt"},
@@ -4693,6 +4881,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             )
             command = train.build_torchrun_command(args)
 
+        # Stage env vars are the handoff from the Python launcher to TorchTitan.
+        # They carry bucket sequence length, CP degree, precision, optimizer, and
+        # checkpoint/export choices into the distributed training process.
         assert env["SWEHERO_BUCKET_CP"] == "2"
         assert env["SWEHERO_BUCKET_SEQ_LEN"] == "32768"
         assert env["SWEHERO_MODEL_REVISION"] == train.MODEL_REVISION
@@ -4857,6 +5048,9 @@ class TestQwenSweHeroTorchTitanLauncher:
             )
             command = train.build_hf_logits_parity_command(args)
 
+        # Logits are the raw next-token scores before sampling. Comparing
+        # TorchTitan logits against a Hugging Face Qwen reference under the same
+        # 128k YaRN context catches model-config drift before long training runs.
         assert "qwen_swehero_logits_parity.py" in " ".join(command)
         assert "--reference-context" in command
         assert command[command.index("--reference-context") + 1] == "paper-yarn-128k"
