@@ -8,6 +8,9 @@ SWE-Lego behavior visible without spreading conditionals through the launcher.
 
 from __future__ import annotations
 
+SWE_LEGO_EVAL_STACK = "swe-lego"
+SWE_LEGO_LOCAL_LLM_API_KEY = "dummy-key"
+
 
 def select_openhands_llm_api_key(
     eval_stack: str,
@@ -22,11 +25,13 @@ def select_openhands_llm_api_key(
     is an eval-stack reproduction detail, not a secret-management policy.
     """
 
-    if eval_stack == "swe-lego" and not llm_api_key_explicit:
-        # Preserve SWE-Lego's vendored local-serving contract. If the caller
-        # explicitly sets LLM_API_KEY, respect it; otherwise use the dummy value
-        # the SWE-Lego path expects for an OpenAI-compatible local server.
-        return "dummy-key"
+    if eval_stack == SWE_LEGO_EVAL_STACK and not llm_api_key_explicit:
+        # SWE-Lego is a reproduction stack with vendored OpenHands/vLLM launch
+        # scripts. Those scripts treat "dummy-key" as the expected local bearer
+        # token when the model server is running inside the pod. This is not an
+        # ML hyperparameter, but changing it can still break the eval harness
+        # before any model inference happens.
+        return SWE_LEGO_LOCAL_LLM_API_KEY
 
     # For all other stacks, and for explicit caller choices, keep the key the
     # launcher already resolved from the environment/defaults.
