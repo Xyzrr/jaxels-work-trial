@@ -52,12 +52,24 @@ from scripts import qwen_swehero_smoke as smoke
 
 IGNORE_INDEX = -100
 
+# The constants below are the public, reviewable training recipe for this
+# launcher. They intentionally live in Python instead of only in prose because
+# the same values are used for validation, run-spec provenance, and TorchTitan
+# worker environment variables.
 MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
 MODEL_REVISION = "c03e6d358207e414f1eca0bb1891e29f1db0e242"
 TRAINING_DATASET_NAME = "swe-hero-openhands-trajectories-5b2ed21-one-rollout"
 DATASET_ID = TRAINING_DATASET_NAME
 SOURCE_DATASET_ID = one_rollout.DATASET_ID
 SOURCE_DATASET_REVISION = one_rollout.HISTORICAL_REVISION
+
+# A transformer can only read a bounded number of tokens at once; that bound is
+# its context length. The direct-to-hero recipe uses a 128k-token context so a
+# full OpenHands SWE trace, including earlier tool observations, can be kept in
+# the prompt while the model is trained on later assistant actions. Qwen2.5 was
+# released with a native 32k-token context, so this launcher records the
+# paper-style YaRN long-context override separately from the model's native
+# configuration.
 PAPER_CONTEXT_LENGTH = 131_072
 QWEN_NATIVE_CONTEXT_LENGTH = 32_768
 DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-torchtitan")
@@ -71,16 +83,40 @@ DEFAULT_TRAINING_PRESET = (
 )
 DEFAULT_NUM_EXAMPLES = 0
 DEFAULT_MAX_STREAMED_EXAMPLES = 0
+
+# We do not pad every trace to the full 128k context. Padding is cheap to reason
+# about but expensive to train, because attention cost grows with sequence
+# length. Instead, each encoded trace is assigned to the smallest bucket that can
+# fit it, so a 20k-token trace uses a 32k training shape instead of a 128k one.
 DEFAULT_BUCKETS = (32_768, 65_536, PAPER_CONTEXT_LENGTH)
+
+# Context Parallelism (CP) splits one long sequence across multiple GPUs. This
+# is different from Data Parallelism, where each GPU gets a different example.
+# Longer buckets use more CP so a single 128k example fits in memory; the
+# remaining GPUs in the world become data-parallel replicas for throughput.
 DEFAULT_BUCKET_CP = {
     32_768: 2,
     65_536: 4,
     PAPER_CONTEXT_LENGTH: 8,
 }
+
+# Shorter buckets run first because they are cheaper and provide an early signal
+# that tokenization, optimizer state, checkpointing, and logging all work before
+# the launcher reaches the memory-heavy 128k stage. This is an engineering
+# curriculum, not a claim from the SWE-Hero paper.
 DEFAULT_BUCKET_CURRICULUM = "short-to-long"
 DEFAULT_LONG_EXAMPLE_POLICY = "error"
+
+# A token is "trainable" when it contributes to the loss. We require at least
+# one trainable assistant/action token so the run never spends a step on an
+# example that only contains prompt or tool-observation context.
 DEFAULT_MIN_TRAINABLE_TOKENS = 1
 DEFAULT_INCLUDE_MODEL_PATCH = False
+
+# Supervised fine-tuning (SFT) trains the model to predict the next token from
+# curated traces. The paper-facing baseline uses three epochs, global batch 32,
+# a cosine learning-rate decay from 1e-5 to 1e-8, no AdamW weight decay, and a
+# 10% warmup period to avoid large unstable updates at the start of training.
 DEFAULT_NUM_TRAIN_EPOCHS = 3.0
 DEFAULT_MAX_STEPS = 0
 DEFAULT_GLOBAL_BATCH_SIZE = 32
@@ -102,6 +138,11 @@ BUCKET_CURRICULUM_CHOICES = (
 QWEN_DEFAULT_SYSTEM_PROMPT = (
     "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 )
+
+# RoPE is the positional encoding used by Qwen. YaRN rescales RoPE so the model
+# can extrapolate beyond the context length it was originally trained for. These
+# values are part of the long-context contract for the Qwen2.5 128k baseline:
+# changing them changes how the model represents token positions.
 QWEN_ROPE_THETA = 1_000_000.0
 QWEN_YARN_BETA_FAST = 32.0
 QWEN_YARN_BETA_SLOW = 1.0
@@ -134,6 +175,11 @@ WANDB_IDENTITY_FILENAME = "wandb_identity.json"
 WANDB_RESUME_CHOICES = ("allow", "never", "must", "auto")
 WANDB_MODE_CHOICES = ("online", "offline", "disabled", "shared")
 WANDB_RUN_ID_FORBIDDEN_CHARS = frozenset("/\\#?%:")
+
+# These choices are forwarded to TorchTitan rather than interpreted locally.
+# They are still enumerated here so a run spec can prove which ML-systems path
+# was selected: optimizer implementation, tensor dtype, and FSDP reshard policy
+# all affect memory, communication, and performance characteristics.
 OPTIMIZER_IMPL_CHOICES = ("for-loop", "foreach", "fused", "fused_opt_states_bf16")
 TORCH_DTYPE_CHOICES = ("float32", "bfloat16")
 FSDP_RESHARD_AFTER_FORWARD_CHOICES = ("default", "always", "never")
@@ -412,6 +458,14 @@ LAUNCH_STAGE_ENV_KEYS = (
 
 @dataclass(frozen=True)
 class BucketStage:
+    """One TorchTitan launch segment for examples with the same sequence shape.
+
+    TorchTitan workers are launched once per bucket because each bucket can need
+    a different context-parallel degree. `steps` counts optimizer updates inside
+    this stage; `cumulative_steps` lets the next stage continue the same learning
+    rate schedule and checkpoint numbering instead of behaving like a new run.
+    """
+
     bucket: int
     cp_degree: int
     example_count: int
@@ -422,6 +476,13 @@ class BucketStage:
 
 @dataclass(frozen=True)
 class BucketPlan:
+    """The full ordered training schedule derived from materialized data.
+
+    ML note: an "epoch" means one pass over the examples. Because this launcher
+    trains separate length buckets one after another, epoch counts are converted
+    into per-bucket optimizer steps and then stitched into one monotonic schedule.
+    """
+
     stages: tuple[BucketStage, ...]
     total_steps: int
     warmup_steps: int
@@ -551,6 +612,12 @@ def load_launch_env_file(argv: list[str] | None = None) -> str:
 
 
 def parse_bucket_list(raw: str | Iterable[int]) -> tuple[int, ...]:
+    """Parse the allowed padded sequence lengths for materialized examples.
+
+    The returned buckets are sorted so every caller can treat them as an ordered
+    set from cheapest/shortest to most expensive/longest.
+    """
+
     if isinstance(raw, str):
         values = []
         seen = set()
@@ -584,6 +651,15 @@ def parse_bucket_list(raw: str | Iterable[int]) -> tuple[int, ...]:
 
 
 def parse_bucket_cp_map(raw: str | Mapping[int, int]) -> dict[int, int]:
+    """Parse the Context Parallelism degree attached to each sequence bucket.
+
+    CP is an ML-systems memory tactic: one long token sequence is sliced across
+    multiple GPUs so attention can run without one GPU holding the whole 128k
+    activation footprint. The map is explicit because the right CP value is a
+    launch-contract decision, not something that should be inferred from model
+    names or hidden defaults.
+    """
+
     if isinstance(raw, Mapping):
         parsed = {int(bucket): int(cp) for bucket, cp in raw.items()}
     else:
@@ -618,6 +694,15 @@ def _format_bucket_cp_map(bucket_cp: Mapping[int, int]) -> str:
 
 
 def expected_qwen_yarn_rope_config() -> dict[str, Any]:
+    """Return the reviewed Qwen2.5 long-context positional-encoding contract.
+
+    Transformers do not know token order from the token IDs themselves; they use
+    positional encodings. Qwen2.5 uses RoPE, and YaRN rescales RoPE so positions
+    beyond the native 32k window remain numerically usable up to the 128k paper
+    context. The config is recorded in provenance so reviewers can distinguish a
+    true 128k-context run from a native-context baseline.
+    """
+
     return {
         "rope_type": "yarn",
         "max_position_embeddings": PAPER_CONTEXT_LENGTH,
@@ -631,6 +716,12 @@ def expected_qwen_yarn_rope_config() -> dict[str, Any]:
 
 
 def choose_bucket(length: int, buckets: Iterable[int]) -> int:
+    """Choose the smallest configured training shape that can hold `length`.
+
+    This keeps the examples loss-equivalent to full-context padding while
+    reducing wasted attention work on short traces.
+    """
+
     if length <= 0:
         raise ValueError("length must be positive")
     for bucket in sorted(buckets):
@@ -1323,6 +1414,11 @@ def validate_launch_inputs(
                 continue
             data_parallel_degree = args.nproc_per_node // cp
             microbatch = args.local_batch_size * data_parallel_degree
+            # TorchTitan accumulates gradients until it reaches the requested
+            # global batch. If the global batch is not an integer multiple of
+            # the per-step microbatch for every bucket, some stage would need a
+            # fractional accumulation step, which is not a valid optimizer
+            # schedule.
             if microbatch > 0 and args.global_batch_size % microbatch != 0:
                 errors.append(
                     "--global-batch-size must be divisible by "
@@ -1352,22 +1448,35 @@ def validate_bucket_config(
     nproc_per_node: int,
     attention_backend: str,
 ) -> None:
+    """Validate the ML-systems invariants of the bucket/CP plan."""
+
     missing = [bucket for bucket in buckets if bucket not in bucket_cp]
     if missing:
         raise ValueError(f"missing CP degree for buckets: {missing}")
     for bucket in buckets:
         cp = bucket_cp[bucket]
+        # Every context-parallel group must contain exactly CP ranks. If CP does
+        # not divide the local GPU count, TorchTitan cannot split ranks into
+        # complete groups and some workers would have no valid role.
         if nproc_per_node % cp != 0:
             raise ValueError(
                 f"bucket {bucket} uses CP={cp}, which must divide "
                 f"--nproc-per-node={nproc_per_node}"
             )
         divisor = 2 * cp
+        # TorchTitan's context-parallel attention partitions sequence positions
+        # into paired chunks across the CP group. Requiring bucket % (2 * CP) == 0
+        # prevents uneven token splits, which would otherwise fail later inside
+        # the distributed attention kernels.
         if bucket % divisor != 0:
             raise ValueError(
                 f"bucket {bucket} must be divisible by 2 * CP ({divisor}) "
                 "for TorchTitan context parallelism"
             )
+    # "varlen" attention avoids padding, but TorchTitan's implementation cannot
+    # currently combine it with CP. The bucketed SDPA/Flex path is the supported
+    # compromise: each bucket still reduces padding, and CP handles long-context
+    # memory pressure.
     if attention_backend == "varlen" and any(bucket_cp[b] > 1 for b in buckets):
         raise ValueError(
             "TorchTitan VarlenAttention does not support Context Parallelism; "
@@ -1376,6 +1485,8 @@ def validate_bucket_config(
 
 
 def _ceil_steps(example_count: int, epochs: float, global_batch_size: int) -> int:
+    """Convert an epoch target into optimizer steps for one bucket."""
+
     if example_count <= 0:
         return 0
     return max(1, math.ceil(example_count * epochs / global_batch_size))
@@ -1385,6 +1496,13 @@ def ordered_buckets_for_curriculum(
     bucket_counts: Mapping[int, int],
     bucket_curriculum: str = DEFAULT_BUCKET_CURRICULUM,
 ) -> tuple[int, ...]:
+    """Return the bucket order that the launcher will train through.
+
+    "Curriculum" here means launch order by sequence length. It does not change
+    labels or model architecture; it only chooses when each materialized bucket
+    is fed to TorchTitan.
+    """
+
     non_empty_buckets = [
         bucket for bucket, count in bucket_counts.items() if int(count) > 0
     ]
@@ -1416,6 +1534,13 @@ def build_bucket_plan(
     max_steps: int = 0,
     bucket_curriculum: str = DEFAULT_BUCKET_CURRICULUM,
 ) -> BucketPlan:
+    """Build the stage plan that turns bucketed JSONL files into one SFT run.
+
+    The important ML bookkeeping is that the learning-rate schedule and
+    checkpoint steps are global across all buckets. Even though TorchTitan is
+    launched stage-by-stage, the model should experience one continuous run.
+    """
+
     if epochs <= 0 and max_steps <= 0:
         raise ValueError("epochs must be positive unless max_steps is set")
     if global_batch_size <= 0:
@@ -1455,6 +1580,10 @@ def build_bucket_plan(
             )
         )
 
+    # Warmup starts the learning rate near zero and ramps to the peak LR. This
+    # is common for transformer fine-tuning because the first updates touch a
+    # large pretrained model and can destabilize it if the peak LR is used
+    # immediately.
     warmup_steps = (
         max(1, math.ceil(cumulative * warmup_ratio))
         if warmup_ratio > 0 and cumulative > 1
@@ -2223,6 +2352,10 @@ def parse_args(
         "--max-grad-norm",
         type=float,
         default=1.0,
+        help=(
+            "Clip gradient norm before each optimizer update. This limits rare "
+            "large updates that can destabilize transformer fine-tuning."
+        ),
     )
     parser.add_argument(
         "--optimizer-impl",
@@ -2250,6 +2383,11 @@ def parse_args(
         "--fp8-recipe",
         choices=("rowwise", "rowwise_with_gw_hp"),
         default="rowwise",
+        help=(
+            "TorchTitan FP8 quantization recipe for supported linear layers. "
+            "FP8 lowers activation/weight bandwidth but is restricted to the "
+            "converter paths TorchTitan marks as safe."
+        ),
     )
     parser.add_argument(
         "--compile",
@@ -2291,11 +2429,21 @@ def parse_args(
         "--activation-checkpoint-mode",
         choices=("full", "selective", "memory_budget", "none"),
         default="full",
+        help=(
+            "Activation checkpointing trades extra recomputation for lower GPU "
+            "memory by discarding intermediate activations and rebuilding them "
+            "during backpropagation."
+        ),
     )
     parser.add_argument(
         "--chunked-ce-chunks",
         type=int,
         default=8,
+        help=(
+            "Split causal-language-model cross entropy into this many chunks. "
+            "Chunking lowers peak memory for long contexts without changing the "
+            "mathematical loss."
+        ),
     )
     parser.add_argument(
         "--checkpoint-interval",
@@ -3341,7 +3489,14 @@ def qwen_openhands_turn_segments(
     previous_role: str | None = None,
     next_role: str | None = None,
 ) -> list[tuple[str, bool]]:
-    """Render one OpenHands message with Qwen2.5-Coder's ChatML convention."""
+    """Render one OpenHands message with Qwen2.5-Coder's ChatML convention.
+
+    Each returned tuple is `(text, is_trainable)`. `text` is what the model sees
+    in its context. `is_trainable` controls whether the tokenizer IDs from that
+    text become labels. Keeping prompt/tool text in the context but masking it
+    from labels teaches the model to use the trace history while only updating
+    weights on assistant actions.
+    """
 
     if not isinstance(turn, Mapping):
         return [(json.dumps(turn, ensure_ascii=False) + "\n", False)]
@@ -3351,6 +3506,10 @@ def qwen_openhands_turn_segments(
     segments: list[tuple[str, bool]] = []
 
     if role == "assistant":
+        # Assistant output is the target behavior: natural-language content,
+        # structured tool calls, and the assistant turn terminator all become
+        # trainable labels. The opening role marker stays masked so the model is
+        # not rewarded for reproducing the prompt scaffolding itself.
         segments.append(("<|im_start|>assistant", False))
         if content:
             segments.append(("\n" + content, True))
@@ -3364,6 +3523,10 @@ def qwen_openhands_turn_segments(
         return segments
 
     if role == "tool":
+        # Tool observations are evidence the model may condition on, not tokens
+        # we want it to imitate. OpenHands represents tool outputs as user-side
+        # ChatML tool-response blocks, so all of these tokens are masked out of
+        # the loss.
         if previous_role != "tool":
             segments.append(("<|im_start|>user", False))
         segments.append(("\n<tool_response>\n", False))
@@ -3385,6 +3548,14 @@ def qwen_openhands_segments(
     *,
     include_model_patch: bool = False,
 ) -> list[tuple[str, bool]]:
+    """Serialize a SWE trace into Qwen/OpenHands text segments.
+
+    The larger system trains a next-token predictor, so all structured SWE trace
+    data must become one linear token stream. This function preserves the Qwen
+    ChatML format expected by the base instruct model and annotates which parts
+    should count as supervised targets.
+    """
+
     segments: list[tuple[str, bool]] = []
     trajectory = example.get("trajectory") or example.get("messages") or []
     if isinstance(trajectory, list):
@@ -3395,6 +3566,10 @@ def qwen_openhands_segments(
                 segments.extend(qwen_openhands_turn_segments(trajectory[0]))
                 start_index = 1
             else:
+                # Qwen2.5-Instruct was chat-tuned with a default system prompt.
+                # When a trajectory omits an explicit system message, inserting
+                # that prompt keeps training examples in the same chat format the
+                # checkpoint expects.
                 segments.append(("<|im_start|>system\n", False))
                 segments.append((QWEN_DEFAULT_SYSTEM_PROMPT, False))
                 segments.append(("<|im_end|>\n", False))
@@ -3423,6 +3598,10 @@ def qwen_openhands_segments(
 
     patch = example.get("model_patch")
     if include_model_patch and patch:
+        # `model_patch` is optional because the direct-to-hero recipe learns from
+        # the OpenHands assistant trajectory. Including final patches changes
+        # the target distribution from action generation toward patch emission,
+        # so it is an explicit ablation knob rather than a hidden default.
         segments.append(("<|im_start|>assistant\n", False))
         segments.append((_stringify(patch) + "\n", True))
         segments.append(("<|im_end|>\n", True))
@@ -3486,11 +3665,23 @@ def encode_swehero_example(
     min_trainable_tokens: int,
     include_model_patch: bool = False,
 ) -> dict[str, Any] | None:
+    """Tokenize one SWE trace into TorchTitan causal-LM training fields.
+
+    Causal language models learn by predicting token `n+1` from tokens up to
+    `n`. That is why the returned `input_ids` drop the final token while
+    `labels` drop the first token. Labels set to `IGNORE_INDEX` are skipped by
+    cross entropy, so prompt/tool-observation tokens provide context without
+    becoming supervised targets.
+    """
+
     token_ids: list[int] = []
     labels: list[int] = []
 
     bos_id = getattr(tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None))
     if bos_id is not None:
+        # BOS means "beginning of sequence". It helps the base model recognize
+        # the start of a sample, but it is not an assistant action and therefore
+        # is masked out of the loss.
         token_ids.append(int(bos_id))
         labels.append(IGNORE_INDEX)
 
@@ -3503,20 +3694,33 @@ def encode_swehero_example(
         )
     for ids, (_text, is_trainable) in zip(tokenized_segments, segments):
         token_ids.extend(ids)
+        # Non-trainable labels stay in the input context but become -100 labels.
+        # PyTorch's cross entropy ignores -100 by convention, matching the
+        # assistant/action-only training objective.
         labels.extend(ids if is_trainable else [IGNORE_INDEX] * len(ids))
 
     eos_id = getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None))
     if eos_id is not None:
         token_ids.append(int(eos_id))
+        # EOS means "end of sequence". If the preceding segment was trainable,
+        # predicting the end marker is part of learning when to stop an assistant
+        # turn; otherwise it remains masked prompt scaffolding.
         labels.append(
             int(eos_id) if labels and labels[-1] != IGNORE_INDEX else IGNORE_INDEX
         )
 
     if len(token_ids) > max_length + 1:
+        # `max_length` applies to shifted inputs, so the unshifted token stream
+        # may be one token longer. Failing closed avoids silently truncating the
+        # end of a SWE trace, which would change what actions the model is asked
+        # to learn from.
         raise LongExampleError(token_count=len(token_ids), max_length=max_length)
     if len(token_ids) < 2:
         return None
 
+    # Shift for next-token prediction: input token i is trained to predict label
+    # token i+1. The label mask shifts too, so only assistant/action next tokens
+    # contribute to the loss.
     shifted_input_ids = token_ids[:-1]
     shifted_labels = labels[1:]
     trainable_tokens = sum(label != IGNORE_INDEX for label in shifted_labels)
@@ -4101,6 +4305,10 @@ def _synthetic_smoke_record(
 ) -> dict[str, Any]:
     source_id = f"synthetic_smoke_bucket_{bucket}_{index}"
     return {
+        # Two tokens are enough to exercise the causal shift: the model sees the
+        # first token and is trained to predict the second. The first label is
+        # masked so this smoke record mirrors the real assistant-only loss shape
+        # without pretending to be a meaningful SWE trace.
         "input_ids": [pad_token_id, 0],
         "labels": [IGNORE_INDEX, 0],
         "length": 2,
@@ -4113,6 +4321,9 @@ def _synthetic_smoke_record(
 def materialize_synthetic_smoke_buckets(args: argparse.Namespace) -> dict[str, Any]:
     from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
+    # Synthetic buckets are a launcher/system smoke path. They intentionally do
+    # not measure model quality; they only prove that every configured bucket and
+    # CP degree reaches TorchTitan, checkpointing, and validation code paths.
     args.out_dir.mkdir(parents=True, exist_ok=True)
     data_dir = args.out_dir / "data"
     staging_data_dir = args.out_dir / f".data.tmp-{os.getpid()}-{time.time_ns()}"
@@ -4248,6 +4459,10 @@ def materialize_synthetic_smoke_buckets(args: argparse.Namespace) -> dict[str, A
 def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
     from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
+    # Materialization is the boundary between raw SWE traces and TorchTitan's
+    # simple JSONL data loader. Each row becomes token IDs, shifted labels, and a
+    # bucket assignment; all later training stages consume those immutable files
+    # so resumes and reviewers can verify exactly what was trained on.
     args.out_dir.mkdir(parents=True, exist_ok=True)
     data_dir = args.out_dir / "data"
     staging_data_dir = args.out_dir / f".data.tmp-{os.getpid()}-{time.time_ns()}"
@@ -4287,6 +4502,9 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
             source_id = _example_id(example, streamed_examples)
             streamed_source_ids.append(source_id)
             try:
+                # Encoding applies the key ML policy for this dataset:
+                # assistant/action tokens are supervised, while user/system/tool
+                # context remains visible but masked out of loss.
                 encoded = encode_swehero_example(
                     tokenizer,
                     example,
@@ -4295,6 +4513,10 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                     include_model_patch=args.include_model_patch,
                 )
             except LongExampleError as exc:
+                # We fail production by default instead of truncating. In
+                # language-model training, truncation changes the target: the
+                # model would see an incomplete SWE trajectory and might lose the
+                # assistant action tokens that make the row useful.
                 skipped["too_long_for_max_length"] += 1
                 skipped_source_ids_by_reason.setdefault(
                     "too_long_for_max_length", []
@@ -4329,6 +4551,10 @@ def materialize_training_buckets(args: argparse.Namespace) -> dict[str, Any]:
                         "too_long_for_largest_bucket", []
                     ).append(source_id)
                 else:
+                    # The bucket is stored per record even though each file is
+                    # bucket-specific. That redundancy makes downstream
+                    # manifest checks and one-off debugging robust against a row
+                    # being copied into the wrong file.
                     record = {
                         **encoded,
                         "bucket": bucket,
@@ -5747,6 +5973,14 @@ def build_stage_env(
     pad_token_id: int,
     load_dataloader_state: bool = False,
 ) -> dict[str, str]:
+    """Build the environment contract consumed by the vendored TorchTitan module.
+
+    TorchTitan owns the actual model/loss/optimizer code. This launcher keeps
+    experiment choices in argparse/run specs, then exports them as environment
+    variables because the vendored TorchTitan extension reads that contract at
+    worker startup.
+    """
+
     env = os.environ.copy()
     for key in CONTROLLED_WANDB_ENV_KEYS:
         env.pop(key, None)
@@ -5769,13 +6003,23 @@ def build_stage_env(
             "SWEHERO_DATASET_ID": args.dataset_id,
             "SWEHERO_DATASET_PATH": str(args.dataset_path),
             "SWEHERO_BUCKET_FILE": str(stage.bucket_file),
+            # The bucket sequence length fixes the padded training shape for
+            # this stage. TorchTitan uses it to size attention tensors and the
+            # data loader pads records in the bucket to this shape.
             "SWEHERO_BUCKET_SEQ_LEN": str(stage.bucket),
+            # CP controls how many ranks collaborate on one long sequence.
+            # Data-parallel degree is derived as world_size / CP by the training
+            # module, so this one value changes both memory layout and effective
+            # per-rank data loading.
             "SWEHERO_BUCKET_CP": str(stage.cp_degree),
             "SWEHERO_ALLOW_EMPTY_RANK_REUSE": "1"
             if allow_empty_rank_reuse(args)
             else "0",
             "SWEHERO_TOTAL_STEPS": str(total_steps),
             "SWEHERO_CUMULATIVE_STEPS": str(stage.cumulative_steps),
+            # Warmup is global across stages: a later 128k bucket should not
+            # restart the LR schedule just because it is launched by a separate
+            # torchrun process.
             "SWEHERO_WARMUP_STEPS": str(warmup_steps),
             "SWEHERO_HF_ASSETS_PATH": str(args.hf_assets_path),
             "SWEHERO_TORCHTITAN_DUMP_FOLDER": str(_torchtitan_dump_dir(args.out_dir)),
@@ -5784,12 +6028,20 @@ def build_stage_env(
             "SWEHERO_SEED": str(args.seed),
             "SWEHERO_GLOBAL_BATCH_SIZE": str(args.global_batch_size),
             "SWEHERO_LOCAL_BATCH_SIZE": str(args.local_batch_size),
+            # These optimizer/schedule values define how quickly the pretrained
+            # checkpoint is allowed to move during SFT. Keeping them explicit in
+            # the worker env lets run specs prove the launched training matches
+            # the reviewed recipe.
             "SWEHERO_LEARNING_RATE": repr(args.learning_rate),
             "SWEHERO_MIN_LEARNING_RATE": repr(args.min_learning_rate),
             "SWEHERO_WEIGHT_DECAY": repr(args.weight_decay),
             "SWEHERO_MAX_GRAD_NORM": repr(args.max_grad_norm),
             "SWEHERO_OPTIMIZER_IMPL": args.optimizer_impl,
             "SWEHERO_ATTENTION_BACKEND": args.attention_backend,
+            # FP8 and BF16 are precision/memory tradeoffs. FP8 is only enabled
+            # for TorchTitan-supported linear layers; BF16 is used for FSDP
+            # parameter/reduction paths to reduce memory and communication while
+            # preserving enough range for transformer training.
             "SWEHERO_ENABLE_FP8": "1" if args.enable_fp8 else "0",
             "SWEHERO_FP8_RECIPE": args.fp8_recipe,
             "SWEHERO_COMPILE": "1" if args.compile else "0",
@@ -5849,6 +6101,14 @@ def _stage_data_parallel_degree(
     args: argparse.Namespace,
     stage: BucketStage,
 ) -> int:
+    """Return how many independent examples can be processed per step.
+
+    World size is all training processes. CP consumes groups of processes to
+    hold one long sequence, so only `world_size / CP` groups remain to process
+    distinct examples in data parallel. That number is the multiplier for
+    local-batch-size when validating global batch divisibility.
+    """
+
     world_size = args.nnodes * args.nproc_per_node
     if stage.cp_degree <= 0:
         raise RuntimeError(f"Stage CP degree must be positive: {stage}")
@@ -7243,6 +7503,9 @@ def _run_launch(
 
     bucket_counts = _bucket_counts_from_manifest(manifest)
     bucket_files = _bucket_files_from_manifest(manifest)
+    # From this point on, the run is driven by immutable tokenized bucket files.
+    # The plan converts "train for N epochs" into concrete optimizer-step counts
+    # per bucket while keeping one global LR/checkpoint schedule.
     plan = build_bucket_plan(
         bucket_counts=bucket_counts,
         bucket_files=bucket_files,
@@ -7325,6 +7588,9 @@ def _run_launch(
             )
             return
     for stage in stages_to_run:
+        # Each stage launches the same TorchTitan model config with a different
+        # bucket file and CP degree. Checkpoints carry model/optimizer state
+        # across stages so this behaves as one continuous SFT run.
         run_stage_with_status(
             args,
             stage,
