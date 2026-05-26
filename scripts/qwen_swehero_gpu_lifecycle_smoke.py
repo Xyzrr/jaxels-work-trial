@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Run a small GPU lifecycle smoke for the SWE-HERO TorchTitan launcher."""
+"""Run a small GPU lifecycle smoke for the SWE-HERO TorchTitan launcher.
+
+This is a system smoke test, not a model-quality evaluation. Its job is to prove
+that the GPU pod can run the same distributed training path used by the real
+Qwen/SWE-Hero experiment, write a resumable TorchTitan checkpoint, export model
+weights in Hugging Face format, and resume from the immutable run contract.
+
+The default mode uses synthetic already-tokenized records. That deliberately
+removes real dataset/tokenization variability so failures point at the lifecycle
+itself: distributed launch, bucket routing, context parallel wiring,
+checkpointing, final export, and resume validation. The
+``--production-acceptance-smoke`` mode switches to a tiny real SWE-Hero subset
+and keeps production provenance/W&B gates enabled for final pre-production
+confidence.
+"""
 
 from __future__ import annotations
 
@@ -14,8 +28,22 @@ from typing import Any
 
 DEFAULT_OUT_DIR = Path("/workspace/qwen25-coder7b-swehero-lifecycle-smoke")
 DEFAULT_HF_ASSETS_PATH = Path("/workspace/assets/hf/Qwen2.5-Coder-7B-Instruct")
+
+# The default lifecycle smoke should be fast and cheap. A 1024-token bucket is
+# far below Qwen2.5-Coder's real long-context training setup, but it exercises
+# the same TorchTitan stage planner and checkpoint/export code paths without
+# allocating enough activations to make the test expensive.
 DEFAULT_BUCKET = 1024
+
+# The production acceptance smoke uses real SWE-Hero traces. 32768 tokens is
+# Qwen2.5-Coder's native context window, so this still checks real ChatML
+# serialization and model execution while avoiding the much more expensive 128k
+# long-context YaRN path used by the full direct-to-hero run.
 DEFAULT_ACCEPTANCE_BUCKET = 32_768
+
+# Context parallelism splits a long sequence across multiple GPU ranks. Keeping
+# the default at 1 avoids adding that distributed dimension to the fast smoke;
+# callers can raise it when they specifically need to validate CP wiring.
 DEFAULT_CP_DEGREE = 1
 DEFAULT_TIMEOUT_SECONDS = 4 * 60 * 60
 
@@ -216,6 +244,10 @@ def _validate_args(args: argparse.Namespace) -> None:
                 "--max-streamed-examples must be >= --num-examples for production acceptance"
             )
     if args.nproc_per_node > 0 and args.cp_degree > 0:
+        # Each context-parallel group must contain an integer number of GPU
+        # ranks. The remaining groups are data-parallel replicas that process
+        # different training examples, so a non-divisible split would make the
+        # global batch calculation and TorchTitan mesh invalid.
         if args.nproc_per_node % args.cp_degree != 0:
             errors.append("--cp-degree must divide --nproc-per-node")
     if errors:
@@ -223,18 +255,26 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _data_parallel_degree(args: argparse.Namespace) -> int:
+    """Return how many independent example replicas remain after CP splitting."""
+
     return args.nproc_per_node // args.cp_degree
 
 
 def _global_batch_size(args: argparse.Namespace) -> int:
+    """Return examples per optimizer step across all data-parallel replicas."""
+
     return _data_parallel_degree(args) * args.local_batch_size
 
 
 def _synthetic_examples_per_bucket(args: argparse.Namespace) -> int:
+    """Produce exactly enough synthetic records for the requested optimizer steps."""
+
     return _global_batch_size(args) * args.max_steps
 
 
 def _common_launcher_args(args: argparse.Namespace) -> list[str]:
+    """Build the shared trainer arguments for both fresh and resume launches."""
+
     bucket = str(args.bucket)
     command = [
         "--out-dir",
@@ -245,6 +285,10 @@ def _common_launcher_args(args: argparse.Namespace) -> list[str]:
     if args.dataset_path is not None:
         command.extend(["--dataset-path", str(args.dataset_path)])
     if args.production_acceptance_smoke:
+        # Production acceptance keeps the real-data and provenance gates enabled
+        # while bounding the record count. That proves the production launcher
+        # can materialize SWE-Hero traces, record durable W&B identity, and still
+        # finish quickly enough to be used as a final smoke.
         command.extend(
             [
                 "--production-mode",
@@ -267,6 +311,10 @@ def _common_launcher_args(args: argparse.Namespace) -> list[str]:
             ]
         )
     else:
+        # Synthetic buckets bypass real data and tokenizer work. They are still
+        # useful for ML infrastructure because they generate shaped token arrays
+        # that flow through the model, loss, optimizer, checkpoint, export, and
+        # resume paths exactly like real examples would.
         command.extend(
             [
                 "--smoke-synthetic-buckets",
@@ -276,6 +324,11 @@ def _common_launcher_args(args: argparse.Namespace) -> list[str]:
         )
     command.extend(
         [
+            # max-length is the model input length cap, while buckets and
+            # bucket-cp tell the launcher which fixed sequence bucket and
+            # context-parallel degree to test. Using a single bucket makes this
+            # lifecycle smoke deterministic: one stage, one checkpoint step, one
+            # final export step.
             "--max-length",
             bucket,
             "--buckets",
@@ -284,16 +337,27 @@ def _common_launcher_args(args: argparse.Namespace) -> list[str]:
             f"{bucket}:{args.cp_degree}",
             "--bucket-curriculum",
             "single-bucket",
+            # TorchTitan's optimizer step sees the global batch across all
+            # data-parallel ranks. Keeping local-batch-size explicit makes the
+            # relationship between GPUs, CP degree, and examples per step
+            # visible in the command the smoke validates.
             "--nproc-per-node",
             str(args.nproc_per_node),
             "--global-batch-size",
             str(_global_batch_size(args)),
             "--local-batch-size",
             str(args.local_batch_size),
+            # One epoch plus an explicit max-steps cap makes the smoke's
+            # training schedule independent of dataset size. The goal is to
+            # execute lifecycle edges, not to improve the model.
             "--num-train-epochs",
             "1",
             "--max-steps",
             str(args.max_steps),
+            # A checkpoint every step is intentionally aggressive for the smoke:
+            # it proves the first-step checkpoint and final checkpoint paths
+            # immediately. Async checkpointing is disabled so validation sees
+            # fully written files before the launcher exits.
             "--checkpoint-interval",
             "1",
             "--checkpoint-async-mode",
@@ -305,6 +369,11 @@ def _common_launcher_args(args: argparse.Namespace) -> list[str]:
             "0",
             "--torchrun-log-rank-filter",
             "0",
+            # torch.compile and FP8 can be valuable in real training, but they
+            # add extra compiler/hardware-specific moving parts. The lifecycle
+            # smoke disables both so a failure is more likely to indicate a
+            # launcher/checkpoint/resume problem rather than a performance-path
+            # issue.
             "--no-compile",
             "--no-enable-fp8",
             "--min-free-disk-gb",
@@ -358,6 +427,14 @@ def _require_nonempty_file(path: Path, label: str) -> None:
 
 
 def _validate_dcp_checkpoint(out_dir: Path, step: int) -> dict[str, Any]:
+    """Validate a Torch Distributed Checkpoint directory for one step.
+
+    DCP checkpoints are resumable training snapshots: they include model weights
+    plus distributed training state such as optimizer state and metadata needed
+    by TorchTitan. That makes them different from the final Hugging Face export,
+    which is meant for inference/loading rather than continuing optimization.
+    """
+
     checkpoint = out_dir / "torchtitan" / "checkpoint" / f"step-{step}"
     _require(checkpoint.is_dir(), f"Missing DCP checkpoint directory: {checkpoint}")
     _require_nonempty_file(checkpoint / ".metadata", "DCP checkpoint metadata")
@@ -373,6 +450,8 @@ def _validate_dcp_checkpoint(out_dir: Path, step: int) -> dict[str, Any]:
 
 
 def _validate_final_export(out_dir: Path, step: int) -> dict[str, Any]:
+    """Validate the Hugging Face-style model-weight export for one step."""
+
     export = out_dir / "torchtitan" / "final_export" / f"step-{step}"
     _require(export.is_dir(), f"Missing final export directory: {export}")
     index = _read_json_object(
@@ -393,6 +472,14 @@ def _validate_final_export(out_dir: Path, step: int) -> dict[str, Any]:
 
 
 def _validate_stage_status(out_dir: Path, max_steps: int) -> dict[str, Any]:
+    """Validate the launcher's staged training status document.
+
+    A "stage" is one fixed bucket/parallelism segment of the overall training
+    plan. This smoke uses one stage, but the validator accepts
+    ``completed_before_resume`` so the second launch can prove resume behavior
+    without rerunning already completed optimizer steps.
+    """
+
     status_path = out_dir / "stage_status.json"
     status = _read_json_object(status_path, "stage status")
     stages = status.get("stages")
@@ -453,6 +540,8 @@ def _validate_stage_status(out_dir: Path, max_steps: int) -> dict[str, Any]:
 
 
 def _validate_production_acceptance_metadata(out_dir: Path) -> dict[str, Any]:
+    """Confirm the acceptance smoke used real production gates, not synthetic data."""
+
     run_spec = _read_json_object(out_dir / "run_spec.json", "run spec")
     args = run_spec.get("args")
     _require(isinstance(args, Mapping), "Run spec has no args object")
@@ -496,6 +585,10 @@ def _validate_production_acceptance_metadata(out_dir: Path) -> dict[str, Any]:
     )
     _require(included_count > 0, "Data manifest did not include real records")
 
+    # Durable W&B identity is part of the production gate because production
+    # experiments need auditable run identity across fresh launch and resume.
+    # Offline/disabled modes are fine for local tests, but they are not enough
+    # proof for this final acceptance path.
     wandb_identity = _read_json_object(
         out_dir / "wandb_identity.json",
         "W&B identity",
@@ -550,6 +643,8 @@ def validate_smoke_outputs(
     max_steps: int,
     require_production_acceptance: bool = False,
 ) -> dict[str, Any]:
+    """Validate the artifacts that prove the training lifecycle completed."""
+
     first_step_report = _read_json_object(
         out_dir / "first_step_checkpoint_validation.json",
         "first-step checkpoint validation report",
@@ -579,6 +674,9 @@ def validate_smoke_outputs(
         f"Final artifact validation does not include checkpoint step {max_steps}",
     )
 
+    # Validate both artifact families. The DCP checkpoint proves the run can
+    # resume training; the final export proves the trained weights can be loaded
+    # by downstream Hugging Face-compatible tooling.
     summary = {
         "first_step_validation": {
             "path": str(out_dir / "first_step_checkpoint_validation.json"),
@@ -599,6 +697,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     _validate_args(args)
 
+    # First run: start from scratch, force output overwrite, and require the
+    # launcher to produce all lifecycle artifacts.
     _run(fresh_launch_command(args), timeout_seconds=args.timeout_seconds)
     fresh_summary = validate_smoke_outputs(
         args.out_dir,
@@ -607,6 +707,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     print(json.dumps({"fresh_smoke_validation": fresh_summary}, indent=2), flush=True)
 
+    # Second run: use the same immutable run spec with --resume. A successful
+    # validation here proves the launcher can recognize completed stages and
+    # still verify final artifacts instead of accidentally starting a new run.
     _run(resume_launch_command(args), timeout_seconds=args.timeout_seconds)
     resume_summary = validate_smoke_outputs(
         args.out_dir,
