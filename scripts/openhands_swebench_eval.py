@@ -50,24 +50,53 @@ DEFAULT_OUTPUT_DIR = Path("eval-runs/openhands-swebench-verified-pass1")
 # OpenHands' SWE-bench script names its Docker execution backend "local".
 # The canonical wrapper invokes that backend inside the GPU pod.
 SWE_BENCH_DOCKER_ENVIRONMENT = "local"
+
+# These constants are eval contract, not incidental defaults. SWE-HERO reports
+# OpenHands with a 128k-token input window, but Qwen2.5-Coder-7B's released base
+# model has a native 32k-token position window. The 4x YaRN factor below tells
+# vLLM how to stretch rotary position embeddings so token positions above 32k
+# are interpreted intentionally instead of as unsupported extrapolation.
 PAPER_CONTEXT_LENGTH = 131_072
 QWEN_NATIVE_CONTEXT_LENGTH = 32_768
 PAPER_YARN_FACTOR = PAPER_CONTEXT_LENGTH / QWEN_NATIVE_CONTEXT_LENGTH
+
+# Sampling controls how much randomness the model uses while proposing patches.
+# The paper reports these values for the OpenHands eval, so they stay as explicit
+# constants instead of hidden parser literals. Temperature controls randomness,
+# top-p keeps only the smallest probability mass above 0.8, and top-k keeps only
+# the 20 most likely next tokens before sampling.
 PAPER_MAX_ITERATIONS = 100
 PAPER_TEMPERATURE = 0.7
 PAPER_TOP_P = 0.8
 PAPER_TOP_K = 20
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+# CodeActAgent expects the model to express repository edits through structured
+# tool calls. "required" means every assistant turn must choose a tool path,
+# which avoids free-form text that OpenHands cannot convert into an action.
 DEFAULT_TOOL_CHOICE = "required"
 DEFAULT_DOCKER_SMOKE_IMAGE = "hello-world:latest"
+
+# The canonical SWE-HERO pod layout starts eight independent one-GPU vLLM
+# replicas and routes OpenHands workers across them. Keeping tensor/pipeline
+# parallelism at 1 means each replica holds a complete 7B model on one GPU.
 DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
 DEFAULT_VLLM_PIPELINE_PARALLEL_SIZE = 1
 DEFAULT_VLLM_SERVER_COUNT = 8
 DEFAULT_VLLM_AGENT_TASKS_PER_SERVER = 24
 DEFAULT_VLLM_ROUTER_PORT = 8090
+
+# bfloat16 is a compact numeric format widely used for inference: it roughly
+# halves GPU memory versus float32 while keeping a wider exponent range than
+# float16. The memory utilization cap leaves headroom for KV cache and runtime
+# allocations instead of letting vLLM reserve the whole GPU.
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.90
 DEFAULT_VLLM_DTYPE = "bfloat16"
 DEFAULT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND = "mp"
+
+# SWE-Lego is a separate eval stack with a Qwen3 checkpoint and its own vendored
+# OpenHands/SWE-bench versions. Its long-context settings come from that stack's
+# published serving contract, not from the SWE-HERO paper's Qwen2.5 YaRN setup.
 SWE_LEGO_MAX_INPUT_TOKENS = 147_456
 SWE_LEGO_VLLM_MAX_MODEL_LEN = 163_840
 SWE_LEGO_MAX_OUTPUT_TOKENS = 16_384
@@ -96,6 +125,10 @@ DEFAULT_CONTEXT_MODE = CONTEXT_MODE_PAPER_YARN_128K
 EVAL_STACK_OPENHANDS = "openhands"
 EVAL_STACK_SWE_LEGO = "swe-lego"
 EVAL_STACKS = (EVAL_STACK_OPENHANDS, EVAL_STACK_SWE_LEGO)
+
+# RoPE is the position encoding used by Qwen. YaRN is the long-context scaling
+# scheme used here; vLLM expects this JSON shape when the served model needs a
+# runtime rope override.
 PAPER_YARN_ROPE_SCALING = {
     "rope_type": "yarn",
     "factor": PAPER_YARN_FACTOR,
@@ -154,6 +187,8 @@ class EvalCommands:
 
 @dataclass(frozen=True)
 class ContextModeSpec:
+    """A named contract between OpenHands' prompt budget and vLLM serving."""
+
     mode: str
     description: str
     max_input_tokens: int
@@ -165,11 +200,17 @@ class ContextModeSpec:
 
 
 def paper_yarn_rope_scaling_json() -> str:
+    """Return compact JSON because vLLM accepts rope scaling as one CLI token."""
+
     return json.dumps(PAPER_YARN_ROPE_SCALING, separators=(",", ":"))
 
 
 def context_mode_spec(mode: str) -> ContextModeSpec:
+    """Map a human-readable context mode to concrete model-serving settings."""
+
     if mode == CONTEXT_MODE_PAPER_YARN_128K:
+        # Main paper-aligned recipe: OpenHands may send up to 128k input tokens,
+        # so vLLM must serve the same 128k model length and apply YaRN scaling.
         return ContextModeSpec(
             mode=mode,
             description=(
@@ -182,6 +223,8 @@ def context_mode_spec(mode: str) -> ContextModeSpec:
             default_eval_note="swehero-qwen25-coder7b-pass1",
         )
     if mode == CONTEXT_MODE_BASE_NATIVE_32K:
+        # Control for the unmodified released base model. No YaRN override is
+        # allowed because this mode is meant to measure native-context behavior.
         return ContextModeSpec(
             mode=mode,
             description=(
@@ -196,6 +239,9 @@ def context_mode_spec(mode: str) -> ContextModeSpec:
             allow_long_max_model_len=False,
         )
     if mode == CONTEXT_MODE_BASE_PAPER_YARN_128K:
+        # Control for separating "trained checkpoint changed" from "larger
+        # context window changed". It uses the base model with the same 128k
+        # serving setup as the paper-aligned trained-model eval.
         return ContextModeSpec(
             mode=mode,
             description=(
@@ -208,6 +254,9 @@ def context_mode_spec(mode: str) -> ContextModeSpec:
             default_eval_note="base-paper-yarn-128k-pass1",
         )
     if mode == CONTEXT_MODE_SWE_LEGO_QWEN3_160K:
+        # SWE-Lego's Qwen3 checkpoint already carries its long-context rope
+        # settings in config.json. Passing an extra vLLM rope override would
+        # double-apply long-context scaling and invalidate the stack contract.
         return ContextModeSpec(
             mode=mode,
             description=(
@@ -237,6 +286,8 @@ def normalize_optional_value(value: str | None) -> str | None:
 def resolve_vllm_rope_scaling(
     requested: str | None, context_spec: ContextModeSpec
 ) -> str | None:
+    """Resolve the preset shorthand for vLLM's position-scaling argument."""
+
     requested = normalize_optional_value(requested)
     if requested is None:
         return None
@@ -246,6 +297,8 @@ def resolve_vllm_rope_scaling(
 
 
 def decoded_vllm_rope_scaling(value: str | None) -> object:
+    """Decode rope metadata for human-readable run metadata."""
+
     if not value:
         return None
     try:
@@ -255,8 +308,12 @@ def decoded_vllm_rope_scaling(value: str | None) -> object:
 
 
 def validate_context_args(args: argparse.Namespace) -> None:
+    """Reject context/serving combinations that would produce invalid baselines."""
+
     context_spec = context_mode_spec(args.context_mode)
     if args.context_mode == CONTEXT_MODE_BASE_NATIVE_32K:
+        # Native-context baseline means both OpenHands input and vLLM serving
+        # stay inside Qwen2.5-Coder's original 32k position window.
         if args.max_input_tokens > QWEN_NATIVE_CONTEXT_LENGTH:
             raise ValueError(
                 f"{CONTEXT_MODE_BASE_NATIVE_32K} requires "
@@ -285,6 +342,9 @@ def validate_context_args(args: argparse.Namespace) -> None:
         return
 
     if args.vllm_max_model_len < args.max_input_tokens:
+        # OpenHands may send max_input_tokens tokens in a prompt. vLLM must be
+        # configured to accept at least that many tokens, or the eval will fail
+        # only after expensive agent work has started.
         raise ValueError(
             "--vllm-max-model-len must be greater than or equal to --max-input-tokens"
         )
@@ -294,6 +354,9 @@ def validate_context_args(args: argparse.Namespace) -> None:
         and args.vllm_max_model_len > QWEN_NATIVE_CONTEXT_LENGTH
         and not args.vllm_rope_scaling
     ):
+        # Serving Qwen2.5 past 32k without YaRN is not a neutral choice. It
+        # changes how the model interprets positions and would make 128k results
+        # hard to compare with the paper-aligned recipe.
         raise ValueError(
             f"{args.context_mode} extends Qwen2.5-Coder beyond "
             f"{QWEN_NATIVE_CONTEXT_LENGTH} tokens and requires explicit "
@@ -381,18 +444,24 @@ def parse_eval_ids(value: str | None) -> list[str]:
 
 
 def effective_openhands_dir(args: argparse.Namespace) -> Path:
+    """Return the OpenHands checkout that belongs to the selected eval stack."""
+
     if args.eval_stack == EVAL_STACK_SWE_LEGO:
         return args.swe_lego_dir / "OpenHands-0.53.0"
     return args.openhands_dir
 
 
 def effective_swebench_dir(args: argparse.Namespace) -> Path | None:
+    """Return SWE-Lego's vendored grader checkout when that stack is selected."""
+
     if args.eval_stack == EVAL_STACK_SWE_LEGO:
         return args.swe_lego_dir / "SWE-bench-4.0.4"
     return None
 
 
 def expected_output_jsonl(args: argparse.Namespace) -> Path:
+    """Mirror OpenHands' output path so the wrapper can find generated patches."""
+
     litellm_model = litellm_model_name(args)
     eval_note = f"_N_{args.eval_note}" if args.eval_note else ""
     return (
@@ -430,7 +499,12 @@ def eval_paths(args: argparse.Namespace) -> EvalPaths:
 
 
 def build_openhands_config(args: argparse.Namespace) -> str:
+    """Render the OpenHands TOML config for the selected model/eval contract."""
+
     litellm_model = litellm_model_name(args)
+    # OpenHands talks through LiteLLM, which names OpenAI-compatible local
+    # servers as "openai/<served-model-name>". The pod launcher starts vLLM with
+    # the same served name so config and server agree.
     config_lines = [
         "# Generated by scripts/openhands_swebench_eval.py.",
         "# Contains only eval/runtime config; generated files live under eval-runs/.",
@@ -445,11 +519,17 @@ def build_openhands_config(args: argparse.Namespace) -> str:
         f"drop_params = {_toml_bool(args.drop_params)}",
         f"disable_vision = {_toml_bool(args.disable_vision)}",
     ]
+    # Sampling parameters are part of the eval recipe. Omitting top-p/top-k for
+    # SWE-Lego preserves its deterministic upstream Qwen3 contract instead of
+    # imposing SWE-HERO sampling settings on a different stack.
     if args.top_p is not None:
         config_lines.append(f"top_p = {args.top_p}")
     if args.top_k is not None:
         config_lines.append(f"top_k = {args.top_k}")
     if not args.omit_native_tool_calling_config:
+        # Native tool calling asks the model server to return structured
+        # message.tool_calls. OpenHands can turn those directly into CodeAct
+        # actions; plain text responses are harder for the agent loop to use.
         config_lines.append(
             f"native_tool_calling = {_toml_bool(args.native_tool_calling)}"
         )
@@ -460,6 +540,8 @@ def build_openhands_config(args: argparse.Namespace) -> str:
     if args.max_output_tokens is not None:
         config_lines.append(f"max_output_tokens = {args.max_output_tokens}")
     if args.native_tool_calling and not args.omit_native_tool_calling_config:
+        # The paper-aligned Qwen2.5 smoke path uses required tool choice because
+        # auto allowed free-form assistant messages that did not execute edits.
         config_lines.append(
             f"completion_kwargs = {{ tool_choice = {_toml_string(args.tool_choice)} }}"
         )
@@ -468,6 +550,9 @@ def build_openhands_config(args: argparse.Namespace) -> str:
         [
             "",
             f"[{args.agent_config_name}]",
+            # These optional OpenHands features add extra tools or prompt
+            # behaviors. They are disabled here so pass@1 measures the same
+            # CodeAct-style coding loop across runs.
             "enable_jupyter = false",
             "enable_browsing = false",
             "enable_llm_editor = false",
@@ -475,6 +560,9 @@ def build_openhands_config(args: argparse.Namespace) -> str:
             "enable_prompt_extensions = false",
             "",
             "[condenser]",
+            # A condenser summarizes old conversation history to fit long runs
+            # into smaller context windows. We disable it because these evals
+            # intentionally allocate the long context budget up front.
             'type = "noop"',
             "",
         ]
@@ -483,7 +571,11 @@ def build_openhands_config(args: argparse.Namespace) -> str:
 
 
 def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
+    """Build the shell commands recorded in metadata and optional dry runs."""
+
     if args.eval_stack == EVAL_STACK_SWE_LEGO:
+        # SWE-Lego must be cloned as a whole because its OpenHands and SWE-bench
+        # subdirectories are part of the published eval stack.
         prepare_openhands = [
             "git",
             "clone",
@@ -491,6 +583,8 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
             str(args.swe_lego_dir),
         ]
     else:
+        # The default OpenHands path uses an explicit ref so paper reproduction
+        # metadata records exactly which harness version produced the patches.
         prepare_openhands = [
             "git",
             "clone",
@@ -502,6 +596,8 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
             str(args.openhands_dir),
         ]
 
+    # run_infer performs the agent rollout: for each SWE-bench task, OpenHands
+    # gives the model a repository issue and records one generated patch.
     run_infer = [
         "poetry",
         "run",
@@ -537,6 +633,8 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
 
     convert_output = None
     if args.eval_stack == EVAL_STACK_SWE_LEGO:
+        # SWE-Lego's vendored OpenHands emits the usual OpenHands JSONL, then
+        # its vendored SWE-bench grader expects a prediction JSONL conversion.
         convert_output = [
             "poetry",
             "run",
@@ -544,6 +642,9 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
             "evaluation/benchmarks/swe_bench/scripts/eval/convert_oh_output_to_swe_json.py",
             str(paths.expected_output_jsonl),
         ]
+        # This path runs SWE-Lego's pinned SWE-bench package directly rather
+        # than OpenHands' helper script so grader timeout/cache settings match
+        # the stack's published contract.
         run_eval = [
             "python",
             "-m",
@@ -566,6 +667,9 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
             str(args.swebench_timeout),
         ]
     else:
+        # Upstream OpenHands V0 ships a convenience script around the dockerized
+        # SWE-bench grader. We keep using it for the current OpenHands stack to
+        # avoid inventing a second grading path.
         run_eval = [
             "bash",
             "evaluation/benchmarks/swe_bench/scripts/eval_infer.sh",
@@ -577,6 +681,8 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
         ]
 
     served_model_name = args.served_model_name or args.model_id
+    # This command is a record of the model server contract. The pod launcher
+    # executes the same shape with tmux supervision and one or more GPU workers.
     serve_vllm = [
         "vllm",
         "serve",
@@ -593,16 +699,22 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
         str(args.vllm_max_model_len),
     ]
     if args.vllm_rope_scaling:
+        # Long-context Qwen2.5 modes need YaRN rope scaling to make token
+        # positions above 32k meaningful to the model.
         serve_vllm.extend(["--rope-scaling", args.vllm_rope_scaling])
     if args.vllm_tensor_parallel_size:
+        # Tensor parallelism splits each layer's matrix math across GPUs.
         serve_vllm.extend(
             ["--tensor-parallel-size", str(args.vllm_tensor_parallel_size)]
         )
     if args.vllm_pipeline_parallel_size:
+        # Pipeline parallelism splits different layer groups across GPUs.
         serve_vllm.extend(
             ["--pipeline-parallel-size", str(args.vllm_pipeline_parallel_size)]
         )
     if args.vllm_max_num_seqs is not None:
+        # vLLM batches multiple prompt sequences together. This cap trades
+        # throughput against KV-cache memory pressure.
         serve_vllm.extend(["--max-num-seqs", str(args.vllm_max_num_seqs)])
     serve_vllm.extend(
         ["--gpu-memory-utilization", str(args.vllm_gpu_memory_utilization)]
@@ -610,10 +722,14 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
     if args.vllm_dtype:
         serve_vllm.extend(["--dtype", args.vllm_dtype])
     if args.native_tool_calling and args.vllm_enable_auto_tool_choice:
+        # vLLM must parse model text back into OpenAI tool-call JSON for
+        # OpenHands' native tool-calling path.
         serve_vllm.append("--enable-auto-tool-choice")
         if args.vllm_tool_call_parser:
             serve_vllm.extend(["--tool-call-parser", args.vllm_tool_call_parser])
     if args.vllm_distributed_executor_backend:
+        # "mp" launches worker processes inside this pod, which is sufficient
+        # for single-pod tensor/pipeline parallel inference.
         serve_vllm.extend(
             [
                 "--distributed-executor-backend",
@@ -621,6 +737,8 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
             ]
         )
     if args.vllm_enforce_eager:
+        # Eager mode avoids some graph-capture complexity during prototype evals
+        # and has been the stable path for the current pod setup.
         serve_vllm.append("--enforce-eager")
 
     return EvalCommands(
@@ -633,11 +751,16 @@ def build_commands(args: argparse.Namespace, paths: EvalPaths) -> EvalCommands:
 
 
 def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
+    """Write reproducibility artifacts before any expensive eval work starts."""
+
     paths = eval_paths(args)
     commands = build_commands(args, paths)
     paths.run_dir.mkdir(parents=True, exist_ok=True)
     paths.config_path.write_text(build_openhands_config(args) + "\n")
 
+    # The real API key has to appear in config.toml because OpenHands reads that
+    # file directly. Metadata redacts non-default keys so command records can be
+    # shared with reviewers without leaking credentials.
     redacted_commands = {
         name: [
             "<redacted>"
@@ -660,6 +783,9 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             else "SWE-HERO paper-aligned OpenHands pass@1 evaluation scaffold"
         ),
         "eval_stack": args.eval_stack,
+        # These are the ML/eval assumptions a reviewer needs before comparing
+        # numbers: benchmark split, pass@1 shape, sampling, context size, and
+        # number of agent/environment interaction rounds.
         "paper_eval_settings": {
             "benchmark": "SWE-bench Verified",
             "metric": "resolved rate / pass@1",
@@ -704,6 +830,9 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "base_url": args.base_url,
             "api_key_source": args.api_key_source,
             "custom_llm_provider": args.custom_llm_provider,
+            # Native tool calling changes the shape of model output expected by
+            # OpenHands. Recording it prevents treating free-text and structured
+            # tool-call evals as interchangeable.
             "native_tool_calling": (
                 None
                 if args.omit_native_tool_calling_config
@@ -723,6 +852,8 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "paper_context_tokens": PAPER_CONTEXT_LENGTH,
             "max_input_tokens": args.max_input_tokens,
             "vllm_max_model_len": args.vllm_max_model_len,
+            # Store decoded JSON when possible so the metadata explains the
+            # long-context scaling contract instead of burying it in a CLI blob.
             "vllm_rope_scaling": decoded_vllm_rope_scaling(args.vllm_rope_scaling),
         },
         "dataset": {
@@ -736,6 +867,9 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
             "docker_smoke_image": args.docker_smoke_image,
             "skip_docker_run_check": args.skip_docker_run_check,
             "skip_docker_buildx_check": args.skip_docker_buildx_check,
+            # Serving topology affects both throughput and comparability. A
+            # single multi-GPU server and many one-GPU replicas can expose the
+            # same model but have very different batching and queue behavior.
             "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
             "vllm_pipeline_parallel_size": args.vllm_pipeline_parallel_size,
             "vllm_server_count": args.vllm_server_count,
@@ -765,6 +899,8 @@ def write_scaffold(args: argparse.Namespace) -> tuple[EvalPaths, EvalCommands]:
     }
     paths.metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
+    # commands.sh is a reproducibility record, not the preferred entry point.
+    # The pod launcher adds environment setup, tmux supervision, and git guards.
     commands_text = "\n".join(
         [
             "#!/usr/bin/env bash",
@@ -824,6 +960,8 @@ def run_command(
 def write_swebench_filter_config(
     openhands_dir: Path, eval_ids: list[str]
 ) -> tuple[Path, str | None]:
+    """Write OpenHands' legacy selected_ids filter and return restore state."""
+
     config_path = (
         openhands_dir / "evaluation" / "benchmarks" / "swe_bench" / "config.toml"
     )
@@ -846,7 +984,11 @@ def git_output(args: list[str], *, cwd: Path) -> str:
 
 
 def ensure_openhands_checkout(args: argparse.Namespace) -> None:
+    """Prepare the eval harness checkout without mutating dirty local trees."""
+
     if args.eval_stack == EVAL_STACK_SWE_LEGO:
+        # The SWE-Lego repository is the unit of reproducibility for that stack:
+        # it contains the expected OpenHands and SWE-bench revisions together.
         if args.swe_lego_dir.exists():
             if not (args.swe_lego_dir / ".git").exists():
                 raise RuntimeError(
@@ -881,6 +1023,8 @@ def ensure_openhands_checkout(args: argparse.Namespace) -> None:
         return
 
     if args.openhands_dir.exists():
+        # Local modifications to the harness would make eval results difficult
+        # to compare. Refuse instead of silently checking out another ref.
         if not (args.openhands_dir / ".git").exists():
             raise RuntimeError(f"{args.openhands_dir} exists but is not a git checkout")
         status = git_output(["status", "--porcelain"], cwd=args.openhands_dir)
@@ -903,6 +1047,8 @@ def ensure_openhands_checkout(args: argparse.Namespace) -> None:
 
 
 def check_runtime(args: argparse.Namespace) -> list[RuntimeCheck]:
+    """Run cheap preflights before starting expensive agent rollouts."""
+
     checks: list[RuntimeCheck] = []
     checks.append(
         RuntimeCheck(
@@ -1005,6 +1151,8 @@ def check_docker_runtime(args: argparse.Namespace) -> list[RuntimeCheck]:
 
 
 def check_llm_endpoint(args: argparse.Namespace) -> RuntimeCheck:
+    """Verify the OpenAI-compatible model endpoint is reachable."""
+
     url = args.base_url.rstrip("/") + "/models"
     request = urllib.request.Request(
         url,
@@ -1023,6 +1171,8 @@ def check_llm_endpoint(args: argparse.Namespace) -> RuntimeCheck:
 
 
 def tool_call_preflight_payload(args: argparse.Namespace) -> dict[str, object]:
+    """Build a minimal request that proves the model server returns tool calls."""
+
     return {
         "model": args.served_model_name or args.model_id,
         "messages": [
@@ -1046,6 +1196,8 @@ def tool_call_preflight_payload(args: argparse.Namespace) -> dict[str, object]:
 
 
 def validate_tool_call_response(response: dict[str, object]) -> RuntimeCheck:
+    """Check that a chat completion used OpenAI's structured tool-call field."""
+
     choices = response.get("choices")
     if not isinstance(choices, list) or not choices:
         return RuntimeCheck("tool_call_preflight", False, "response has no choices")
@@ -1090,6 +1242,8 @@ def validate_tool_call_response(response: dict[str, object]) -> RuntimeCheck:
 
 
 def check_tool_call_endpoint(args: argparse.Namespace) -> RuntimeCheck:
+    """Call /chat/completions and fail fast on non-structured model output."""
+
     url = args.base_url.rstrip("/") + "/chat/completions"
     payload = json.dumps(tool_call_preflight_payload(args)).encode("utf-8")
     request = urllib.request.Request(
@@ -1145,6 +1299,8 @@ def assert_preflight_ok(checks: list[RuntimeCheck]) -> None:
 
 
 def summarize_report(report_path: Path) -> dict[str, Any]:
+    """Compute pass@1 from SWE-bench report fields across harness versions."""
+
     report = json.loads(report_path.read_text())
     resolved_ids = report.get("resolved_ids") or []
     unresolved_ids = report.get("unresolved_ids") or []
@@ -1155,6 +1311,9 @@ def summarize_report(report_path: Path) -> dict[str, Any]:
     total = report.get("submitted_instances", report.get("total_instances"))
     if total is None:
         total = len(set(resolved_ids) | set(unresolved_ids) | set(error_ids))
+    # pass@1 is the fraction of submitted tasks solved by one generated patch.
+    # It is the metric used by SWE-bench/OpenHands leaderboards for a single
+    # rollout per task.
     pass_at_1 = None if not total else resolved / total
     return {
         "resolved": resolved,
@@ -1165,6 +1324,8 @@ def summarize_report(report_path: Path) -> dict[str, Any]:
 
 
 def summarize_agent_tool_use(output_jsonl: Path) -> dict[str, Any]:
+    """Summarize whether OpenHands actually used tools during the rollout."""
+
     instances = 0
     agent_messages = 0
     agent_tool_actions = 0
@@ -1190,6 +1351,9 @@ def summarize_agent_tool_use(output_jsonl: Path) -> dict[str, Any]:
                 if action == "message":
                     agent_messages += 1
                 continue
+            # Non-message agent actions are tool uses such as shell execution or
+            # file edits. Counting them catches model/server settings that make
+            # the agent produce text but never act on the repository.
             action_name = str(action)
             agent_tool_actions += 1
             tool_action_counts[action_name] = tool_action_counts.get(action_name, 0) + 1
@@ -1207,6 +1371,8 @@ def summarize_agent_tool_use(output_jsonl: Path) -> dict[str, Any]:
 def run_eval(
     args: argparse.Namespace, paths: EvalPaths, commands: EvalCommands
 ) -> None:
+    """Execute OpenHands inference and optional SWE-bench grading."""
+
     if not args.skip_preflight:
         checks = check_runtime(args)
         for check in checks:
@@ -1217,6 +1383,9 @@ def run_eval(
     ensure_openhands_checkout(args)
     openhands_dir = effective_openhands_dir(args)
     env = os.environ.copy()
+    # These environment variables are consumed by OpenHands' legacy SWE-bench
+    # harness. Keeping them explicit here makes it clear which optional agent
+    # capabilities are part of the measured eval contract.
     env["RUNTIME"] = args.runtime
     env["RUN_WITH_BROWSING"] = "false"
     env["USE_HINT_TEXT"] = str(args.use_hint_text).lower()
@@ -1228,6 +1397,8 @@ def run_eval(
     env["ITERATIVE_EVAL_MODE"] = str(args.iterative_eval_mode).lower()
     env["ENABLE_LLM_EDITOR"] = str(args.enable_llm_editor).lower()
     existing_pythonpath = env.get("PYTHONPATH")
+    # The vendored harness imports modules relative to its checkout. Prepending
+    # it keeps the selected eval stack ahead of any globally installed package.
     env["PYTHONPATH"] = (
         str(openhands_dir)
         if not existing_pythonpath
@@ -1237,6 +1408,8 @@ def run_eval(
     eval_ids = parse_eval_ids(args.eval_ids)
     filter_state: tuple[Path, str | None] | None = None
     if eval_ids:
+        # Some older OpenHands paths ignore --eval-ids but still read a local
+        # selected_ids config file. Writing both keeps smoke runs narrow.
         filter_state = write_swebench_filter_config(openhands_dir, eval_ids)
     try:
         run_command(commands.run_infer, cwd=openhands_dir, env=env)
@@ -1254,6 +1427,8 @@ def run_eval(
         )
         if not args.skip_swebench_eval:
             if commands.convert_output is not None:
+                # SWE-Lego separates "agent output" from "grader predictions".
+                # Convert after inference so the grader sees its expected JSONL.
                 run_command(commands.convert_output, cwd=openhands_dir, env=env)
             if args.eval_stack == EVAL_STACK_SWE_LEGO:
                 swebench_dir = effective_swebench_dir(args)
@@ -1272,6 +1447,9 @@ def run_eval(
                 )
                 report_candidates = sorted(paths.swebench_report_dir.glob("*.json"))
                 if report_candidates:
+                    # The vendored SWE-bench grader chooses its own timestamped
+                    # report name. Move the newest report to the stable path
+                    # recorded in metadata so downstream tooling can find it.
                     report_candidates[-1].replace(paths.expected_report_json)
             else:
                 run_command(commands.run_eval, cwd=openhands_dir, env=env)
@@ -1285,6 +1463,8 @@ def run_eval(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse preset-driven eval settings and normalize derived ML knobs."""
+
     argv = _argv_with_default_preset(argv)
     parser = EvalArgumentParser(
         description="Run/prepare OpenHands SWE-bench Verified pass@1 eval for Qwen2.5-Coder-7B.",
@@ -1622,6 +1802,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-swebench-eval", action="store_true", default=False)
     args = parser.parse_args(argv)
 
+    # Only LLM_API_KEY controls model access. Avoid reading provider-specific
+    # variables such as OPENAI_API_KEY because this script usually targets a
+    # local vLLM server, not the public OpenAI API.
     args.api_key = os.environ.get("LLM_API_KEY") or DEFAULT_API_KEY
     if os.environ.get("LLM_API_KEY"):
         args.api_key_source = "LLM_API_KEY"
@@ -1633,8 +1816,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.litellm_model = None
     context_spec = context_mode_spec(args.context_mode)
     if args.max_input_tokens is None:
+        # OpenHands' max_input_tokens is the prompt budget passed to the agent.
+        # It must stay aligned with the model-serving context mode.
         args.max_input_tokens = context_spec.max_input_tokens
     if args.vllm_max_model_len is None:
+        # vLLM's max model length is the server-side context capacity. It can be
+        # larger than the OpenHands input budget when the stack reserves room for
+        # long model outputs, as SWE-Lego does.
         args.vllm_max_model_len = context_spec.vllm_max_model_len
     args.vllm_rope_scaling = resolve_vllm_rope_scaling(
         args.vllm_rope_scaling, context_spec
@@ -1668,6 +1856,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--base-url is required; use scripts/run_midtraining_pod.py eval "
             "to launch the eval on the GPU pod."
         )
+    # Resolve paths after parsing so metadata and generated command records are
+    # reproducible regardless of the caller's working directory.
     args.output_dir = args.output_dir.resolve()
     args.openhands_dir = args.openhands_dir.resolve()
     args.swe_lego_dir = args.swe_lego_dir.resolve()
