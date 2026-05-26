@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Small OpenAI-compatible request router for pod-local vLLM replicas."""
+"""Small OpenAI-compatible request router for pod-local vLLM replicas.
+
+The current Qwen2.5 OpenHands eval presets start one vLLM server per GPU and
+then expose this router as the single OpenAI-compatible base URL that OpenHands
+talks to. Each OpenHands worker drives one SWE-bench task attempt, so the router
+is part of the eval-serving contract: it spreads task requests across replicas
+and prevents any one vLLM process from receiving more concurrent generations
+than the preset says it can handle.
+
+This file does not interpret model outputs or alter prompts. It only forwards
+HTTP requests and preserves vLLM's OpenAI-style responses. That boundary matters
+because eval quality should be attributed to the model/OpenHands stack, not to
+hidden response transformations in the router.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +41,8 @@ HOP_BY_HOP_HEADERS = {
 
 @dataclass
 class Backend:
+    """One pod-local vLLM server plus its concurrency accounting."""
+
     name: str
     base_url: str
     semaphore: threading.BoundedSemaphore
@@ -36,6 +51,8 @@ class Backend:
 
 @dataclass
 class RouterState:
+    """Mutable router state shared by all HTTP handler threads."""
+
     backends: list[Backend]
     api_key: str
     request_timeout: float
@@ -44,6 +61,14 @@ class RouterState:
     next_backend: int = 0
 
     def acquire_backend(self) -> Backend | None:
+        """Reserve capacity on a backend, preferring round-robin distribution.
+
+        vLLM replicas are expensive model-serving processes, and each concurrent
+        request can hold GPU memory for an entire OpenHands action. The bounded
+        semaphore enforces the preset's per-replica worker budget instead of
+        letting a burst of tasks overload one GPU.
+        """
+
         deadline = time.monotonic() + self.acquire_timeout
         while True:
             with self.lock:
@@ -53,6 +78,10 @@ class RouterState:
                     backend = self.backends[index]
                     if backend.semaphore.acquire(blocking=False):
                         backend.in_flight += 1
+                        # Advance even on success so sequential requests rotate
+                        # across GPUs. Busy replicas are skipped above, so
+                        # concurrent bursts spill to the next backend with
+                        # available model-serving capacity.
                         self.next_backend = (index + 1) % len(self.backends)
                         return backend
             if time.monotonic() >= deadline:
@@ -60,6 +89,8 @@ class RouterState:
             time.sleep(0.05)
 
     def release_backend(self, backend: Backend) -> None:
+        """Release one request slot after the backend response is handled."""
+
         with self.lock:
             backend.in_flight -= 1
             backend.semaphore.release()
@@ -74,6 +105,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True})
             return
         if self.path.startswith("/v1/models"):
+            # Model metadata should be the same for every replica because the
+            # launcher starts homogeneous vLLM servers. Querying the first
+            # backend is enough for readiness checks and avoids consuming a
+            # generation slot on every model server.
             self._forward_to_backend(self.state.backends[0], body=None)
             return
         self._send_json(404, {"error": {"message": f"unsupported path: {self.path}"}})
@@ -88,6 +123,10 @@ class RouterHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         backend = self.state.acquire_backend()
         if backend is None:
+            # OpenHands treats this as an infrastructure failure for the eval
+            # request. Returning 503 is more honest than queueing forever: the
+            # configured worker count is asking for more concurrent generations
+            # than the router can place on vLLM replicas.
             self._send_json(
                 503,
                 {
@@ -104,6 +143,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.state.release_backend(backend)
 
     def _forward_to_backend(self, backend: Backend, body: bytes | None) -> None:
+        """Forward one OpenAI-compatible request to a selected vLLM backend."""
+
         url = backend.base_url + self.path.removeprefix("/v1")
         headers = {
             key: value
@@ -112,6 +153,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             and key.lower() not in {"host", "content-length"}
         }
         if self.state.api_key and "Authorization" not in headers:
+            # The pod-local vLLM endpoint uses an OpenAI-compatible API shape.
+            # The key is a placeholder compatibility value, not a network
+            # secret, but forwarding it keeps OpenAI client libraries satisfied.
             headers["Authorization"] = f"Bearer {self.state.api_key}"
         request = urllib.request.Request(
             url,
@@ -126,10 +170,15 @@ class RouterHandler(BaseHTTPRequestHandler):
                 response_body = response.read()
                 self.send_response(response.status)
                 self._copy_response_headers(response.headers.items())
+                # This header is for debugging eval infrastructure. It does not
+                # change the OpenAI response body that OpenHands parses.
                 self.send_header("X-VLLM-Backend", backend.name)
                 self.end_headers()
                 self.wfile.write(response_body)
         except urllib.error.HTTPError as exc:
+            # Preserve backend HTTP errors and bodies. A model-serving error
+            # should remain visible to the caller instead of being rewritten as
+            # a generic router failure.
             response_body = exc.read()
             self.send_response(exc.code)
             self._copy_response_headers(exc.headers.items())
@@ -137,6 +186,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response_body)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # Network/timeouts here mean the selected vLLM replica was
+            # unreachable or stalled. Surface that as a bad gateway so eval logs
+            # distinguish backend health from model-generated failures.
             self._send_json(
                 502,
                 {
@@ -148,10 +200,14 @@ class RouterHandler(BaseHTTPRequestHandler):
             )
 
     def _copy_response_headers(self, headers: object) -> None:
+        """Copy end-to-end response headers while dropping proxy-only headers."""
+
         for key, value in headers:
             if key.lower() in HOP_BY_HOP_HEADERS:
                 continue
             if key.lower() in {"content-length", "content-encoding"}:
+                # The router may alter framing by reading and rewriting the
+                # body, so let BaseHTTPRequestHandler compute response framing.
                 continue
             self.send_header(key, value)
 
@@ -188,6 +244,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_state(args: argparse.Namespace) -> RouterState:
+    """Create router state from CLI args without starting the HTTP server."""
+
     backends = [
         Backend(
             name=f"vllm-{index}",
@@ -208,6 +266,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     RouterHandler.state = build_state(args)
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), RouterHandler)
+    # The pod launcher waits for this process by polling /v1/models. This log
+    # line records the serving topology used for the eval run.
     print(
         "router_ready "
         + json.dumps(
