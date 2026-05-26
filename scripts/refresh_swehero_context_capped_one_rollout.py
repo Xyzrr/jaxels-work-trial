@@ -40,6 +40,10 @@ DEFAULT_TOKENIZER_PATH = (
     / "hf"
     / "Qwen2.5-Coder-7B-Instruct-tokenizer-only"
 )
+
+# This string is part of the artifact contract. The context filter must use the
+# exact same "raw trace -> Qwen ChatML text -> token IDs" transformation as the
+# trainer, otherwise a row could appear to fit here but overflow during training.
 TRACE_SERIALIZER = (
     "Qwen2.5 ChatML over OpenHands messages; same segments as "
     "scripts.qwen_swehero_train.encode_swehero_example"
@@ -48,6 +52,14 @@ TRACE_SERIALIZER = (
 
 @dataclass(frozen=True)
 class ContextEvaluation:
+    """Token-length result for one serialized SWE rollout.
+
+    `token_count` is the full sequence including optional BOS/EOS special
+    tokens. `shifted_input_length` is what the causal-LM trainer actually feeds
+    as input after next-token shifting, so that is the value compared with the
+    model context window.
+    """
+
     token_count: int
     shifted_input_length: int
     max_shifted_context: int
@@ -56,6 +68,8 @@ class ContextEvaluation:
 
 @dataclass(frozen=True)
 class ContextSelectedRow:
+    """A selected rollout plus the context-fit metadata used for refresh."""
+
     row: dict[str, Any]
     selected: prep.SelectedRow
     context: ContextEvaluation
@@ -79,7 +93,13 @@ class CurrentArtifactStatus:
 
 
 class QwenTokenizerAdapter:
-    """Small adapter matching TorchTitan's HuggingFaceTokenizer surface."""
+    """Small adapter matching TorchTitan's HuggingFaceTokenizer surface.
+
+    The production trainer uses TorchTitan's tokenizer wrapper, but this refresh
+    script should run before the full training environment is needed. Loading the
+    same tokenizer.json/tokenizer_config.json through `tokenizers` is enough to
+    reproduce Qwen token IDs and special-token IDs for context-length checks.
+    """
 
     def __init__(self, tokenizer_path: Path) -> None:
         from tokenizers import Tokenizer
@@ -115,16 +135,28 @@ def evaluate_qwen_context(
     max_shifted_context: int,
     include_model_patch: bool = False,
 ) -> ContextEvaluation:
-    """Return the exact shifted input length used by SWE-Hero training."""
+    """Return the exact shifted input length used by SWE-Hero training.
+
+    Causal language models train by predicting the next token from the previous
+    tokens. The trainer therefore uses `input_ids = token_ids[:-1]` and
+    `labels = token_ids[1:]`. A row fits the training context only if that
+    shifted input length is within the configured cap.
+    """
 
     token_count = 0
     bos_id = getattr(tokenizer, "bos_id", getattr(tokenizer, "bos_token_id", None))
     if bos_id is not None:
+        # BOS is not visible in the raw OpenHands trace, but the tokenizer/model
+        # may add it as a required start-of-sequence marker. It consumes one
+        # context slot and must be counted.
         token_count += 1
 
     segments = train.qwen_openhands_segments(
         row, include_model_patch=include_model_patch
     )
+    # The serializer marks which segments are trainable for loss masking, but
+    # context fit depends on *all* segments: prompts, assistant actions, and tool
+    # observations all occupy attention/context positions.
     tokenized_segments = train._tokenize_texts(
         tokenizer, (text for text, _is_trainable in segments)
     )
@@ -137,6 +169,8 @@ def evaluate_qwen_context(
 
     eos_id = getattr(tokenizer, "eos_id", getattr(tokenizer, "eos_token_id", None))
     if eos_id is not None:
+        # EOS is counted because training may append it to teach the model where
+        # an assistant turn or sample ends.
         token_count += 1
 
     shifted_input_length = max(0, token_count - 1)
@@ -151,6 +185,14 @@ def evaluate_qwen_context(
 def select_better_context_row(
     current: ContextSelectedRow | None, candidate: ContextSelectedRow
 ) -> ContextSelectedRow:
+    """Keep the same deterministic rollout ranking used by the raw builder.
+
+    The context refresh should only add the "must fit in Qwen context" constraint.
+    It should not invent a new ML preference among rollouts, because that would
+    make the refreshed artifact a different experiment rather than a capped
+    version of the public one-rollout approximation.
+    """
+
     if current is None:
         return candidate
     if candidate.selected.selection_rank < current.selected.selection_rank:
@@ -198,6 +240,13 @@ def load_current_selected_rows(
     batch_size: int,
     include_model_patch: bool,
 ) -> tuple[Any, dict[str, ContextSelectedRow]]:
+    """Load the existing one-rollout artifact and annotate each row's context fit.
+
+    The selection manifest is treated as the source of truth for why each row was
+    selected. The Parquet row supplies the actual trace content that must be
+    serialized and token-counted for the Qwen training context.
+    """
+
     manifest_path = dataset_path / "selection_manifest.jsonl"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Missing selection manifest: {manifest_path}")
@@ -252,6 +301,14 @@ def find_fit_replacements(
     batch_size: int,
     include_model_patch: bool,
 ) -> tuple[int, dict[str, ContextSelectedRow], dict[str, int], dict[str, int]]:
+    """Find same-task replacement rollouts that pass filters and fit context.
+
+    We scan the pinned source revision, not the already-selected artifact,
+    because over-context tasks need access to their alternate public rollouts.
+    A replacement must pass the same public-column filters as the raw builder and
+    then fit the Qwen/OpenHands shifted context cap.
+    """
+
     replacements: dict[str, ContextSelectedRow] = {}
     accepted_candidates_by_instance = dict.fromkeys(instance_ids, 0)
     fit_candidates_by_instance = dict.fromkeys(instance_ids, 0)
@@ -282,6 +339,9 @@ def find_fit_replacements(
                 continue
             accepted_candidates_by_instance[instance_id] += 1
 
+            # Filtering by context comes after the paper-approximation filters.
+            # This preserves the original "quality" filter semantics and only
+            # removes candidates the model cannot physically train on at 128k.
             context = evaluate_qwen_context(
                 tokenizer,
                 row,
@@ -301,6 +361,9 @@ def find_fit_replacements(
                 evaluation=evaluation,
             )
             candidate = ContextSelectedRow(row=row, selected=selected, context=context)
+            # If multiple same-task rollouts fit, choose the same deterministic
+            # rank the raw artifact used: fewer editor errors, fewer assistant
+            # turns, then earlier source row.
             replacements[instance_id] = select_better_context_row(
                 replacements.get(instance_id), candidate
             )
@@ -345,6 +408,13 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def context_filter_contract(args: argparse.Namespace) -> dict[str, Any]:
+    """Return the reproducibility contract for context-capping decisions.
+
+    The hashes matter because tokenizer changes can move a row across the
+    context boundary without changing the raw SWE trace. Recording both tokenizer
+    files makes stale artifacts detectable before training.
+    """
+
     return {
         "max_shifted_context": args.max_shifted_context,
         "max_token_count": args.max_shifted_context + 1,
@@ -379,6 +449,8 @@ def current_artifact_status(
     *,
     context_filter: Mapping[str, Any],
 ) -> CurrentArtifactStatus:
+    """Check whether an existing artifact already matches this refresh contract."""
+
     reasons: list[str] = []
     metadata_path = dataset_path / "metadata.json"
     report_path = dataset_path / "context_filter_report.json"
@@ -429,6 +501,9 @@ def current_artifact_status(
     else:
         for key, expected_value in context_filter.items():
             if stored_context.get(key) != expected_value:
+                # A context-filter mismatch means the artifact may have been
+                # capped with a different tokenizer, context length, or trace
+                # serializer. Any of those changes can alter which rows fit.
                 reasons.append(f"context_filter.{key} changed")
 
     counts = metadata.get("counts")
@@ -458,6 +533,9 @@ def current_artifact_status(
     if isinstance(max_final, bool) or not isinstance(max_final, int):
         reasons.append("missing final context maximum")
     elif max_final > args.max_shifted_context:
+        # The strongest cheap stale-artifact check is the recomputed maximum
+        # shifted length recorded by the previous refresh. If it exceeds the
+        # requested cap, the artifact is unsafe for this training context.
         reasons.append("final context maximum exceeds requested cap")
 
     replaced = report.get("replaced")
@@ -550,6 +628,8 @@ def write_dataset(
     report: dict[str, Any],
     overwrite: bool,
 ) -> None:
+    """Write the refreshed Hugging Face-style Parquet dataset atomically."""
+
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -578,6 +658,9 @@ def write_dataset(
             shard_path = data_dir / (
                 f"train-{shard_index:05d}-of-{shard_count:05d}.parquet"
             )
+            # Keep the original Arrow schema so downstream dataset loading sees
+            # the same columns and types as the raw one-rollout artifact. The
+            # refresh changes which rows are present, not the trace schema.
             table = pa.Table.from_pylist(shard_rows, schema=schema)
             pq.write_table(table, shard_path, compression="zstd")
 
@@ -603,6 +686,8 @@ def _refresh_dataset_exact(
     *,
     context_filter: Mapping[str, Any],
 ) -> RefreshSummary:
+    """Recompute the context-capped artifact from current and source rows."""
+
     started_at = time.time()
     tokenizer = QwenTokenizerAdapter(args.tokenizer_path)
 
@@ -629,6 +714,9 @@ def _refresh_dataset_exact(
     accepted_candidates_by_instance: dict[str, int] = {}
     fit_candidates_by_instance: dict[str, int] = {}
     if over_context:
+        # Only over-context tasks need a source-dataset scan. Rows that already
+        # fit are preserved byte-for-byte, which keeps this refresh narrow and
+        # minimizes drift from the raw public approximation.
         (
             source_rows_scanned,
             replacements,
@@ -656,6 +744,10 @@ def _refresh_dataset_exact(
 
         replacement = replacements.get(instance_id)
         if replacement is None:
+            # Truncating would silently train on a different trajectory ending,
+            # often dropping exactly the assistant/action tokens we care about.
+            # Excluding the task is more honest than manufacturing a partial
+            # training example when no accepted same-task rollout fits.
             excluded.append(
                 {
                     "instance_id": instance_id,
@@ -671,6 +763,9 @@ def _refresh_dataset_exact(
             )
             continue
 
+        # Replacements are same-task rows that satisfy both the public filters
+        # and the Qwen context cap. The report records old and new context stats
+        # so reviewers can audit every changed task.
         final_by_instance[instance_id] = replacement
         replaced.append(
             {
@@ -695,6 +790,9 @@ def _refresh_dataset_exact(
     selected_rows = sorted(
         final_by_instance.values(), key=lambda item: item.selected.source_row_index
     )
+    # Sorting by source row index preserves deterministic dataset order across
+    # rebuilds. The order is not an ML objective, but it affects streaming and
+    # reproducibility when later stages read the Parquet shards.
     summary = RefreshSummary(
         current_selected_rows=len(current),
         current_over_context_rows=len(over_context),
@@ -741,6 +839,8 @@ def _refresh_dataset_exact(
         "summary": asdict(summary),
         "replaced": sorted(replaced, key=lambda item: item["instance_id"]),
         "excluded": sorted(excluded, key=lambda item: item["instance_id"]),
+        # These maxima are quick proof that the refresh actually made the final
+        # artifact trainable under the requested Qwen context window.
         "max_current_shifted_input_length": max(
             selected.context.shifted_input_length for selected in current.values()
         ),
@@ -762,6 +862,8 @@ def _refresh_dataset_exact(
 
 
 def refresh_dataset(args: argparse.Namespace) -> RefreshSummary:
+    """Refresh if needed, otherwise reuse a proven-current in-place artifact."""
+
     context_filter = context_filter_contract(args)
     if _is_same_path(args.dataset_path, args.output_dir):
         status = current_artifact_status(
@@ -799,7 +901,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=prep.DEFAULT_OUTPUT_DIR)
     parser.add_argument("--tokenizer-path", type=Path, default=DEFAULT_TOKENIZER_PATH)
     parser.add_argument(
-        "--max-shifted-context", type=int, default=train.PAPER_CONTEXT_LENGTH
+        "--max-shifted-context",
+        type=int,
+        default=train.PAPER_CONTEXT_LENGTH,
+        help=(
+            "Maximum causal-LM shifted input length. For next-token training the "
+            "input is one token shorter than the serialized token stream."
+        ),
     )
     parser.add_argument(
         "--max-assistant-turns", type=int, default=prep.MAX_ASSISTANT_TURNS
@@ -813,7 +921,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rows-per-shard", type=int, default=prep.DEFAULT_ROWS_PER_SHARD
     )
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--include-model-patch", action="store_true")
+    parser.add_argument(
+        "--include-model-patch",
+        action="store_true",
+        help=(
+            "Append model_patch before counting context. This changes the target "
+            "task from OpenHands action generation toward final patch emission."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
