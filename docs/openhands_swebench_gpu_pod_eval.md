@@ -151,10 +151,10 @@ Prebuild runs in tmux session `openhands-swebench-image-prebuild` and logs to
 the existing session. Pass `--replace-session` to kill that session and start a
 fresh prebuild.
 
-The launcher skips already-built final OpenHands runtime image tags. Missing
-images build in parallel; use `--parallel-builds N` to tune concurrency or
-`--parallel-builds 1` for serial behavior. Use `--eval-limit N` only for a
-small prebuild smoke.
+The launcher ensures already-built images are skipped by final OpenHands runtime
+image tag. Missing images build in parallel; use `--parallel-builds N` to tune
+concurrency or `--parallel-builds 1` for serial behavior. Use `--eval-limit N`
+only for a small prebuild smoke.
 
 The launcher writes
 `/workspace/runlogs/openhands-swebench-image-prebuild.context.json`. Reruns
