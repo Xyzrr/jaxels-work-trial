@@ -1,3 +1,14 @@
+"""Tests for the pod-local Qwen SWE-HERO TorchTitan wrapper.
+
+The wrapper is runtime plumbing around the real training entrypoint. It should
+make long GPU training runs reconnectable, repair the pinned TorchTitan CUDA
+venv, and then forward every model/data/training argument unchanged to
+``qwen_swehero_train.py``. These tests make that boundary explicit so future
+changes do not hide ML experiment choices in the pod supervisor layer.
+"""
+
+from __future__ import annotations
+
 import os
 import shlex
 import shutil
@@ -12,12 +23,25 @@ WRAPPER = REPO_ROOT / "scripts" / "run_qwen_swehero_torchtitan_pod.py"
 
 
 def write_executable(path: Path, content: str) -> None:
+    """Write a tiny executable shim used to observe wrapper behavior."""
+
     path.write_text(textwrap.dedent(content).lstrip())
     path.chmod(0o755)
 
 
 class TestQwenSweHeroPodWrapper:
+    """Exercise the wrapper without starting real tmux or TorchTitan training."""
+
     def make_fake_runtime(self, tmp: Path) -> dict[str, str]:
+        """Create fake pod tools and return the environment that exposes them.
+
+        The actual wrapper launches a pinned TorchTitan runtime because CUDA,
+        PyTorch, TorchTitan, and TorchAO versions are tightly coupled for model
+        training. The tests replace those tools with shims that log invocations,
+        so we can verify the wrapper's process control without importing the
+        training stack or touching GPUs.
+        """
+
         fake_bin = tmp / "fake-bin"
         fake_bin.mkdir()
         venv_bin = tmp / "venv" / "bin"
@@ -42,6 +66,10 @@ class TestQwenSweHeroPodWrapper:
             #!/usr/bin/env bash
             exit 0
             """
+        # The Python shim delegates stdin programs back to the real test Python.
+        # The wrapper uses that path when it needs Python only to parse @arg files
+        # before the TorchTitan venv exists; normal training invocations are
+        # logged instead of executed.
         write_executable(venv_bin / "python", python_shim)
         write_executable(venv_bin / "torchrun", torchrun_shim)
         write_executable(python_template, python_shim)
@@ -132,6 +160,9 @@ class TestQwenSweHeroPodWrapper:
             setup_log_exists = (tmp / "setup.log").exists()
             runtime_log_exists = (tmp / "runtime.log").exists()
 
+        # Starting tmux should not run the verifier/training process in the parent
+        # wrapper. The parent only creates a supervised child session so the GPU
+        # job can survive a dropped pod connection.
         assert "has-session -t swehero-qwen-smoke" in tmux_log
         assert "new-session -d -s swehero-qwen-smoke" in tmux_log
         assert "pipe-pane -o -t swehero-qwen-smoke:0.0" in tmux_log
@@ -158,6 +189,9 @@ class TestQwenSweHeroPodWrapper:
             setup_log_exists = (tmp / "setup.log").exists()
             runtime_log_exists = (tmp / "runtime.log").exists()
 
+        # Reconnecting to an existing session must be side-effect free. A running
+        # distributed training job already owns its model state, checkpoints, and
+        # optimizer state; starting a new job here would corrupt that lifecycle.
         assert "has-session -t swehero-qwen-prod" in tmux_log
         assert "new-session" not in tmux_log
         assert "attach-session -t swehero-qwen-prod" in tmux_log
@@ -180,6 +214,9 @@ class TestQwenSweHeroPodWrapper:
             setup_log_exists = (tmp / "setup.log").exists()
             runtime_log_exists = (tmp / "runtime.log").exists()
 
+        # In non-interactive contexts the wrapper should still start the tmux
+        # supervisor but return immediately, leaving the training session detached
+        # for later inspection.
         assert "new-session -d -s swehero-detached" in tmux_log
         assert "attach-session" not in tmux_log
         assert "No interactive terminal is available" in result.stdout
@@ -211,6 +248,10 @@ class TestQwenSweHeroPodWrapper:
             assert result.returncode == 0, result.stderr
             tmux_log = (tmp / "tmux.log").read_text()
 
+        # @arg files are the project convention for reproducible experiment
+        # presets. The supervisor expands them only far enough to derive the
+        # output directory and a stable session name, not to reinterpret training
+        # hyperparameters.
         assert "has-session -t swehero-from-arg-file" in tmux_log
         assert "new-session -d -s swehero-from-arg-file" in tmux_log
 
@@ -230,6 +271,9 @@ class TestQwenSweHeroPodWrapper:
             assert result.returncode == 0, result.stderr
             tmux_log = (tmp / "tmux.log").read_text()
 
+        # A fresh pod may not have the pinned TorchTitan venv yet. The supervisor
+        # still has to start because the tmux child is the process that repairs
+        # the CUDA/PyTorch runtime before invoking training.
         assert "new-session -d -s swehero-fresh-pod" in tmux_log
         assert "Canonical TorchTitan venv is missing" not in result.stderr
 
@@ -250,9 +294,14 @@ class TestQwenSweHeroPodWrapper:
             runtime_log = (tmp / "runtime.log").read_text()
             tmux_log_exists = (tmp / "tmux.log").exists()
 
+        # Once inside the tmux child, the wrapper must run the setup script and
+        # then call the training script directly. This is where the pinned runtime
+        # is repaired before the ML recipe is interpreted.
         assert "--venv" in setup_log
         assert "--verify-only" not in setup_log
         assert "scripts/qwen_swehero_train.py" in runtime_log
+        # Arguments are forwarded intact so model, dataset, context length, and
+        # optimizer choices remain owned by qwen_swehero_train.py and its presets.
         assert "--out-dir /workspace/runs/direct-child --dry-run" in runtime_log
         assert not tmux_log_exists
 
@@ -270,6 +319,9 @@ class TestQwenSweHeroPodWrapper:
             setup_log = (tmp / "setup.log").read_text()
             runtime_log = (tmp / "runtime.log").read_text()
 
+        # Direct non-supervised launches also repair the venv first. Otherwise a
+        # stale CUDA/PyTorch/TorchTitan stack could fail or alter training behavior
+        # before the explicit Qwen/SWE-HERO recipe is even reached.
         assert "--venv" in setup_log
         assert "--verify-only" not in setup_log
         assert "scripts/qwen_swehero_train.py" in runtime_log
@@ -288,6 +340,9 @@ class TestQwenSweHeroPodWrapper:
             runtime_log = (tmp / "runtime.log").read_text()
             tmux_log_exists = (tmp / "tmux.log").exists()
 
+        # Non-interactive automation keeps the original direct behavior unless
+        # supervision is explicitly requested. That matters for CI and wrapper
+        # tests that expect one process to exec the training entrypoint.
         assert "--venv" in setup_log
         assert "--verify-only" not in setup_log
         assert "scripts/qwen_swehero_train.py" in runtime_log
