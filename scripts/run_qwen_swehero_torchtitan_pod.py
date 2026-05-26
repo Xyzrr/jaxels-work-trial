@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+"""Pod-local launcher for the Qwen SWE-Hero TorchTitan training entrypoint.
+
+This wrapper is deliberately about runtime plumbing, not ML experiment design.
+The actual model, dataset, context length, optimizer, checkpointing, and other
+training choices live in preset/CLI arguments consumed by
+``scripts/qwen_swehero_train.py``. Keeping this file thin prevents a future
+non-SWE-Hero experiment from inheriting hidden Qwen or SWE-Hero assumptions just
+because it also runs through the TorchTitan pod runtime.
+
+The main ML-adjacent decision made here is runtime isolation: TorchTitan training
+uses a pinned CUDA/PyTorch/TorchTitan environment that differs from the pod's
+generic Python environment. This launcher creates or repairs that environment
+before handing control to the training script, so distributed startup failures
+are less likely to be caused by accidental package drift.
+"""
+
 from __future__ import annotations
 
 import os
@@ -23,19 +39,38 @@ from scripts.pod_utils import (
 
 ROOT_DIR = repo_root()
 SELF_PATH = ROOT_DIR / "scripts" / Path(__file__).name
+
+# The venv path is runtime plumbing, not an experiment setting. The default name
+# remains SWE-Hero-flavored for compatibility with existing pods, but callers
+# should choose model/data behavior through preset arguments forwarded to the
+# training entrypoint below.
 VENV_PATH = Path(
     os.environ.get("TORCHTITAN_POD_VENV", "/workspace/venvs/torchtitan-swehero-cu128")
 )
+
+# Keep setup outside the training script so every launch, including dry runs and
+# resumed runs, starts from the same pinned TorchTitan runtime contract.
 SETUP_SCRIPT = Path(
     os.environ.get(
         "TORCHTITAN_POD_SETUP_SCRIPT",
         str(ROOT_DIR / "scripts" / "setup_torchtitan_pod_venv.py"),
     )
 )
+
+# Used only to derive a reconnectable tmux session name when the caller did not
+# pass --out-dir. The canonical training preset still owns the real output path.
 DEFAULT_OUT_DIR = "/workspace/qwen25-coder7b-swehero-torchtitan"
 
 
 def python_for_arg_parsing() -> str:
+    """Find a Python interpreter before the TorchTitan venv necessarily exists.
+
+    The tmux supervisor needs to inspect ``@preset`` files and ``--out-dir``
+    before it decides which session to create or reattach. On a fresh pod, the
+    TorchTitan venv may not exist yet, so this helper falls back to the base
+    Python installed by the pod manifest.
+    """
+
     venv_python = VENV_PATH / "bin" / "python"
     if venv_python.exists() and os.access(venv_python, os.X_OK):
         return str(venv_python)
@@ -52,6 +87,13 @@ def python_for_arg_parsing() -> str:
 
 
 def expanded_args(args: list[str]) -> list[str]:
+    """Expand argparse ``@file`` arguments just far enough for wrapper metadata.
+
+    The training script also parses these presets later. This wrapper expands
+    them only to find runtime metadata such as ``--out-dir`` for tmux naming; it
+    deliberately does not interpret model, dataset, or optimizer flags here.
+    """
+
     tokens: list[str] = []
 
     def expand_arg(arg: str) -> None:
@@ -79,6 +121,8 @@ def expanded_args(args: list[str]) -> list[str]:
 
 
 def resolved_out_dir(args: list[str]) -> str:
+    """Resolve the launch output directory without owning training semantics."""
+
     # Keep the explicit bootstrap Python check from the shell wrapper.
     python_for_arg_parsing()
     out_dir = DEFAULT_OUT_DIR
@@ -97,6 +141,8 @@ def resolved_out_dir(args: list[str]) -> str:
 
 
 def tmux_session_name(args: list[str]) -> str:
+    """Derive a stable, shell-safe tmux session name for this launch."""
+
     if os.environ.get("SWEHERO_POD_TMUX_SESSION"):
         return os.environ["SWEHERO_POD_TMUX_SESSION"]
     base = Path(resolved_out_dir(args).rstrip("/") or "default").name
@@ -108,6 +154,8 @@ def tmux_session_name(args: list[str]) -> str:
 
 
 def should_use_tmux_supervisor() -> bool:
+    """Decide whether this launch should run inside a reconnectable tmux session."""
+
     if os.environ.get("SWEHERO_POD_SUPERVISOR_CHILD") == "1":
         return False
     if os.environ.get("TMUX"):
@@ -138,6 +186,8 @@ def should_use_tmux_supervisor() -> bool:
 
 
 def should_attach_tmux_client() -> bool:
+    """Decide whether to attach after creating or finding a tmux session."""
+
     value = os.environ.get("SWEHERO_POD_TMUX_ATTACH", "auto")
     if value in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}:
         return True
@@ -149,6 +199,14 @@ def should_attach_tmux_client() -> bool:
 
 
 def attach_or_create_tmux_session(args: list[str]) -> None:
+    """Attach to an existing supervised run or start a detached supervised run.
+
+    Long distributed training jobs should survive a dropped ``kubectl exec`` or
+    laptop network connection. tmux is the pod-local supervisor used here; it is
+    intentionally outside the ML stack and does not change any training
+    arguments.
+    """
+
     if shutil.which("tmux") is None:
         print(
             "tmux is required for reconnectable supervised pod launches.\n\n"
@@ -191,6 +249,9 @@ def attach_or_create_tmux_session(args: list[str]) -> None:
         )
         raise SystemExit(0)
 
+    # Starting a new training process is the point where the pod checkout must
+    # match the branch and cleanliness rules. Reattaching above intentionally
+    # skips this guard so reconnects do not mutate an already-running job.
     pod_startup_common.prepare_pod_checkout(
         ROOT_DIR, "TorchTitan pod execution directory"
     )
@@ -198,6 +259,10 @@ def attach_or_create_tmux_session(args: list[str]) -> None:
     os.close(fd)
     env_file = Path(env_file_name)
     write_shell_exports(env_file, dict(os.environ))
+
+    # tmux receives one shell command, so preserve the caller's environment in a
+    # temporary export file and quote every forwarded argument. The child process
+    # sets SWEHERO_POD_SUPERVISOR_CHILD=1 to avoid recursively spawning tmux.
     command = (
         f"source {shell_quote(env_file)}; "
         f"rm -f {shell_quote(env_file)}; "
@@ -256,18 +321,34 @@ def attach_or_create_tmux_session(args: list[str]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Prepare the pod runtime and exec the Qwen SWE-Hero training script."""
+
     args = sys.argv[1:] if argv is None else argv
     if should_use_tmux_supervisor():
         attach_or_create_tmux_session(args)
 
+    # Direct execution reaches this point either because supervision is disabled
+    # or because this process is already the tmux child. The checkout guard runs
+    # immediately before the actual training launch.
     pod_startup_common.prepare_pod_checkout(
         ROOT_DIR, "TorchTitan pod execution directory"
     )
+
+    # Synchronize the pinned TorchTitan runtime before invoking any training
+    # code. This matters for ML correctness because PyTorch, CUDA, TorchAO, and
+    # TorchTitan internals are tightly coupled; a stale dependency can produce
+    # failures or numerically different behavior before the model configuration
+    # itself is even considered.
     setup = subprocess.run([str(SETUP_SCRIPT), "--venv", str(VENV_PATH)], check=False)
     if setup.returncode != 0:
         return setup.returncode
     env = dict(os.environ)
     env["PATH"] = f"{VENV_PATH / 'bin'}:{env.get('PATH', '')}"
+
+    # From here onward, the lower-level training entrypoint owns the ML recipe.
+    # This wrapper forwards args unchanged so preset ordering and CLI overrides
+    # behave exactly as if qwen_swehero_train.py had been run directly inside the
+    # canonical venv.
     exec_process(
         [
             str(VENV_PATH / "bin" / "python"),
