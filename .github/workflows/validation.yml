@@ -16,14 +16,26 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
+          # Keep CI on the same uv resolver as local development. The GPU pod
+          # has its own runtime setup scripts because CUDA/PyTorch/vLLM stacks
+          # must not be inferred from this local validation environment.
           version: "0.11.16"
           enable-cache: true
 
       - name: Install Python
+        # This is the local project interpreter for pytest/Ruff and launcher
+        # unit tests. TorchTitan training uses a separate pod-side Python 3.10
+        # CUDA venv, and OpenHands/vLLM evals use pod-side Python 3.12 venvs.
         run: uv python install 3.12.13
 
       - name: Sync dependencies
+        # uv.lock intentionally pins only local automation dependencies. Model
+        # weights, CUDA wheels, vLLM, OpenHands, and SWE-bench grader runtimes
+        # are validated by the GPU-pod workflows documented in docs/.
         run: uv sync --locked
 
       - name: Validate
+        # Local validation proves that project-owned launchers, tests, linting,
+        # and formatting are healthy. It does not claim that a training preset
+        # converges or that an eval model server passes SWE-bench.
         run: uv run scripts/validate.py
