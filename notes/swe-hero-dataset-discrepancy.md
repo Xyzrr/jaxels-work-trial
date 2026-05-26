@@ -6,6 +6,28 @@ Date investigated: 2026-05-21
 
 The SWE-ZERO to SWE-HERO paper reports a SWE-HERO training set of 13.2k execution-based trajectories, but the linked Hugging Face dataset currently exposes 34,269 rows. We need to know whether the exact 13.2k rows used in the paper can be recovered from the public artifact.
 
+## Reader Vocabulary
+
+These terms determine why the row counts below matter for training:
+
+- A task instance, stored as `instance_id`, is one coding problem plus its
+  repository/test environment. If the same `instance_id` appears three times,
+  the model would see three attempts at the same problem, not three independent
+  problems.
+- A rollout or trajectory is one full OpenHands attempt at solving one task:
+  prompts, assistant actions, tool calls, tool observations, and usually a
+  produced patch. Supervised fine-tuning (SFT) turns the assistant portions of
+  those traces into next-token targets.
+- Execution-based means the data came from an agent interacting with an actual
+  repository environment, rather than from a hand-written instruction/answer
+  pair. That makes the traces valuable, but also makes provenance important
+  because tool failures, duplicate attempts, and over-long contexts change what
+  the model learns.
+- One rollout per task is an ML weighting decision. It keeps every retained
+  task roughly equally represented. Training on all public rollouts would
+  over-weight tasks with multiple attempts and would no longer match the paper's
+  described data distribution.
+
 ## Paper Claims
 
 Source: arXiv `2604.01496`, v2 dated 2026-05-06.
@@ -18,7 +40,7 @@ Relevant claims:
 - The corpus composition section says the final SWE-HERO set comprises 13.2k execution-based trajectories after the filtering protocol.
 - The same paragraph says they did not exclude SWE-HERO trajectories based on task-resolution success because the SWE-HERO dataset is smaller.
 
-This implies the paper training set should be approximately one trajectory per retained task instance, not three trajectories for most task instances.
+This implies the paper training set should be approximately one trajectory per retained task instance, not three trajectories for most task instances. That difference is not cosmetic: duplicate trajectories for a task change the effective training weights and can teach the model to imitate repeated attempts at the same issue.
 
 ## Public Hugging Face Dataset
 
@@ -121,6 +143,10 @@ Without that, any 13.2k subset we create from the 34,269 public rows would be in
 
 Use one of these only with an explicit caveat that it is not the exact paper training set.
 
+A deterministic tie-breaker is required for either approximation. Without one,
+two rebuilds from the same public pool could pick different rollouts for the
+same task and produce different SFT targets.
+
 1. Current canonical public approximation:
    - Pin revision `150bc119e52c647216fce285fd801f16b6fd745b`.
    - Select one trajectory per `instance_id` with a declared deterministic tie-breaker.
@@ -147,6 +173,14 @@ The script applies the paper filters observable from public columns and records
 the missing `test_patch`-overlap filter caveat in the generated `metadata.json`.
 
 Implemented context-capped training artifact:
+
+The context-capped refresh exists because long agent traces can exceed the
+model's training window. In causal language-model training, the model reads a
+sequence of tokens and predicts the next token; after that one-token shift, the
+input length still must fit the configured context window. Rows that exceed the
+131,072-token shifted-input cap would either fail training or require
+truncation. Truncation is not used here because it can remove earlier tool
+observations or the final assistant action, changing the supervised target.
 
 - Script: `scripts/refresh_swehero_context_capped_one_rollout.py`
 - Default input/output: `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`
