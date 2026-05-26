@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""Pod-side launcher for OpenHands SWE-bench evals served by local vLLM.
+
+This file is the glue between three systems that are easy to confuse:
+
+* OpenHands drives the agent loop and asks an LLM to edit a repository.
+* vLLM serves the model on the GPU pod through an OpenAI-compatible API.
+* SWE-bench grades the generated patch in Docker after the agent finishes.
+
+Most of the choices below are not generic Kubernetes plumbing; they encode ML
+serving constraints for long-context coding models. Comments intentionally spell
+out why we choose specific context lengths, GPU layouts, and concurrency limits
+so engineers who do not work with model serving can still reason about changes.
+"""
+
 from __future__ import annotations
 
 import os
@@ -30,6 +44,9 @@ OPENHANDS_EVAL_UV_VERSION = "0.11.16"
 UV_X86_64_UNKNOWN_LINUX_GNU_SHA256 = (
     "74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
 )
+# Qwen2.5-Coder is trained with a 32k-token native position window. Asking vLLM
+# to serve 128k without an explicit long-context strategy would make the model
+# extrapolate beyond its native positional embeddings in an undefined way.
 QWEN_NATIVE_CONTEXT_LENGTH = 32768
 
 
@@ -91,6 +108,8 @@ def env_bool(value: str) -> bool:
 
 
 class EvalLauncher:
+    """Coordinate pod-local model serving, OpenHands inference, and grading."""
+
     def __init__(self) -> None:
         uv_version_env = os.environ.get("UV_VERSION")
         if uv_version_env and uv_version_env != OPENHANDS_EVAL_UV_VERSION:
@@ -101,12 +120,21 @@ class EvalLauncher:
         self.workspace_root = Path(
             os.environ.get("WORKSPACE_ROOT", "/workspace/jaxels-work-trial")
         )
+        # The default preset is the paper-aligned SWE-HERO eval recipe: Qwen
+        # 2.5 Coder 7B, OpenHands, SWE-bench Verified, and a 128k YaRN context
+        # window. Other eval stacks still come from explicit preset files.
         self.config_preset = (
             ROOT_DIR
             / "configs/eval/openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args"
         )
+        # vLLM requires an API key even for a local server. The value is not a
+        # secret for these pod-local evals; it is only a bearer token shared by
+        # OpenHands, the router, and the model server.
         self.llm_api_key_explicit = "LLM_API_KEY" in os.environ
         self.llm_api_key = os.environ.get("LLM_API_KEY", "local-llm")
+        # Keep model-serving dependencies separate from OpenHands dependencies.
+        # vLLM pins CUDA-adjacent packages tightly, while OpenHands and
+        # SWE-bench bring their own Python dependency constraints.
         self.vllm_venv = Path(
             os.environ.get("VLLM_VENV", "/workspace/venvs/openhands-vllm")
         )
@@ -120,6 +148,8 @@ class EvalLauncher:
         self.vllm_visible_devices = os.environ.get(
             "VLLM_VISIBLE_DEVICES", os.environ.get("VLLM_GPU", "")
         )
+        # Restart is opt-in because loading a coding model into GPU memory can
+        # take minutes. A context signature below detects when reuse is safe.
         self.vllm_force_restart = os.environ.get("VLLM_FORCE_RESTART", "0")
         self.vllm_nccl_cumem_enable = os.environ.get("VLLM_NCCL_CUMEM_ENABLE", "auto")
         self.vllm_tmux_session = os.environ.get(
@@ -237,8 +267,13 @@ class EvalLauncher:
         return ROOT_DIR / self.config_preset
 
     def resolve_eval_config(self, config_path: Path) -> dict[str, object]:
+        """Parse the preset once and project eval settings into launcher state."""
+
         if not config_path.is_file():
             raise SystemExit(f"eval config preset not found: {config_path}")
+        # The eval script owns preset semantics. Reusing its parser here avoids a
+        # second source of truth for ML knobs such as context mode, sampling, and
+        # vLLM parallelism.
         args = eval_script.parse_args(
             [
                 f"@{config_path}",
@@ -248,6 +283,9 @@ class EvalLauncher:
             ]
         )
         context_spec = eval_script.context_mode_spec(args.context_mode)
+        # The pod launcher must know whether vLLM needs permission to exceed the
+        # model's native context window. For Qwen2.5-Coder, that is only valid
+        # when the preset also supplies the matching YaRN rope scaling config.
         return {
             "CONFIG_PRESET_PATH": config_path,
             "EVAL_STACK": args.eval_stack,
@@ -505,6 +543,8 @@ class EvalLauncher:
         )
 
     def ensure_eval_python(self, uv_bin: Path) -> None:
+        """Create the Python runtime used for OpenHands and SWE-bench grading."""
+
         if self.eval_python_ready:
             return
         self.ensure_python_venv(
@@ -552,12 +592,17 @@ class EvalLauncher:
         self.eval_python_ready = True
 
     def ensure_vllm_python(self, uv_bin: Path) -> None:
+        """Create the Python runtime used only for the vLLM model server."""
+
         if self.vllm_python_ready:
             return
         if not self.vllm_requirements_path.is_file():
             die(f"vLLM requirements file not found: {self.vllm_requirements_path}")
         self.ensure_python_venv(self.vllm_venv, self.vllm_python_version, uv_bin)
         resolved_requirements = self.vllm_venv / "openhands-vllm-resolved.txt"
+        # Compile then sync rather than installing the input file directly. That
+        # records the full transitive vLLM stack, which matters for GPU serving
+        # because CUDA, transformers, and vLLM versions must remain compatible.
         run(
             [
                 str(uv_bin),
@@ -597,6 +642,8 @@ class EvalLauncher:
                 break
         if expected_vllm is None:
             die(f"{self.vllm_requirements_path} must pin vllm with vllm==...")
+        # vLLM is the model-serving engine, so silently drifting this version can
+        # change context-length behavior, scheduler behavior, or tool-call JSON.
         actual_vllm = run(
             [
                 str(self.vllm_venv / "bin" / "python"),
@@ -721,7 +768,12 @@ class EvalLauncher:
         run(["docker", "buildx", "version"], stdout=subprocess.DEVNULL)
 
     def ensure_openhands_checkout(self) -> None:
+        """Check out the exact eval harness requested by the preset."""
+
         if self.eval_stack == "swe-lego":
+            # SWE-Lego vendors the OpenHands and SWE-bench revisions it expects.
+            # Using upstream OpenHands here would mix eval harness assumptions
+            # with a checkpoint that was published for the vendored stack.
             swe_lego_dir = Path(self.swe_lego_dir)
             if not (swe_lego_dir / ".git").is_dir():
                 swe_lego_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -807,9 +859,14 @@ class EvalLauncher:
         )
 
     def ensure_openhands_dependencies(self, uv_bin: Path) -> None:
+        """Install the selected OpenHands/SWE-bench stack into the eval venv."""
+
         self.ensure_openhands_checkout()
         self.poetry_install_openhands_dependencies()
         if self.eval_stack == "swe-lego":
+            # SWE-Lego pins a vendored SWE-bench package. Installing it editable
+            # makes Python imports resolve to the same grader code the stack was
+            # released with, instead of the upstream package in this repo.
             run(
                 [
                     str(uv_bin),
@@ -840,11 +897,19 @@ class EvalLauncher:
     def effective_vllm_nccl_cumem_enable(self) -> str:
         if self.vllm_nccl_cumem_enable == "auto":
             if self.vllm_parallel_gpu_count > 1:
+                # NCCL coordinates GPU-to-GPU communication for tensor/pipeline
+                # parallel serving. The pod's /dev/shm is small, and enabling
+                # CUDA memory-backed NCCL avoids fragile shared-memory failures.
                 return "1"
             return ""
         return self.vllm_nccl_cumem_enable
 
     def vllm_context_signature(self, gpu: int, port: int) -> str:
+        """Describe the model-serving contract that makes endpoint reuse safe."""
+
+        # A live /models response only proves that something is serving. For eval
+        # reproducibility, the endpoint must also match the preset's model,
+        # context window, rope scaling, precision, GPU layout, and tool parser.
         return "\n".join(
             [
                 f"CONTEXT_MODE={self.context_mode}",
@@ -907,17 +972,24 @@ class EvalLauncher:
         )
 
     def cleanup_vllm_runtime(self) -> None:
+        """Remove stale model-serving processes and IPC files before restart."""
+
         self.kill_process_pattern(str(self.vllm_venv / "bin" / "vllm"))
         self.kill_process_pattern(
             f"{self.vllm_venv / 'bin' / 'python'} -c from multiprocessing"
         )
         for pattern in ("/dev/shm/psm_*", "/dev/shm/sem.mp-*", "/dev/shm/nccl-*"):
+            # Multi-GPU vLLM can leave multiprocessing and NCCL shared-memory
+            # handles behind after a hard kill. Removing them prevents the next
+            # server from inheriting stale inter-process communication state.
             for path in Path("/").glob(pattern.removeprefix("/")):
                 path.unlink(missing_ok=True)
 
     def ensure_vllm_server(
         self, uv_bin: Path, ip: str, gpu: int, port: int, session: str
     ) -> None:
+        """Start or reuse one vLLM OpenAI-compatible endpoint."""
+
         base_url = f"http://{ip}:{port}/v1"
         context_path = self.tmux_log_dir / f"{session}.context"
         expected_context = self.vllm_context_signature(gpu, port)
@@ -949,6 +1021,9 @@ class EvalLauncher:
                 and context_path.is_file()
                 and context_path.read_text() == expected_context
             ):
+                # Reuse is safe only when the endpoint and the recorded serving
+                # contract match. Otherwise a previous eval could silently serve
+                # the wrong model length, precision, or rope scaling.
                 return
             print(
                 f"restarting vLLM endpoint on {base_url} for context mode {self.context_mode}"
@@ -1007,14 +1082,25 @@ class EvalLauncher:
         )
         env_parts: list[str] = []
         if self.vllm_visible_devices and self.vllm_visible_devices != "all":
+            # A manual override is useful for single-server debugging. It is
+            # disallowed for multi-replica runs later because mapping several
+            # server processes onto one custom device list is ambiguous.
             env_parts.append(f"CUDA_VISIBLE_DEVICES={self.vllm_visible_devices}")
         elif self.vllm_server_count == 1 and self.vllm_parallel_gpu_count > 1:
+            # A single large model server can shard one model across multiple
+            # GPUs. CUDA_VISIBLE_DEVICES must expose the whole shard group to the
+            # one vLLM process.
             env_parts.append(
                 f"CUDA_VISIBLE_DEVICES={','.join(str(i) for i in range(self.vllm_parallel_gpu_count))}"
             )
         else:
+            # The standard SWE-HERO eval path runs one vLLM replica per GPU.
+            # The router then spreads OpenHands requests across replicas.
             env_parts.append(f"CUDA_VISIBLE_DEVICES={gpu}")
         if env_bool(self.vllm_allow_long_max_model_len):
+            # vLLM protects users from accidentally exceeding a model's native
+            # context length. We enable the override only after preset validation
+            # proved that the corresponding long-context mode is intentional.
             env_parts.append("VLLM_ALLOW_LONG_MAX_MODEL_LEN=1")
         nccl_cumem_enable = self.effective_vllm_nccl_cumem_enable()
         if nccl_cumem_enable:
@@ -1035,6 +1121,9 @@ class EvalLauncher:
             str(self.vllm_max_model_len),
         ]
         if self.vllm_rope_scaling:
+            # RoPE is the position-encoding mechanism that lets the model know
+            # token order. YaRN scaling stretches that mechanism from Qwen's
+            # native 32k window to the paper's 128k evaluation window.
             command.extend(["--rope-scaling", self.vllm_rope_scaling])
         command.extend(
             [
@@ -1045,6 +1134,8 @@ class EvalLauncher:
             ]
         )
         if self.vllm_max_num_seqs:
+            # This caps how many prompts vLLM batches together. Higher values
+            # improve throughput but consume more KV-cache memory per server.
             command.extend(["--max-num-seqs", str(self.vllm_max_num_seqs)])
         command.extend(
             [
@@ -1055,10 +1146,16 @@ class EvalLauncher:
             ]
         )
         if env_bool(self.vllm_enable_auto_tool_choice):
+            # OpenHands uses tool calls to drive repository edits. Native
+            # tool-call parsing catches malformed model output before it becomes
+            # an agent action.
             command.append("--enable-auto-tool-choice")
             if self.vllm_tool_call_parser:
                 command.extend(["--tool-call-parser", self.vllm_tool_call_parser])
         if self.vllm_distributed_executor_backend:
+            # Multi-GPU serving needs a worker launcher. The default "mp"
+            # backend keeps all workers inside this pod instead of relying on a
+            # separate distributed cluster.
             command.extend(
                 [
                     "--distributed-executor-backend",
@@ -1066,6 +1163,8 @@ class EvalLauncher:
                 ]
             )
         if env_bool(self.vllm_enforce_eager):
+            # Eager execution trades some graph-compiler optimization for more
+            # predictable startup/debug behavior in this prototype eval stack.
             command.append("--enforce-eager")
         tmux_command = (
             f"cd {shell_quote(self.workspace_root)} && "
@@ -1094,6 +1193,8 @@ class EvalLauncher:
         die(f"vLLM did not become ready; see /workspace/runlogs/{session}.log")
 
     def ensure_vllm_router(self, ip: str, backend_args: list[str]) -> None:
+        """Start or reuse the local router that load-balances vLLM replicas."""
+
         router_url = f"http://{ip}:{self.vllm_router_port}/v1"
         context_path = self.tmux_log_dir / f"{self.vllm_router_tmux_session}.context"
         expected_context = "\n".join(
@@ -1134,6 +1235,9 @@ class EvalLauncher:
                 and context_path.is_file()
                 and context_path.read_text() == expected_context
             ):
+                # The router has no model weights, but it still encodes eval
+                # concurrency. Reusing a router with the wrong backend list can
+                # overload one GPU or send requests to a stale model server.
                 return
             print(
                 f"restarting vLLM router on {router_url} for context mode {self.context_mode}"
@@ -1189,6 +1293,8 @@ class EvalLauncher:
         )
 
     def ensure_vllm_stack(self, uv_bin: Path, ip: str) -> None:
+        """Ensure all configured vLLM replicas and the optional router exist."""
+
         if env_bool(self.vllm_force_restart):
             run(
                 ["tmux", "kill-session", "-t", self.vllm_tmux_session],
@@ -1220,6 +1326,9 @@ class EvalLauncher:
 
         backend_args: list[str] = []
         for gpu in range(self.vllm_server_count):
+            # In the common replica layout, port N maps to GPU N. For a single
+            # multi-GPU server, the loop runs once and that server receives the
+            # whole tensor/pipeline-parallel device group.
             port = self.vllm_port + gpu
             session = self.vllm_session_name(gpu)
             self.ensure_vllm_server(uv_bin, ip, gpu, port, session)
@@ -1228,6 +1337,8 @@ class EvalLauncher:
             self.ensure_vllm_router(ip, backend_args)
 
     def assign_config(self, values: dict[str, object]) -> None:
+        """Copy parsed preset values onto the launcher instance."""
+
         for key, value in values.items():
             setattr(self, key.lower(), value)
         self.config_preset_path = Path(values["CONFIG_PRESET_PATH"])
@@ -1238,6 +1349,8 @@ class EvalLauncher:
             )
 
     def run_foreground(self, uv_bin: Path) -> None:
+        """Run the full pod-side eval flow in the current process."""
+
         pod_startup_common.require_pod_runtime(
             self.workspace_root, "nvidia-smi", "docker", "curl", "git"
         )
@@ -1257,15 +1370,24 @@ class EvalLauncher:
             die(
                 f"expected at least {self.required_gpu_count} visible GPUs, found {self.visible_gpu_count}"
             )
+        # Tensor parallelism splits individual model layers across GPUs.
+        # Pipeline parallelism splits groups of layers across GPUs. Multiplying
+        # them gives the number of GPUs one vLLM process needs to serve a single
+        # model replica.
         self.vllm_parallel_gpu_count = int(self.vllm_tensor_parallel_size) * int(
             self.vllm_pipeline_parallel_size
         )
         if int(self.vllm_server_count) == 1:
+            # SWE-Lego's published contract uses one multi-GPU vLLM server for a
+            # larger long-context model, so the parallel group may span GPUs.
             if self.vllm_parallel_gpu_count > self.visible_gpu_count:
                 die(
                     f"vLLM parallel size exceeds visible GPUs: {self.vllm_parallel_gpu_count} > {self.visible_gpu_count}"
                 )
         else:
+            # The current OpenHands/SWE-HERO path scales throughput by running
+            # independent one-GPU replicas. That keeps each replica simple and
+            # lets the router apply a fixed per-GPU request budget.
             if int(self.vllm_server_count) > self.visible_gpu_count:
                 die(
                     f"vLLM server count exceeds visible GPUs: {self.vllm_server_count} > {self.visible_gpu_count}"
@@ -1300,6 +1422,9 @@ class EvalLauncher:
         total_agent_workers = int(self.vllm_server_count) * int(
             self.vllm_agent_tasks_per_server
         )
+        # OpenHands worker count is tied to serving capacity. Too many workers
+        # create long queues and can exhaust vLLM KV-cache memory; too few leave
+        # expensive GPUs idle.
         if env_bool(str(self.vllm_use_router)):
             llm_base_url = f"http://{pod_ip}:{self.vllm_router_port}/v1"
         else:
@@ -1333,6 +1458,8 @@ class EvalLauncher:
         if self.preflight_only:
             eval_args.append("--preflight-only")
         else:
+            # Skip this in preflight mode because that mode only verifies that
+            # vLLM can emit a structured tool call; it does not run OpenHands.
             self.ensure_openhands_dependencies(uv_bin)
         if self.skip_swebench_eval:
             eval_args.append("--skip-swebench-eval")
