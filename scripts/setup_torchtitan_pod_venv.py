@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""Create or verify the pinned TorchTitan training runtime on the GPU pod.
+
+This script intentionally does not run through the project `uv` environment.
+It is the bootstrap layer that creates the separate pod venv used for
+distributed TorchTitan training. That venv pins CUDA, PyTorch, TorchAO, and the
+vendored TorchTitan checkout together so a training job does not accidentally
+inherit packages from the workstation or from a previous pod image.
+
+The important ML/runtime contract is:
+
+* PyTorch must be the CUDA 12.8 build expected by the GPU pod;
+* TorchTitan must import with the FSDP and mixed-precision APIs this project
+  uses for full-model training; and
+* TorchAO float8 support must be present because the training launcher can ask
+  TorchTitan to use FP8 linear layers where TorchTitan marks that path safe.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -17,6 +34,11 @@ from importlib.metadata import version
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+
+# The pod training runtime is deliberately pinned separately from the local
+# project runtime. TorchTitan and PyTorch internals are tightly coupled; allowing
+# a newer uv/Python resolver path to drift here can change CUDA wheels or
+# dependency versions before any training code runs.
 TORCHTITAN_POD_UV_VERSION = "0.11.16"
 TORCHTITAN_POD_PYTHON_VERSION = "3.10.12"
 UV_X86_64_UNKNOWN_LINUX_GNU_SHA256 = (
@@ -103,6 +125,8 @@ def require_uv_version(uv_bin: Path, expected: str) -> None:
 def download_linux_uv(
     version_value: str, expected_sha256: str, destination_dir: Path
 ) -> None:
+    """Install the exact Linux uv binary needed before any venv exists."""
+
     with tempfile.TemporaryDirectory() as raw_tmp:
         tmp = Path(raw_tmp)
         archive = tmp / "uv.tar.gz"
@@ -117,6 +141,9 @@ def download_linux_uv(
             shutil.copyfileobj(response, out)
         actual_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
         if actual_sha256 != expected_sha256:
+            # This bootstrap path runs before the project dependency lock can
+            # protect us. The checksum keeps the pod from executing a corrupted
+            # or unexpected uv binary while preparing the training runtime.
             raise SystemExit(
                 f"uv archive checksum mismatch: expected {expected_sha256}, "
                 f"found {actual_sha256}"
@@ -132,6 +159,8 @@ def download_linux_uv(
 
 
 def ensure_uv() -> Path:
+    """Return a uv binary that exactly matches the TorchTitan pod contract."""
+
     uv_version_env = os.environ.get("UV_VERSION")
     if uv_version_env and uv_version_env != TORCHTITAN_POD_UV_VERSION:
         print(
@@ -144,6 +173,9 @@ def ensure_uv() -> Path:
 
     uv_bin_env = os.environ.get("UV_BIN")
     if uv_bin_env:
+        # UV_BIN is a runtime-plumbing escape hatch for repairing a pod. It is
+        # still version-checked because resolver drift can change the CUDA/PyTorch
+        # dependency set that the later sync installs.
         uv_bin = Path(uv_bin_env)
         if not uv_bin.exists() or not os.access(uv_bin, os.X_OK):
             print(f"UV_BIN is not executable: {uv_bin}", file=sys.stderr)
@@ -158,6 +190,9 @@ def ensure_uv() -> Path:
         if uv_version_matches(uv_bin, TORCHTITAN_POD_UV_VERSION):
             require_uv_version(uv_bin, TORCHTITAN_POD_UV_VERSION)
             return uv_bin
+        # A wrong binary in the managed location is more dangerous than a
+        # missing binary because it looks canonical to future runs. Remove it so
+        # the verified download path can recreate the expected tool.
         print(
             f"Removing wrong uv binary from pinned tool directory: {uv_bin}",
             file=sys.stderr,
@@ -196,8 +231,13 @@ def ensure_uv() -> Path:
 
 
 def ensure_python(uv_bin: Path) -> str:
+    """Return the CPython interpreter used to build the TorchTitan venv."""
+
     python_bin = os.environ.get("PYTHON")
     if python_bin:
+        # PYTHON is only used for bootstrap/repair. We do not infer experiment
+        # settings from it; the actual training packages still come from the
+        # pinned requirements file below.
         if not Path(python_bin).exists() and shutil.which(python_bin) is None:
             print(f"PYTHON is not executable or on PATH: {python_bin}", file=sys.stderr)
             raise SystemExit(1)
@@ -209,6 +249,8 @@ def ensure_python(uv_bin: Path) -> str:
     python_install_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["UV_PYTHON_DOWNLOADS"] = "automatic"
+    # Install CPython into /workspace so the venv can be recreated on fresh pods
+    # without depending on the container image's system Python version.
     run(
         [
             str(uv_bin),
@@ -243,6 +285,8 @@ def verify_runtime(
     uv_bin: Path,
     expected_uv_version: str,
 ) -> None:
+    """Prove the venv can run the training stack before a job starts."""
+
     actual_uv_version = run(
         [str(uv_bin), "--version"], capture_output=True
     ).stdout.strip()
@@ -258,6 +302,10 @@ def verify_runtime(
             required[match.group(1)] = match.group(2)
 
     for package, expected in required.items():
+        # These three packages form the critical training runtime:
+        # torch provides CUDA kernels and distributed primitives, torchao provides
+        # optional FP8/quantization helpers, and torchdata is used by TorchTitan's
+        # input pipeline.
         actual = version(package)
         if actual != expected:
             raise SystemExit(
@@ -271,6 +319,9 @@ def verify_runtime(
             f"torch.__version__ mismatch: expected {required['torch']}, found {torch.__version__}"
         )
     if torch.version.cuda != "12.8":
+        # The wheel CUDA version must match the pod contract. A CPU wheel or a
+        # different CUDA build can import successfully but fail later inside
+        # distributed training or NCCL setup.
         raise SystemExit(f"expected CUDA 12.8 torch wheel, found {torch.version.cuda}")
 
     from torch.distributed.fsdp import (
@@ -280,9 +331,14 @@ def verify_runtime(
     )
     from torchao.float8 import Float8LinearConfig
 
+    # These imports are not decorative. The training launcher asks TorchTitan for
+    # FSDP-style sharding, mixed precision, and optional FP8 linear layers. If
+    # any symbol moved or vanished, fail here instead of during a multi-GPU job.
     Float8LinearConfig.from_recipe_name("rowwise")
     if not torch.cuda.is_available():
         raise SystemExit("torch.cuda.is_available() is false in the pod runtime")
+    # Run one CUDA tensor operation to prove the selected wheel can allocate on
+    # the GPU, not just import its Python package.
     cuda_value = torch.ones(1, device="cuda").item()
     if cuda_value != 1.0:
         raise SystemExit("CUDA smoke tensor returned the wrong value")
@@ -299,8 +355,14 @@ def verify_runtime(
         "tyro",
         "wandb",
     ):
+        # These packages support dataset loading, tokenization, checkpoint file
+        # formats, config parsing, TensorBoard/W&B logging, and other training
+        # plumbing. Importing them here catches incomplete venv repairs.
         importlib.import_module(module)
 
+    # Persist a venv-local manifest so each training run can record exactly what
+    # runtime was verified without re-running this script during provenance
+    # collection.
     record = {
         "created_at_unix": time.time(),
         "python": sys.version,
@@ -338,6 +400,10 @@ def main(argv: list[str] | None = None) -> int:
     venv_path, recreate, verify_only = parse_args(
         sys.argv[1:] if argv is None else argv
     )
+    # The requirements input is split into a human-maintained requirement file
+    # and an optional lock generated for the pod. Install from the lock when it
+    # exists, but still use the input file as the source for critical version
+    # checks in verify_runtime.
     requirements_path = Path(
         os.environ.get(
             "TORCHTITAN_POD_REQUIREMENTS",
@@ -359,8 +425,14 @@ def main(argv: list[str] | None = None) -> int:
     python_bin = ensure_python(uv_bin)
     env = dict(os.environ)
     env["UV_CACHE_DIR"] = env.get("UV_CACHE_DIR", "/workspace/.cache/uv")
+    # PyTorch CUDA wheels are often available from multiple indexes. The
+    # unsafe-best-match strategy is intentional here because the lock/requirements
+    # pin the exact wheel set and the pod runtime must be able to select those
+    # CUDA-specific artifacts.
     env["UV_INDEX_STRATEGY"] = env.get("UV_INDEX_STRATEGY", "unsafe-best-match")
     env["UV_LINK_MODE"] = env.get("UV_LINK_MODE", "hardlink")
+    # After ensure_python has installed the managed interpreter, do not let uv
+    # download a different Python during venv creation or dependency sync.
     env["UV_PYTHON_DOWNLOADS"] = env.get("UV_PYTHON_DOWNLOADS", "never")
 
     if not verify_only:
@@ -368,6 +440,9 @@ def main(argv: list[str] | None = None) -> int:
             shutil.rmtree(venv_path)
         if not (venv_path / "bin" / "python").exists():
             venv_path.parent.mkdir(parents=True, exist_ok=True)
+            # --no-project prevents uv from mixing this pod training venv with
+            # the repository's local development pyproject/lock. TorchTitan's
+            # CUDA runtime is intentionally isolated.
             run(
                 [
                     str(uv_bin),
@@ -380,6 +455,9 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 env=env,
             )
+        # Sync enforces the complete runtime set rather than incrementally
+        # installing packages. That removes stale CUDA or TorchTitan-adjacent
+        # packages from previous pod experiments.
         run(
             [
                 str(uv_bin),
@@ -391,6 +469,9 @@ def main(argv: list[str] | None = None) -> int:
             ],
             env=env,
         )
+        # TorchTitan is vendored in this repo and intentionally outside the
+        # project uv environment. Install it editable without dependencies so the
+        # pinned pod requirements remain the single source for package versions.
         run(
             [
                 str(uv_bin),
@@ -405,6 +486,8 @@ def main(argv: list[str] | None = None) -> int:
             env=env,
         )
 
+    # pip check catches dependency metadata conflicts; verify_runtime catches the
+    # ML-specific contract that pip metadata alone cannot express.
     run(
         [str(uv_bin), "pip", "check", "--python", str(venv_path / "bin" / "python")],
         env=env,
