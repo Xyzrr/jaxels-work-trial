@@ -14,6 +14,33 @@ The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
 - Dockerized SWE-bench grading through either OpenHands' bundled grader path
   or SWE-Lego's vendored `SWE-bench-4.0.4` checkout.
 
+Eval concepts used throughout this runbook:
+
+- SWE-bench eval asks an agent to modify real repositories and then grades the
+  produced patch against hidden tests. A pass@1 score means each task gets one
+  agent attempt; the metric is the fraction of tasks solved by that first
+  attempt.
+- OpenHands is the coding agent harness. It turns a SWE-bench task into a loop
+  of model messages, shell/editor/tool actions, and repository observations.
+  The model server only predicts the next assistant action; OpenHands decides
+  how to execute that action and when to stop.
+- vLLM is the local model-serving layer that exposes an OpenAI-compatible API.
+  It is not the grader or the agent. It controls GPU memory use, context length,
+  batching, precision, and whether model weights are split across GPUs.
+- Tensor parallelism splits one model replica across multiple GPUs. Multiple
+  replicas instead run independent copies on different GPUs. The Qwen2.5 evals
+  use one 7B replica per GPU for throughput, while the SWE-Lego Qwen3 preset
+  uses one 8-way tensor-parallel replica because that reproduction contract
+  serves a long-context Qwen3 model across all GPUs.
+- Native tool calling means the model returns structured `tool_calls` JSON
+  rather than free-form text. For OpenHands/SWE-bench this matters because an
+  apparently fluent answer is useless unless the harness can execute the model's
+  intended shell/editor action.
+- A context mode is the joint contract among tokenizer limits, vLLM
+  `--max-model-len`, and any RoPE/YaRN long-context scaling. Changing it changes
+  what the model can read during a task, so it is an eval variable, not just an
+  implementation detail.
+
 Use `scripts/run_midtraining_pod.py eval` and
 `scripts/run_midtraining_pod.py prebuild` from the workstation checkout. The
 meta-wrapper pushes the current clean branch, enters `midtraining-dev` with
@@ -285,6 +312,11 @@ The tool-call preflight must return structured `message.tool_calls` for
 Qwen2.5-Coder. If it returns plain assistant text, the eval should not start.
 The SWE-Lego Qwen3 preset disables this preflight because its OpenHands config
 does not force native tool calling or `tool_choice=required`.
+
+This preflight is an ML-facing correctness check. It catches the case where the
+same model endpoint is reachable but no longer speaks the action format that
+OpenHands expects. Without structured tool calls, later SWE-bench failures would
+mix together model quality, prompt/config drift, and harness parsing failures.
 
 ## Preset Defaults
 
