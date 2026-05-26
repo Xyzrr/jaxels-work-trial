@@ -8,6 +8,15 @@ same experiments were rerun against the Python launchers under
 The raw scratch logs are intentionally ignored by git. This document records
 the reproducible experiment scope and normalized results.
 
+The purpose of these experiments was not just to prove that Python printed the
+same help text as the old shell scripts. These launchers are the boundary
+between a cheap workstation command and expensive ML workloads running in the
+GPU pod. If the conversion changed an argument order, an environment variable,
+or the pod-side script path, a later training or eval run could silently use a
+different model preset, dataset, context window, vLLM topology, or grader. The
+checks below therefore focus on the launch contract that determines what ML
+experiment actually runs.
+
 ## Normalization
 
 The comparison normalizes only intentional migration differences:
@@ -23,6 +32,12 @@ The comparison normalizes only intentional migration differences:
   pinned uv binary with that environment variable set.
 
 No behavior-specific output was normalized away.
+
+In particular, the normalization did not remove model-serving settings,
+forwarded secrets, branch guards, worker counts, or eval selectors. Those values
+are part of the experiment contract: they decide which checkpoint is served,
+which pod checkout is used, how many OpenHands tasks run concurrently, and
+whether the evaluator grades the same SWE-bench instances.
 
 ## Result Summary
 
@@ -43,6 +58,14 @@ No behavior-specific output was normalized away.
 | `openhands_eval_help` | Eval launcher help text, options, env docs, and defaults are preserved with `.py` script names. | Pass |
 | `openhands_eval_worker_selection` | Worker selection helper returns `7`, `3`, `3`, `16` for the SWE-Lego/current OpenHands smoke cases. | Pass |
 | `openhands_eval_llm_key_selection` | LLM API key helper returns `dummy-key`, `explicit`, `local-llm` for SWE-Lego default, SWE-Lego explicit, and current OpenHands default cases. | Pass |
+
+The last two eval cases deserve special attention. Worker selection controls
+how many OpenHands agents submit tasks to the local model server at once; too
+many workers can make vLLM run out of GPU memory, while too few workers can make
+an eval appear slower than the configuration really is. The LLM key selection
+case keeps local pod inference distinct from provider-backed APIs: a dummy or
+local key is sufficient for the OpenAI-compatible vLLM endpoint, while real
+secrets should remain explicit runtime inputs.
 
 ## Normalized Comparison Output
 
