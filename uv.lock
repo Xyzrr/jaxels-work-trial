@@ -1,3 +1,13 @@
+# Local development lock only.
+#
+# This file is consumed by `uv sync --locked` for workstation/CI automation:
+# pytest, Ruff, and their transitive dependencies.
+# It intentionally does not describe the ML runtime. That separate runtime
+# includes TorchTitan training, vLLM serving, OpenHands orchestration, CUDA
+# wheels, model weights, and SWE-bench graders. Those pins live in
+# requirements/* and are repaired inside the GPU pod so a local tooling sync
+# cannot change numerical training or eval behavior.
+#
 version = 1
 revision = 3
 requires-python = "==3.12.*"
