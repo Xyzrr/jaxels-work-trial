@@ -22,17 +22,40 @@ import os
 from pathlib import Path
 from typing import Any
 
+# This script predates the preset-driven TorchTitan launcher and is kept as a
+# quick local/pod smoke path. Its settings are still environment-driven so old
+# command snippets continue to work; the production training path records these
+# same choices through argparse presets instead.
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-Coder-7B-Instruct")
 DATASET_ID = os.environ.get("DATASET_ID", "nvidia/SWE-Hero-openhands-trajectories")
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/workspace/qwen25-coder7b-swehero-smoke"))
+
+# A transformer can only condition on a bounded number of tokens at once. The
+# SWE-Hero direct-to-hero recipe uses a 128k-token context so long OpenHands
+# traces can keep prior reasoning, tool calls, and tool observations available
+# while later assistant actions are supervised.
 PAPER_CONTEXT_LENGTH = 131_072
+
+# Qwen2.5-Coder was released with a native 32k-token context. When this smoke
+# runs at the paper 128k context, `maybe_enable_yarn` applies YaRN positional
+# scaling so the model can represent token positions beyond 32k.
 QWEN_NATIVE_CONTEXT_LENGTH = 32_768
 MAX_LENGTH = int(os.environ.get("MAX_LENGTH", str(PAPER_CONTEXT_LENGTH)))
 NUM_EXAMPLES = int(os.environ.get("NUM_EXAMPLES", "2"))
 MAX_STREAMED_EXAMPLES = int(os.environ.get("MAX_STREAMED_EXAMPLES", "200"))
+
+# Supervised fine-tuning (SFT) updates the pretrained model to predict target
+# assistant/action tokens from curated traces. These defaults mirror the paper
+# recipe where a tiny smoke run can: three epochs, global batch 32, AdamW with a
+# 1e-5 peak learning rate, cosine decay toward 1e-8, and 10% warmup.
 NUM_TRAIN_EPOCHS = float(os.environ.get("NUM_TRAIN_EPOCHS", "3"))
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "0"))
 GLOBAL_BATCH_SIZE = int(os.environ.get("GLOBAL_BATCH_SIZE", "32"))
+
+# `per_device_train_batch_size` is how many examples one process/GPU handles at
+# once. `WORLD_SIZE` is the number of training processes. Gradient accumulation
+# simulates a larger batch by adding gradients over several smaller forward/back
+# passes before one optimizer update.
 PER_DEVICE_TRAIN_BATCH_SIZE = int(os.environ.get("PER_DEVICE_TRAIN_BATCH_SIZE", "1"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 GRADIENT_ACCUMULATION_STEPS = int(
@@ -52,7 +75,20 @@ LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "1e-5"))
 MIN_LEARNING_RATE = float(os.environ.get("MIN_LEARNING_RATE", "1e-8"))
 WARMUP_RATIO = float(os.environ.get("WARMUP_RATIO", "0.1"))
 MIN_TRAINABLE_TOKENS = int(os.environ.get("MIN_TRAINABLE_TOKENS", "1"))
+
+# PyTorch cross entropy ignores labels with value -100. We use that to keep
+# prompt/tool-observation tokens visible to the model while excluding them from
+# the supervised loss.
+IGNORE_INDEX = -100
+
+# Computing logits for a 128k sequence all at once can spike memory. The custom
+# Trainer below projects hidden states through the LM head in chunks; this keeps
+# the same mathematical loss while lowering peak activation/logit memory.
 LOGIT_CHUNK_SIZE = int(os.environ.get("LOGIT_CHUNK_SIZE", "512"))
+
+# The direct-to-hero target is assistant action generation. Training on final
+# patches changes the task toward patch emission, so this stays an explicit
+# ablation switch rather than part of the default smoke path.
 INCLUDE_MODEL_PATCH = os.environ.get("INCLUDE_MODEL_PATCH", "0").lower() in {
     "1",
     "true",
@@ -145,6 +181,13 @@ def turn_segments(turn: object) -> list[tuple[str, bool]]:
 def example_segments(
     example: dict[str, object], *, include_model_patch: bool = INCLUDE_MODEL_PATCH
 ) -> list[tuple[str, bool]]:
+    """Serialize one raw SWE-Hero row into linear text/loss-mask segments.
+
+    Language models train on one token stream, not nested message dictionaries.
+    This helper flattens either `trajectory` or `messages` while preserving a
+    boolean that says whether each segment should become a supervised target.
+    """
+
     segments: list[tuple[str, bool]] = []
     trajectory = example.get("trajectory") or example.get("messages") or []
     if isinstance(trajectory, list):
@@ -155,6 +198,9 @@ def example_segments(
 
     patch = example.get("model_patch")
     if include_model_patch and patch:
+        # Final patches are plausible targets, but they are a different behavior
+        # from OpenHands action generation. Keeping this branch explicit prevents
+        # a smoke experiment from quietly training on a different task.
         segments.append(("<|assistant_final_patch|>\n", False))
         segments.append((_stringify(patch) + "\n", True))
 
@@ -168,30 +214,50 @@ def encode_example(
     max_length: int = MAX_LENGTH,
     include_model_patch: bool = INCLUDE_MODEL_PATCH,
 ) -> dict[str, list[int]] | None:
+    """Convert one serialized SWE trace into causal-LM input IDs and labels.
+
+    A causal language model learns next-token prediction: given token `n`, it is
+    trained to predict token `n+1`. The Hugging Face causal-LM model performs
+    that one-token shift internally, so this smoke script keeps input IDs and
+    labels aligned and only masks labels that should not contribute to loss.
+    """
+
     input_ids: list[int] = []
     labels: list[int] = []
 
     bos_token_id = getattr(tokenizer, "bos_token_id", None)
     if bos_token_id is not None:
+        # BOS marks the start of the sample. It helps preserve the base model's
+        # expected sequence shape, but it is not an assistant action to imitate.
         input_ids.append(bos_token_id)
-        labels.append(-100)
+        labels.append(IGNORE_INDEX)
 
     for text, is_trainable in example_segments(
         example, include_model_patch=include_model_patch
     ):
         token_ids = tokenizer.encode(text, add_special_tokens=False)
         input_ids.extend(token_ids)
-        labels.extend(token_ids if is_trainable else [-100] * len(token_ids))
+        # Non-trainable text remains part of the prompt context. Its labels are
+        # IGNORE_INDEX so cross entropy skips those positions.
+        labels.extend(token_ids if is_trainable else [IGNORE_INDEX] * len(token_ids))
 
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     if eos_token_id is not None:
         input_ids.append(eos_token_id)
-        labels.append(eos_token_id if labels and labels[-1] != -100 else -100)
+        # If the previous target was trainable, learning the end-of-sequence
+        # marker teaches the model when to stop that assistant output.
+        labels.append(
+            eos_token_id if labels and labels[-1] != IGNORE_INDEX else IGNORE_INDEX
+        )
 
+    # This smoke script truncates instead of failing closed because it is meant
+    # to find any runnable examples quickly. The production TorchTitan launcher
+    # rejects over-context examples by default so real training does not silently
+    # change the supervised target.
     input_ids = input_ids[:max_length]
     labels = labels[:max_length]
 
-    trainable_tokens = sum(label != -100 for label in labels)
+    trainable_tokens = sum(label != IGNORE_INDEX for label in labels)
     if trainable_tokens < MIN_TRAINABLE_TOKENS:
         return None
 
@@ -199,6 +265,13 @@ def encode_example(
 
 
 def effective_batch_config() -> dict[str, int]:
+    """Return the batch shape that controls optimizer-update frequency.
+
+    The ML-relevant batch size is not just the number of examples on one GPU.
+    Optimizer behavior depends on the effective global batch:
+    per-device batch * number of training processes * accumulation steps.
+    """
+
     samples_per_optimizer_step = (
         PER_DEVICE_TRAIN_BATCH_SIZE * WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS
     )
@@ -218,6 +291,14 @@ def build_cosine_with_min_lr_lambda(
     min_learning_rate: float = MIN_LEARNING_RATE,
     warmup_ratio: float = WARMUP_RATIO,
 ):
+    """Build the learning-rate multiplier used by the AdamW scheduler.
+
+    Warmup ramps the LR up gradually at the beginning, which reduces the chance
+    of destabilizing a pretrained transformer with a large first update. Cosine
+    decay then lowers the LR smoothly toward a non-zero floor so later updates
+    become smaller but training does not abruptly stop.
+    """
+
     min_lr_ratio = min_learning_rate / learning_rate
     warmup_steps = (
         max(1, math.ceil(total_steps * warmup_ratio))
@@ -245,6 +326,15 @@ def maybe_enable_yarn(
     max_length: int = MAX_LENGTH,
     enable_yarn: bool = ENABLE_YARN,
 ) -> None:
+    """Enable Qwen long-context positional scaling when the smoke exceeds 32k.
+
+    Qwen uses RoPE positional encodings, so token IDs alone do not tell the model
+    where a token appeared in the long trace. YaRN rescales those positional
+    encodings from the native 32k window to the requested context length. Both
+    `rope_scaling` and `rope_parameters` are written because different
+    Transformers/Qwen code paths have used different config field names.
+    """
+
     if not enable_yarn or max_length <= QWEN_NATIVE_CONTEXT_LENGTH:
         return
 
@@ -298,6 +388,10 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
+        # Decoder-only LMs often ship without a dedicated pad token because
+        # generation handles one sequence at a time. Batching variable-length
+        # training examples still needs a pad value, and reusing EOS is the
+        # standard safe fallback because padding positions are masked from loss.
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.model_max_length = max(MAX_LENGTH, PAPER_CONTEXT_LENGTH)
 
@@ -322,6 +416,9 @@ def main() -> None:
 
     batch_config = effective_batch_config()
     samples_per_optimizer_step = batch_config["effective_global_batch_size"]
+    # Trainer epochs are defined over `len(train_dataset)`. A tiny smoke subset
+    # can be smaller than one effective global batch, so we repeat examples until
+    # every optimizer step receives a complete accumulated batch.
     items_per_epoch = max(
         samples_per_optimizer_step,
         math.ceil(len(encoded_examples) / samples_per_optimizer_step)
@@ -331,6 +428,8 @@ def main() -> None:
         items_per_epoch = max(items_per_epoch, samples_per_optimizer_step * MAX_STEPS)
 
     class TinyDataset(torch.utils.data.Dataset):
+        """Repeat the small encoded subset to satisfy Trainer's epoch contract."""
+
         def __len__(self) -> int:
             return items_per_epoch
 
@@ -338,6 +437,13 @@ def main() -> None:
             return encoded_examples[idx % len(encoded_examples)]
 
     def collate(features: list[dict[str, list[int]]]) -> dict[str, torch.Tensor]:
+        """Pad a batch while preserving the loss mask.
+
+        `attention_mask` tells the transformer which positions are real tokens.
+        The label tensor is padded with IGNORE_INDEX so padding never contributes
+        to cross entropy.
+        """
+
         max_batch_len = max(len(feature["input_ids"]) for feature in features)
         input_ids = torch.full(
             (len(features), max_batch_len),
@@ -345,7 +451,9 @@ def main() -> None:
             dtype=torch.long,
         )
         attention_mask = torch.zeros((len(features), max_batch_len), dtype=torch.long)
-        labels = torch.full((len(features), max_batch_len), -100, dtype=torch.long)
+        labels = torch.full(
+            (len(features), max_batch_len), IGNORE_INDEX, dtype=torch.long
+        )
 
         for row, feature in enumerate(features):
             length = len(feature["input_ids"])
@@ -370,7 +478,13 @@ def main() -> None:
         attn_implementation="sdpa",
         trust_remote_code=True,
     ).to("cuda")
+    # KV cache speeds up autoregressive generation, but training uses full
+    # sequences and backpropagation. Disabling it avoids storing inference-only
+    # cache tensors.
     model.config.use_cache = False
+    # Gradient checkpointing discards intermediate activations during the forward
+    # pass and recomputes them during backward. That costs extra compute but is
+    # the practical memory tradeoff for long-context smoke runs.
     model.gradient_checkpointing_enable()
 
     steps_per_epoch = math.ceil(
@@ -403,6 +517,14 @@ def main() -> None:
     )
 
     class ChunkedCausalLMTrainer(Trainer):
+        """Trainer variant that computes long-context LM-head loss in chunks.
+
+        Hugging Face's default causal-LM loss projects every hidden state through
+        the vocabulary-sized LM head at once. At 128k context, that temporary
+        logits tensor can dominate memory. This keeps the transformer forward
+        pass intact, but slices the final projection/loss computation.
+        """
+
         def compute_loss(
             self,
             model,
@@ -411,8 +533,16 @@ def main() -> None:
             num_items_in_batch=None,
         ):
             labels = inputs.pop("labels")
+            # `model.model` is the transformer body. Calling it directly returns
+            # hidden states before the vocabulary projection, letting us apply
+            # `lm_head` in LOGIT_CHUNK_SIZE slices below.
             outputs = model.model(**inputs, use_cache=False)
             hidden_states = outputs.last_hidden_state
+
+            # Next-token prediction: hidden state at position i predicts the
+            # label at position i+1. The final hidden state has no next token, so
+            # it is dropped; the first label has no preceding hidden state, so it
+            # is dropped.
             shifted_hidden_states = hidden_states[:, :-1, :].reshape(
                 -1, hidden_states.shape[-1]
             )
@@ -423,7 +553,7 @@ def main() -> None:
             for start in range(0, shifted_hidden_states.shape[0], LOGIT_CHUNK_SIZE):
                 end = min(start + LOGIT_CHUNK_SIZE, shifted_hidden_states.shape[0])
                 label_chunk = shifted_labels[start:end]
-                valid_tokens = label_chunk.ne(-100).sum()
+                valid_tokens = label_chunk.ne(IGNORE_INDEX).sum()
                 if valid_tokens.item() == 0:
                     continue
 
@@ -431,11 +561,14 @@ def main() -> None:
                 loss_sum = loss_sum + torch.nn.functional.cross_entropy(
                     logits.float(),
                     label_chunk,
-                    ignore_index=-100,
+                    ignore_index=IGNORE_INDEX,
                     reduction="sum",
                 )
                 token_count = token_count + valid_tokens
 
+            # Average only over supervised assistant/action tokens. Prompt,
+            # observation, and padding labels were set to IGNORE_INDEX and are
+            # excluded from both `loss_sum` and `token_count`.
             loss = loss_sum / token_count.clamp_min(1)
             if return_outputs:
                 return loss, outputs
