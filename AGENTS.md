@@ -4,6 +4,14 @@ Build a prototype mid-training pipeline for a future 100B-500B open source codin
 
 The project started from a SWE-Hero reproduction, but it is now transitioning into a more general experiment pipeline. Do not introduce new hardcoded SWE-Hero assumptions into shared launchers, config parsing, data plumbing, or eval orchestration. Prefer preset-driven experiment definitions that can support additional trace sources, models, serving topologies, OpenHands versions, and graders.
 
+# ML Reader Notes
+
+- SFT means supervised fine-tuning: continue training a pretrained model so it imitates selected target text. In this repo, the target text is assistant/tool-action content from coding-agent traces; prompt text and tool observations usually stay in the context but are masked out of the loss.
+- SWE traces are execution records from coding tasks: repository state, prompts, model actions, shell/editor/tool calls, observations, and produced patches. They are not ordinary prompt/answer pairs, so filtering, ordering, and truncation decisions change what the model learns.
+- A context window is the number of tokens the model can read at once. Qwen2.5-Coder is native 32k context, while the direct-to-hero training/eval presets intentionally use 128k-class YaRN long-context settings. Changing context mode, RoPE/YaRN scaling, or vLLM max length changes the ML experiment.
+- One rollout per task is a data-weighting choice. Keeping multiple attempts for the same `instance_id` would over-weight that task during SFT and would no longer match the paper's described setup.
+- vLLM serves the model behind an OpenAI-compatible API; OpenHands is the coding-agent harness; SWE-bench is the grader. Do not treat those as interchangeable runtime pieces when changing eval presets.
+
 # Mode
 
 Ship prototype ASAP: skip post-task validation, parent-branch merges, and PR ceremony unless explicitly asked. When done, commit task changes and push the current branch.
