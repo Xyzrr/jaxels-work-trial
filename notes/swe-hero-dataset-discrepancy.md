@@ -1,32 +1,36 @@
 # SWE-Hero Dataset Row-Count Discrepancy
 
-Date investigated: 2026-05-21
+Investigated: 2026-05-21
 
-## Question
+## Summary
 
-The SWE-ZERO to SWE-HERO paper reports a SWE-HERO training set of 13.2k execution-based trajectories, but the linked Hugging Face dataset currently exposes 34,269 rows. We need to know whether the exact 13.2k rows used in the paper can be recovered from the public artifact.
+The exact 13.2k-row SWE-HERO paper training set cannot be recovered from the
+public Hugging Face artifact alone.
 
-## Reader Vocabulary
+What the evidence shows:
 
-These terms determine why the row counts below matter for training:
+- The paper reports about 13.2k execution-based trajectories generated as one
+  rollout per task instance.
+- The public `nvidia/SWE-Hero-openhands-trajectories` dataset observed during
+  the investigation exposed 34,269 rows over 11,766 unique `instance_id` values.
+- Every public data-bearing revision is a 32k-36k row multi-rollout pool. None
+  has about 13.2k rows or about 13.2k unique instances.
+- The local training approximation is
+  `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`: the earliest
+  public upload reduced to one rollout per task, then context-capped to 12,617
+  rows.
 
-- A task instance, stored as `instance_id`, is one coding problem plus its
-  repository/test environment. If the same `instance_id` appears three times,
-  the model would see three attempts at the same problem, not three independent
-  problems.
-- A rollout or trajectory is one full OpenHands attempt at solving one task:
-  prompts, assistant actions, tool calls, tool observations, and usually a
-  produced patch. Supervised fine-tuning (SFT) turns the assistant portions of
-  those traces into next-token targets.
-- Execution-based means the data came from an agent interacting with an actual
-  repository environment, rather than from a hand-written instruction/answer
-  pair. That makes the traces valuable, but also makes provenance important
-  because tool failures, duplicate attempts, and over-long contexts change what
-  the model learns.
-- One rollout per task is an ML weighting decision. It keeps every retained
-  task roughly equally represented. Training on all public rollouts would
-  over-weight tasks with multiple attempts and would no longer match the paper's
-  described data distribution.
+For shared ML vocabulary such as SFT, rollout, context window, and one rollout
+per task, see [`../AGENTS.md`](../AGENTS.md).
+
+## Why It Matters
+
+This is a training-data weighting issue, not a cosmetic row-count mismatch.
+Training on all public rows would overweight tasks with multiple attempts. A
+synthetic 13.2k slice, such as the first 13,200 rows, would also preserve
+duplicate rollouts and change the source/repo distribution.
+
+The only faithful fix is a row-level paper manifest from the authors.
 
 ## Paper Claims
 
@@ -34,29 +38,29 @@ Source: arXiv `2604.01496`, v2 dated 2026-05-06.
 
 Relevant claims:
 
-- The SWE-HERO stage is described as a refined collection of about 13k trajectories across about 13k task instances.
-- The task collection section says 13.5k instances had containerized Docker environments and were verified by executing reference patches.
-- The SWE-HERO trajectory collection says the authors generated a single rollout per task instance.
-- The corpus composition section says the final SWE-HERO set comprises 13.2k execution-based trajectories after the filtering protocol.
-- The same paragraph says they did not exclude SWE-HERO trajectories based on task-resolution success because the SWE-HERO dataset is smaller.
+- SWE-HERO is described as about 13k trajectories across about 13k task
+  instances.
+- 13.5k instances had containerized Docker environments and verified reference
+  patches.
+- The authors generated a single rollout per task instance.
+- The final SWE-HERO set is 13.2k execution-based trajectories after filtering.
+- SWE-HERO trajectories were not excluded based on task-resolution success.
 
-This implies the paper training set should be approximately one trajectory per retained task instance, not three trajectories for most task instances. That difference is not cosmetic: duplicate trajectories for a task change the effective training weights and can teach the model to imitate repeated attempts at the same issue.
-
-## Public Hugging Face Dataset
+## Public Dataset Evidence
 
 Dataset: `nvidia/SWE-Hero-openhands-trajectories`
 
-Current main revision observed:
+Observed public main revision:
 
 - SHA: `150bc119e52c647216fce285fd801f16b6fd745b`
 - Last modified: 2026-05-08T17:10:16Z
-- Public refs: `main` and `refs/convert/parquet`; no tags or alternative public branches were present via `git ls-remote`.
-- Dataset card reports:
-  - Total issues: 11,766
-  - Total trajectories: 34,269
-  - Sources: `SWE-Gym/SWE-Gym`, `R2E-Gym/R2E-Gym-Subset`, `nebius/SWE-rebench`
+- Public refs: `main` and `refs/convert/parquet`; no public tags or alternative
+  branches were present via `git ls-remote`.
+- Dataset card: 11,766 total issues, 34,269 total trajectories.
+- Sources: `SWE-Gym/SWE-Gym`, `R2E-Gym/R2E-Gym-Subset`,
+  `nebius/SWE-rebench`
 
-Direct parquet query of current main confirms:
+Direct parquet query of that revision:
 
 | Metric | Count |
 | --- | ---: |
@@ -66,7 +70,7 @@ Direct parquet query of current main confirms:
 | Instances with 2 trajectories | 371 |
 | Instances with 3 trajectories | 11,066 |
 
-Current source breakdown:
+Source breakdown:
 
 | `dataset` value | Rows | Unique instances | Unique repos |
 | --- | ---: | ---: | ---: |
@@ -75,7 +79,7 @@ Current source breakdown:
 | `SWE-Gym/SWE-Gym-Raw` | 3,990 | 1,397 | 10 |
 | `SWE-Gym/SWE-Gym` | 1,869 | 666 | 1 |
 
-Current license breakdown:
+License breakdown:
 
 | License | Rows | Unique instances |
 | --- | ---: | ---: |
@@ -93,7 +97,7 @@ The dataset repo was created after the v1 paper submission:
 - HF dataset initial commit: 2026-04-17
 - First data upload: 2026-04-20
 
-Historical parquet object counts from the public `main` history:
+Historical parquet object counts from public `main` history:
 
 | Date | Commit | Files | Rows | Unique instances | Instances by trajectory count |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -104,94 +108,87 @@ Historical parquet object counts from the public `main` history:
 | 2026-05-01 | `7ec4ffc` | 14 | 34,269 | 11,766 | 1:329, 2:371, 3:11,066 |
 | 2026-05-08 | `150bc11` | 14 | 34,269 | 11,766 | 1:329, 2:371, 3:11,066 |
 
-None of the public data-bearing revisions contains about 13.2k rows. None contains about 13.2k unique instances either. The closest public one-trajectory-per-instance candidate is the earliest upload at 12,633 unique instances, still 567 instances short of 13.2k and with a broader/noisier license set than the current card.
+None of these revisions contains about 13.2k rows or 13.2k unique instances.
+The closest one-trajectory-per-instance candidate is the earliest upload at
+12,633 unique instances, still 567 short of 13.2k.
 
-The May 1 morning upload (`fdabc1a`) also appears to have a different or incorrect `dataset` column convention: grouping by `dataset` yields repository names rather than the source labels used in current main. That is another signal that the public artifact was being iterated after the paper, not a frozen paper-training manifest.
+The May 1 morning upload (`fdabc1a`) also appears to have a different
+`dataset` column convention: grouping by `dataset` yields repository names
+rather than the source labels used in current main. That suggests the public
+artifact was still being cleaned after the paper, not frozen as the paper SFT
+manifest.
 
-## Likely Explanation
+## Interpretation
 
-The current 34.2k-row public dataset is best understood as a multi-rollout public pool over 11.8k task instances, not as the final 13.2k paper training set.
+The current public dataset is best understood as a multi-rollout public pool
+over about 11.8k task instances, not the final 13.2k paper training set.
 
-Reasons:
+Most plausible sequence:
 
-1. The paper says SWE-HERO generated a single rollout per task instance, but current public main has three trajectories for 11,066 of 11,766 instances.
-2. The paper says 13.5k Docker-backed instances were the SWE-HERO foundation and 13.2k trajectories remained after filtering. Public main has only 11,766 unique instances.
-3. The dataset repo did not exist publicly until after the paper's v1 submission, and every public data upload is a 32k-36k row multi-rollout corpus.
-4. Public revisions show active post-paper changes in counts, license filtering, source breakdown, and at least one column convention.
-5. The public rows do not include enough provenance to reverse-engineer the paper's exact selection, such as rollout ordinal/seed, exact source dataset revisions, task whitelist, reference-patch verification result, filter flags, test-patch metadata, or a final SFT manifest.
+1. Internal paper run: one rollout per Docker-backed task, filtered to about
+   13.2k trajectories.
+2. Public release: a broader multi-rollout trajectory pool was exported after
+   the paper submission.
+3. Public follow-up edits changed counts, license filtering, source breakdown,
+   schema/card details, and at least one column convention.
 
-The most plausible story is:
+The public rows lack enough provenance to reconstruct the exact paper subset:
+rollout ordinal/seed, exact source revisions, task whitelist,
+reference-patch-verification result, filter flags, test-patch metadata, and
+final SFT manifest are missing.
 
-- Internal paper run: one rollout per Docker-backed task, filtered to about 13.2k trajectories.
-- Public release: later exported a broader multi-rollout trajectory pool, then further edited it for licensing/source/schema/card cleanup.
+## Local Approximation
 
-## Can We Recover The Exact 13.2k Rows?
+Use this artifact only with an explicit caveat that it is not the exact paper
+training set.
 
-Not from the current public information.
-
-The exact paper set requires a row-level manifest from the authors, ideally keyed by:
-
-- `instance_id`
-- `trajectory_id`
-- source dataset and source revision
-- OpenHands/version or trajectory-generation revision
-- filtering decisions
-
-Without that, any 13.2k subset we create from the 34,269 public rows would be invented. In particular, taking the first 13,200 rows is invalid because it preserves duplicate rollouts for early instances and changes the source/repo distribution.
-
-## Best Public Approximation Options
-
-Use one of these only with an explicit caveat that it is not the exact paper training set.
-
-A deterministic tie-breaker is required for either approximation. Without one,
-two rebuilds from the same public pool could pick different rollouts for the
-same task and produce different SFT targets.
-
-1. Current canonical public approximation:
-   - Pin revision `150bc119e52c647216fce285fd801f16b6fd745b`.
-   - Select one trajectory per `instance_id` with a declared deterministic tie-breaker.
-   - Result: 11,766 trajectories.
-   - Pros: matches the current public dataset card and license cleanup.
-   - Cons: materially smaller than the paper's 13.2k and cannot reproduce the paper training set.
-
-2. Largest historical public unique-instance approximation:
-   - Pin revision `5b2ed21270ad773a50163e2999c510f0cbb92cfa`.
-   - Select one trajectory per `instance_id` with a declared deterministic tie-breaker.
-   - Result: 12,633 trajectories.
-   - Pros: closest public unique-instance count.
-   - Cons: still not 13.2k, uses an early post-paper upload, and includes license labels later removed from the public card/current data.
-
-Implemented local preparation workflow:
+Raw one-rollout approximation:
 
 - Script: `scripts/prepare_swehero_historical_one_rollout.py`
-- Default output: `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`
 - Source revision: `5b2ed21270ad773a50163e2999c510f0cbb92cfa`
-- Output shape from the 2026-05-21 run: 12,633 selected rows from 35,934 public rows and 12,633 unique instances.
+- Output: `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`
+- 2026-05-21 shape: 12,633 selected rows from 35,934 public rows; 12,633 unique
+  instances.
 - Training path: pass the output directory as `--dataset-id`.
 
-The script applies the paper filters observable from public columns and records
-the missing `test_patch`-overlap filter caveat in the generated `metadata.json`.
+The script applies paper filters visible in public columns and records the
+missing `test_patch`-overlap filter caveat in generated `metadata.json`.
 
-Implemented context-capped training artifact:
-
-The context-capped refresh exists because long agent traces can exceed the
-model's training window. In causal language-model training, the model reads a
-sequence of tokens and predicts the next token; after that one-token shift, the
-input length still must fit the configured context window. Rows that exceed the
-131,072-token shifted-input cap would either fail training or require
-truncation. Truncation is not used here because it can remove earlier tool
-observations or the final assistant action, changing the supervised target.
+Context-capped training artifact:
 
 - Script: `scripts/refresh_swehero_context_capped_one_rollout.py`
-- Default input/output: `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`
-- Tokenization contract: Qwen2.5-Coder ChatML over OpenHands messages, matching `scripts/qwen_swehero_train.py`; model patches are not appended by default.
-- Context cap: shifted input length must be `<= 131,072` tokens, equivalent to the 128k paper training context.
-- Selection rule for over-context rows: among same-task rollouts that pass the same public-column filters and fit the context cap, choose the lowest `str_replace_editor` error count, then lowest assistant turn count, then earliest source row index.
-- Output shape from the 2026-05-22 refresh: 12,617 selected rows. The raw artifact had 39 over-context selected rows; 23 were replaced with fitting same-task rollouts and 16 tasks were excluded because no accepted same-task rollout fit the context cap.
-- Verification from a streaming recomputation over the final Parquet shards: 12,617 rows, 12,617 unique `instance_id` values, zero rows over context, max shifted input length 130,126, and zero manifest length mismatches.
-- Exact replacement/exclusion details are recorded in `context_filter_report.json`.
+- Input/output: `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`
+- Tokenization: Qwen2.5-Coder ChatML over OpenHands messages, matching
+  `scripts/qwen_swehero_train.py`; model patches are not appended by default.
+- Context cap: shifted input length must be `<= 131,072` tokens.
+- Replacement rule: for over-context selected rows, choose a fitting same-task
+  rollout by lowest `str_replace_editor` error count, then lowest assistant turn
+  count, then earliest source row index.
+- 2026-05-22 shape: 12,617 selected rows. Of 39 over-context selected rows, 23
+  were replaced and 16 tasks were excluded.
+- Verification: 12,617 rows, 12,617 unique `instance_id` values, zero
+  over-context rows, max shifted input length 130,126, and zero manifest length
+  mismatches.
+- Audit file: `context_filter_report.json`
 
-Tasks excluded by the 2026-05-22 context refresh:
+The training workflow consumes this artifact as documented in
+[`../docs/swehero_torchtitan_pod.md`](../docs/swehero_torchtitan_pod.md).
+
+## Public Approximation Options
+
+| Option | Revision | One-rollout result | Use when | Caveat |
+| --- | --- | ---: | --- | --- |
+| Current public main | `150bc119e52c647216fce285fd801f16b6fd745b` | 11,766 | Matching the current dataset card and license cleanup matters most. | Materially smaller than the paper set. |
+| Earliest public upload | `5b2ed21270ad773a50163e2999c510f0cbb92cfa` | 12,633 | Closest public unique-instance count matters most. | Still not 13.2k; early post-paper upload with broader/noisier license labels. |
+
+A deterministic tie-breaker is required for either option. Without one, two
+rebuilds from the same public pool could pick different rollouts for the same
+task and produce different SFT targets.
+
+## Excluded Context-Refresh Tasks
+
+These 16 tasks had no accepted same-task rollout that fit the 131,072-token
+shifted-input cap during the 2026-05-22 refresh:
 
 ```text
 juanifioren__django-oidc-provider-329
@@ -214,7 +211,8 @@ streamlink__streamlink-3131
 
 ## Request To Authors
 
-If we need the exact paper rows, ask NVIDIA for the training manifest rather than another natural-language clarification.
+If exact reproduction is required, ask NVIDIA for the row-level training
+manifest rather than another natural-language clarification.
 
 Suggested request:
 

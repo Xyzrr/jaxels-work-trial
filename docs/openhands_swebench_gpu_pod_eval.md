@@ -1,117 +1,116 @@
 # OpenHands And SWE-Lego SWE-bench Eval on the GPU Pod
 
-This eval workflow is no longer SWE-Hero-only. It is the shared GPU-pod path
-for SWE-bench-style coding eval experiments that can choose different
-OpenHands stacks, model-serving contracts, and graders through presets.
+## Overview
 
-The canonical path is a single privileged `midtraining-dev` GPU pod that runs:
+This is the shared GPU-pod runbook for SWE-bench-style coding evals. It is no
+longer SWE-Hero-only: presets choose the OpenHands stack, model-serving
+topology, context contract, and grader.
 
-- one Qwen2.5-Coder-7B vLLM replica per GPU plus a pod-local router for the
-  existing SWE-Hero eval presets; or
-- one 8-way tensor-parallel vLLM server without the router for the SWE-Lego
-  Qwen3 preset;
-- OpenHands inference through the preset-selected eval stack;
-- Dockerized SWE-bench grading through either OpenHands' bundled grader path
-  or SWE-Lego's vendored `SWE-bench-4.0.4` checkout.
+Use this document when launching or reproducing evals. For project-wide
+vocabulary and configuration rules, see [`../AGENTS.md`](../AGENTS.md).
 
-Eval concepts used throughout this runbook:
+The canonical runtime is the privileged `midtraining-dev` pod. Do not run
+OpenHands, vLLM, or SWE-bench grading from the laptop.
 
-- SWE-bench eval asks an agent to modify real repositories and then grades the
-  produced patch against hidden tests. A pass@1 score means each task gets one
-  agent attempt; the metric is the fraction of tasks solved by that first
-  attempt.
-- OpenHands is the coding agent harness. It turns a SWE-bench task into a loop
-  of model messages, shell/editor/tool actions, and repository observations.
-  The model server only predicts the next assistant action; OpenHands decides
-  how to execute that action and when to stop.
-- vLLM is the local model-serving layer that exposes an OpenAI-compatible API.
-  It is not the grader or the agent. It controls GPU memory use, context length,
-  batching, precision, and whether model weights are split across GPUs.
-- Tensor parallelism splits one model replica across multiple GPUs. Multiple
-  replicas instead run independent copies on different GPUs. The Qwen2.5 evals
-  use one 7B replica per GPU for throughput, while the SWE-Lego Qwen3 preset
-  uses one 8-way tensor-parallel replica because that reproduction contract
-  serves a long-context Qwen3 model across all GPUs.
-- Native tool calling means the model returns structured `tool_calls` JSON
-  rather than free-form text. For OpenHands/SWE-bench this matters because an
-  apparently fluent answer is useless unless the harness can execute the model's
-  intended shell/editor action.
-- A context mode is the joint contract among tokenizer limits, vLLM
-  `--max-model-len`, and any RoPE/YaRN long-context scaling. Changing it changes
-  what the model can read during a task, so it is an eval variable, not just an
-  implementation detail.
+## Quick Commands
 
-Use `scripts/run_midtraining_pod.py eval` and
-`scripts/run_midtraining_pod.py prebuild` from the workstation checkout. The
-meta-wrapper pushes the current clean branch, enters `midtraining-dev` with
-`tmp/pod-creds/kubeconfig.yaml`, sets the legacy `SWEHERO_POD_GIT_BRANCH`
-runtime variable inside the pod, and starts the lower-level pod wrapper from
-`/workspace/jaxels-work-trial`. Do not run OpenHands or SWE-bench from the
-laptop.
+Prebuild OpenHands runtime images:
 
-The workstation wrapper is a Python `uv` entrypoint. Run it directly as shown
-or through `uv run`; do not add shell launchers for new eval or prebuild
-workflows.
+```bash
+scripts/run_midtraining_pod.py prebuild
+```
 
-## Configuration Presets
+Run a one-instance smoke:
 
-Eval experiment settings live in argparse preset files under `configs/eval/`.
-The pod launcher defaults to:
+```bash
+scripts/run_midtraining_pod.py eval --eval-limit 1
+```
+
+Run the full default SWE-bench Verified pass@1 eval:
+
+```bash
+scripts/run_midtraining_pod.py eval
+```
+
+Run preflight checks only:
+
+```bash
+scripts/run_midtraining_pod.py eval --preflight-only --foreground
+```
+
+Launch without attaching:
+
+```bash
+scripts/run_midtraining_pod.py --no-tty eval --eval-limit 1 --no-attach
+```
+
+## Runtime Shape
+
+`scripts/run_midtraining_pod.py eval` and
+`scripts/run_midtraining_pod.py prebuild` are workstation `uv` Python
+entrypoints. The meta-wrapper pushes the current clean branch, enters
+`midtraining-dev` with `tmp/pod-creds/kubeconfig.yaml`, sets the legacy
+`SWEHERO_POD_GIT_BRANCH` runtime variable inside the pod, and starts the
+lower-level pod wrapper from `/workspace/jaxels-work-trial`.
+
+The pod then runs one of these serving contracts:
+
+- Current Qwen2.5 presets: one vLLM replica per GPU plus a pod-local router.
+- SWE-Lego Qwen3 preset: one 8-way tensor-parallel vLLM server, no router.
+
+Inference runs through the preset-selected OpenHands stack. Grading runs
+through either OpenHands' bundled SWE-bench path or SWE-Lego's vendored
+`SWE-bench-4.0.4` checkout.
+
+## Presets
+
+Eval settings live in `configs/eval/*.args`. The default preset is:
 
 ```text
 configs/eval/openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args
 ```
 
-That preset encodes the paper-aligned Qwen2.5-Coder-7B SWE-bench Verified
-pass@1 eval: local model path, served model name, OpenHands settings, sampling,
-128k YaRN context, vLLM sizing, and the 4096-token per-turn output cap used for
-structured tool-call stability. The Python entrypoint also accepts `@...`
-argparse files directly, but canonical pod launches should pass presets with
-`--config PATH`.
+It encodes the paper-aligned Qwen2.5-Coder-7B SWE-bench Verified pass@1 eval:
+model path, served model name, OpenHands settings, sampling, 128k YaRN context,
+vLLM sizing, and the 4096-token per-turn output cap used for structured
+tool-call stability.
 
-For a different eval, copy a preset, edit the copied file, and swap the
-`--config` path. Use primitive CLI flags after the preset only for one-off run
-controls such as `--eval-limit`, `--eval-ids`, `--output-dir`,
-`--preflight-only`, and `--skip-swebench-eval`. Do not add convenience aliases
-for those flags.
+Supported presets:
 
-The current supported presets are:
+| Preset | Purpose |
+| --- | --- |
+| `openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args` | Default Qwen2.5-Coder-7B Instruct eval through upstream OpenHands. |
+| `openhands-swebench-verified-qwen25-coder-7b-base-native-32k.args` | Released Qwen2.5-Coder-7B base model in native 32k context. |
+| `openhands-swebench-verified-qwen25-coder-7b-base-paper-yarn-128k.args` | Released Qwen2.5-Coder-7B base model with paper-style 128k YaRN serving. |
+| `openhands-swebench-verified-swe-lego-qwen3-8b.args` | SWE-Lego Qwen3-8B reproduction through the vendored SWE-Lego stack. |
 
-- `openhands-swebench-verified-qwen25-coder-7b-paper-yarn-128k.args`: current
-  SWE-Hero-style Qwen2.5-Coder-7B Instruct eval through upstream OpenHands.
-- `openhands-swebench-verified-qwen25-coder-7b-base-native-32k.args`: released
-  Qwen2.5-Coder-7B base model in its native 32k context window.
-- `openhands-swebench-verified-qwen25-coder-7b-base-paper-yarn-128k.args`:
-  released Qwen2.5-Coder-7B base model with the paper-style 128k YaRN serving
-  contract.
-- `openhands-swebench-verified-swe-lego-qwen3-8b.args`: SWE-Lego Qwen3-8B
-  reproduction through the vendored SWE-Lego eval stack.
+For a new eval, copy a preset, edit the copy, and pass it with `--config PATH`.
+Use primitive CLI flags after the preset only for run controls such as
+`--eval-limit`, `--eval-ids`, `--output-dir`, `--preflight-only`, and
+`--skip-swebench-eval`.
 
-New eval experiments should add a new preset and, when necessary, a narrowly
-scoped stack adapter. Keep shared launcher behavior selected by explicit
-preset arguments such as `--eval-stack`, `--context-mode`,
-`--vllm-server-count`, and grader flags. Do not infer stack behavior from model
-names or from the historical SWE-Hero defaults.
+New shared launcher behavior must be selected by explicit preset arguments such
+as `--eval-stack`, `--context-mode`, `--vllm-server-count`, and grader flags.
+Do not infer stack behavior from model names or historical SWE-Hero defaults.
 
-Environment variables are reserved for secrets and pod/runtime plumbing:
+Environment variables are only for secrets and pod/runtime plumbing:
 `LLM_API_KEY`, `WORKSPACE_ROOT`, `VLLM_VENV`, `VLLM_REQUIREMENTS_PATH`,
 `VLLM_FORCE_RESTART`, `VLLM_VISIBLE_DEVICES`, `EVAL_VENV`,
 `VLLM_NCCL_CUMEM_ENABLE`, `OPENHANDS_EVAL_POETRY_VERSION`,
-`REQUIRED_GPU_COUNT`, and tmux/uv path controls. The API key is env-only; set
-`LLM_API_KEY` when the default `local-llm` key is not appropriate. The
-meta-wrapper owns the branch synchronization contract and forwards selected
-runtime environment variables to the pod. `SWEHERO_POD_GIT_BRANCH` remains a
-pod-side legacy compatibility name; do not add new SWE-Hero-prefixed env vars
-for general eval controls.
+`REQUIRED_GPU_COUNT`, and tmux/uv path controls.
+
+`LLM_API_KEY` is env-only; set it when the default `local-llm` key is not
+appropriate. `SWEHERO_POD_GIT_BRANCH` remains a pod-side legacy compatibility
+name; do not add new SWE-Hero-prefixed env vars for general eval controls.
 
 ## Pod Requirement
 
 `midtraining-dev` must be created from `manifests/midtraining-hostpath.yaml`.
-That manifest makes the GPU pod privileged, installs Docker plus Buildx, and
+The manifest makes the pod privileged, installs Docker plus Buildx, and
 persists Docker state under `/workspace/pod-docker-data/midtraining-dev`.
 
-Pod security settings are immutable. If an older `midtraining-dev` pod is
-already running without privilege, recreate it before launching this eval:
+Pod security settings are immutable. If an older pod is already running without
+privilege, recreate it:
 
 ```bash
 KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
@@ -122,83 +121,81 @@ KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
   kubectl wait -n midtraining --for=condition=Ready pod/midtraining-dev --timeout=600s
 ```
 
-The launcher intentionally runs both:
+The launcher verifies Docker with both:
 
 ```bash
 docker run --rm hello-world:latest
 docker buildx version
 ```
 
-`docker info` alone is not enough for this workflow because an unprivileged pod
-can report a reachable daemon while still failing container execution.
+`docker info` alone is insufficient because an unprivileged pod can expose a
+daemon while still failing container execution.
 
-## Prebuild Runtime Images
+## Image Prebuild
 
-Prebuild the per-task OpenHands runtime images before eval:
+Prebuild runtime images before eval:
 
 ```bash
 scripts/run_midtraining_pod.py prebuild
 ```
 
-For the SWE-Lego stack, prebuild against its vendored `OpenHands-0.53.0` by
-passing the SWE-Lego preset:
+For SWE-Lego, prebuild against its vendored `OpenHands-0.53.0`:
 
 ```bash
 scripts/run_midtraining_pod.py prebuild \
   --config configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args
 ```
 
-The script runs in tmux session `openhands-swebench-image-prebuild`, logs to
-`/workspace/runlogs/openhands-swebench-image-prebuild.log`, and a rerun attaches
-to the existing session. Pass `--replace-session` to kill that tmux session and
-launch a fresh prebuild instead. It inspects the final OpenHands runtime image
-tag before every build, so already-built images are skipped. Missing runtime
-images build in parallel; use `--parallel-builds N` to tune concurrency, or
-`--parallel-builds 1` to force the old serial behavior. Use `--eval-limit N`
-only for a small prebuild smoke. The launcher also writes
-`/workspace/runlogs/openhands-swebench-image-prebuild.context.json`; reruns with
-the same session name must match that stored launch context unless
+Prebuild runs in tmux session `openhands-swebench-image-prebuild` and logs to
+`/workspace/runlogs/openhands-swebench-image-prebuild.log`. A rerun attaches to
+the existing session. Pass `--replace-session` to kill that session and start a
+fresh prebuild.
+
+The launcher skips already-built final OpenHands runtime image tags. Missing
+images build in parallel; use `--parallel-builds N` to tune concurrency or
+`--parallel-builds 1` for serial behavior. Use `--eval-limit N` only for a
+small prebuild smoke.
+
+The launcher writes
+`/workspace/runlogs/openhands-swebench-image-prebuild.context.json`. Reruns
+with the same session name must match that stored launch context unless
 `--replace-session` is set.
 
-## Smoke Command
+## Default Eval Runs
 
-Run a one-instance smoke:
+Smoke:
 
 ```bash
 scripts/run_midtraining_pod.py eval --eval-limit 1
 ```
 
-For a non-attached launch:
-
-```bash
-scripts/run_midtraining_pod.py --no-tty eval --eval-limit 1 --no-attach
-```
-
-The launcher creates a tmux session named
-`openhands-swebench-eval-<timestamp>` by default and writes the transcript to
-`/workspace/runlogs/<session>.log`.
-
-## Full Pass@1 Command
-
-Run the full SWE-bench Verified split:
+Full pass@1:
 
 ```bash
 scripts/run_midtraining_pod.py eval
 ```
 
+The eval launcher creates tmux session `openhands-swebench-eval-<timestamp>` by
+default and writes `/workspace/runlogs/<session>.log`.
+
+For a healthy Qwen2.5 smoke, preflight should show `used_real_tools: true` and
+structured `tool_calls` before pass@1 is reported. Later `loop_errors` describe
+the sampled model trajectory quality; they are not by themselves evidence that
+vLLM returned plain text instead of tool calls.
+
 ## SWE-Lego Eval
 
-The SWE-Lego reproduction preset is:
+The SWE-Lego preset is:
 
 ```text
 configs/eval/openhands-swebench-verified-swe-lego-qwen3-8b.args
 ```
 
-It switches the eval stack from upstream OpenHands to the cloned
-`SWE-Lego/SWE-Lego` repository at commit
-`94704b69aac886e003660e1e0f69f7de163b284e`. In that checkout the launcher uses
-`OpenHands-0.53.0` for inference and installs `SWE-bench-4.0.4` for grading.
-The model-serving contract is the SWE-Lego Qwen3 contract:
+It switches from upstream OpenHands to the cloned `SWE-Lego/SWE-Lego` repo at
+commit `94704b69aac886e003660e1e0f69f7de163b284e`. That stack uses
+`OpenHands-0.53.0` for inference and vendored `SWE-bench-4.0.4` for grading.
+
+SWE-Lego Qwen3 serving contract:
 
 ```text
 --model-id SWE-Lego/SWE-Lego-Qwen3-8B
@@ -221,19 +218,20 @@ The model-serving contract is the SWE-Lego Qwen3 contract:
 --swebench-max-workers 10
 ```
 
-The Qwen3 long-context settings are taken from the model's own `config.json`.
-Do not add the Qwen2.5 YaRN `--rope-scaling` override to this preset.
+Do not add the Qwen2.5 YaRN `--rope-scaling` override to this preset; the
+Qwen3 long-context settings come from the model `config.json`.
+
+SWE-Lego intentionally differs from current Qwen2.5 OpenHands presets by not
+forcing native tool calling or `tool_choice=required`, preserving
+`NUM_WORKERS=24`, and grading with `--cache_level instance --timeout 500
+--max_workers 10`. Treat those as reproduction-contract settings, not global
+defaults.
+
 For multi-GPU vLLM servers, the launcher sets `NCCL_CUMEM_ENABLE=1` by default
-because the pod's default `/dev/shm` is too small for NCCL's per-rank shared
-memory segments when vLLM disables cuMem.
+because the pod's `/dev/shm` is too small for NCCL per-rank shared-memory
+segments when vLLM disables cuMem.
 
-SWE-Lego also intentionally differs from the current Qwen2.5 OpenHands presets
-by not forcing native tool calling or `tool_choice=required`, by preserving
-`NUM_WORKERS=24`, and by grading with `--cache_level instance --timeout 500
---max_workers 10`. Treat these as part of the preset's reproduction contract,
-not as global defaults for future evals.
-
-Run SWE-Lego-Qwen3-8B on the 16-task infrastructure check set with:
+Run the 16-task SWE-Lego infrastructure check:
 
 ```bash
 eval_ids="django__django-13670,django__django-12663,scikit-learn__scikit-learn-14983,django__django-13279,sphinx-doc__sphinx-7757,django__django-14434,django__django-11999,scikit-learn__scikit-learn-25232,sympy__sympy-15599,astropy__astropy-14309,scikit-learn__scikit-learn-25973,sphinx-doc__sphinx-8551,django__django-12155,sphinx-doc__sphinx-11510,scikit-learn__scikit-learn-13439,django__django-15503"
@@ -243,8 +241,9 @@ scripts/run_midtraining_pod.py eval \
   --run-id swe-lego-qwen3-8b-16task
 ```
 
-After OpenHands finishes, the wrapper converts its `output.jsonl` with the
-vendored OpenHands SWE-bench converter and then runs:
+After OpenHands finishes, the wrapper converts `output.jsonl` with the vendored
+OpenHands SWE-bench converter and runs this from the SWE-Lego
+`SWE-bench-4.0.4` environment:
 
 ```text
 python -m swebench.harness.run_evaluation \
@@ -253,13 +252,12 @@ python -m swebench.harness.run_evaluation \
   --max_workers 10
 ```
 
-from the SWE-Lego `SWE-bench-4.0.4` environment. The final run report is copied
-to `<output-dir>/swebench-results/run_report.json`.
+The final report is copied to `<output-dir>/swebench-results/run_report.json`.
 
 ## Base Model Eval Modes
 
-For a full base-model comparison against an SFT checkpoint, run both base
-context modes with explicit run IDs:
+Run both base context modes when comparing a base model against an SFT
+checkpoint:
 
 ```bash
 scripts/run_midtraining_pod.py eval \
@@ -273,55 +271,40 @@ scripts/run_midtraining_pod.py eval \
   --run-id qwen25-coder7b-base-yarn128k-pass1
 ```
 
-The preset's `--context-mode` controls the eval context contract:
+Context modes:
 
-- `base-native-32k`: evaluates the released base model inside its native
-  32,768-token context window. vLLM starts with `--max-model-len 32768`, no
-  YaRN `--rope-scaling`, and OpenHands is configured with
-  `max_input_tokens = 32768`. This is the clean "as shipped" base baseline.
-  Because OpenHands 0.62.0 sends `max_output_tokens` to the model while its
-  `max_input_tokens` field is not a hard truncation mechanism, this mode may
-  surface real native-context request failures on longer trajectories.
-- `base-paper-yarn-128k`: evaluates the same base model with the paper-style
-  131,072-token context budget. vLLM starts with `--max-model-len 131072` plus
-  YaRN rope scaling from the native 32k window, and OpenHands is configured
-  with `max_input_tokens = 131072`. This is the context-matched base control.
-- `paper-yarn-128k`: the default for SFT/checkpoint evals that are meant to
-  match the paper's 128k OpenHands setup.
-- `swe-lego-qwen3-160k`: evaluates `SWE-Lego/SWE-Lego-Qwen3-8B` with
-  OpenHands `max_input_tokens = 147456` and vLLM
-  `--max-model-len 163840`, relying on the model-provided Qwen3 long-context
-  config instead of a Qwen2.5 YaRN override.
+| Mode | Contract |
+| --- | --- |
+| `base-native-32k` | Released base model at native 32,768-token context: `--max-model-len 32768`, no YaRN, OpenHands `max_input_tokens = 32768`. This may expose real native-context request failures on longer trajectories. |
+| `base-paper-yarn-128k` | Same base model with paper-style 131,072-token context and YaRN scaling from native 32k. This is the context-matched base control. |
+| `paper-yarn-128k` | Default for SFT/checkpoint evals meant to match the paper's 128k OpenHands setup. |
+| `swe-lego-qwen3-160k` | SWE-Lego Qwen3 with OpenHands `max_input_tokens = 147456` and vLLM `--max-model-len 163840`, using model-provided long-context config. |
 
-Changing a preset's context mode, vLLM max length, or RoPE scaling changes the
-vLLM server contract. The launcher writes a context signature under
-`/workspace/runlogs/<vllm-session>.context` and restarts tmux-managed vLLM
-servers when the requested signature does not match the live endpoint. If a
-non-launcher process is still bound to the port, the launcher stops instead of
-silently reusing it.
+Changing context mode, vLLM max length, or RoPE scaling changes the vLLM server
+contract. The launcher writes `/workspace/runlogs/<vllm-session>.context` and
+restarts tmux-managed vLLM servers when the requested signature does not match
+the live endpoint. If a non-launcher process owns the port, the launcher stops
+instead of reusing it.
 
-## Preflight Only
+## Preflight
 
-Check the pod runtime, Docker, vLLM, and structured tool calling:
+Run:
 
 ```bash
 scripts/run_midtraining_pod.py eval --preflight-only --foreground
 ```
 
-The tool-call preflight must return structured `message.tool_calls` for
-Qwen2.5-Coder. If it returns plain assistant text, the eval should not start.
+The Qwen2.5 tool-call preflight must return structured `message.tool_calls`. If
+it returns plain assistant text, the eval should not start because OpenHands
+cannot reliably execute the model's intended shell/editor action.
+
 The SWE-Lego Qwen3 preset disables this preflight because its OpenHands config
 does not force native tool calling or `tool_choice=required`.
 
-This preflight is an ML-facing correctness check. It catches the case where the
-same model endpoint is reachable but no longer speaks the action format that
-OpenHands expects. Without structured tool calls, later SWE-bench failures would
-mix together model quality, prompt/config drift, and harness parsing failures.
+## Default Preset Values
 
-## Preset Defaults
-
-The default eval preset resolves to the experiment settings below. These are
-argparse values, not environment variables:
+The default preset resolves to these argparse values, not environment
+variables:
 
 ```text
 --eval-stack openhands
@@ -350,56 +333,45 @@ argparse values, not environment variables:
 ```
 
 The launcher starts replicas on ports `8000..8007` and exposes the router on
-port `8090`. `--vllm-agent-tasks-per-server` controls how many concurrent
-OpenHands workers are budgeted per vLLM replica; the default preset's full-run
-worker count is `8 * 24 = 192`.
+port `8090`. `--vllm-agent-tasks-per-server` controls concurrent OpenHands
+workers per vLLM replica; the default full-run worker count is `8 * 24 = 192`.
 
 Set `--max-output-tokens none` only in an explicit preset or one-off CLI
 override for ablations that intentionally reproduce unbounded-output behavior.
 
-Output defaults to:
+Default output directory:
 
 ```text
 /workspace/eval-runs/openhands-swebench-verified-pass1/<timestamp>
 ```
 
-Override with `--output-dir PATH` when a stable path is needed.
+Use `--output-dir PATH` when a stable path is needed.
 
-## What the Launcher Does
+## Launcher Internals
 
-1. `scripts/run_midtraining_pod.py` refuses to push if the local checkout has
-   uncommitted changes, pushes the selected branch, and enters
-   `midtraining-dev` through `kubectl exec`.
-2. The lower-level pod wrappers call the shared startup guard before actual
-   job launch. The guard refuses to launch unless `SWEHERO_POD_GIT_BRANCH`
-   names the selected branch and `/workspace/jaxels-work-trial` is clean,
-   checked out to that branch, and fast-forwarded to `origin/<branch>`.
-3. The lower-level pod wrappers refuse to run on macOS or outside `/workspace`
-   for runtime work.
-4. Bootstraps and verifies the pinned `uv 0.11.16` binary if the pod does not
-   already have it.
-5. Starts `dockerd` in a pod tmux session if needed.
+The launcher:
+
+1. Refuses to push if the local checkout has uncommitted changes, pushes the
+   selected branch, and enters `midtraining-dev` with `kubectl exec`.
+2. Runs the shared startup guard, which requires `/workspace/jaxels-work-trial`
+   to be clean, checked out to `SWEHERO_POD_GIT_BRANCH`, and fast-forwarded to
+   `origin/<branch>`.
+3. Refuses runtime work on macOS or outside `/workspace`.
+4. Bootstraps and verifies pinned `uv 0.11.16` if needed.
+5. Starts `dockerd` in pod tmux if needed.
 6. Verifies Docker by running a real container and checking Buildx.
-7. Creates or repairs the Python 3.12 eval environment, including the Poetry
-   version requested by the preset (`2.1.3` for the current OpenHands preset,
-   `2.1.4` for the SWE-Lego checkout).
+7. Creates or repairs the Python 3.12 eval environment, including preset
+   Poetry version (`2.1.3` for current OpenHands, `2.1.4` for SWE-Lego).
 8. Creates or repairs the Python 3.12 vLLM environment from
-   `requirements/openhands-vllm.txt` before starting any missing vLLM server.
-9. Starts the vLLM topology requested by the preset. Current Qwen2.5 presets
-   start one replica per GPU. The SWE-Lego Qwen3 preset starts one vLLM process
-   with `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` and tensor parallel size 8.
+   `requirements/openhands-vllm.txt`.
+9. Starts the preset vLLM topology: one replica per GPU for current Qwen2.5
+   presets, or one tensor-parallel process over GPUs `0..7` for SWE-Lego Qwen3.
 10. Starts `scripts/openai_vllm_router.py` only when `--vllm-use-router` is set.
-11. Syncs the preset-selected OpenHands evaluation dependencies. For SWE-Lego,
-    this means the nested `OpenHands-0.53.0`; for current presets, this means
-    the configured upstream OpenHands checkout.
+11. Syncs preset-selected OpenHands dependencies: upstream OpenHands for
+    current presets or nested `OpenHands-0.53.0` for SWE-Lego.
 12. Runs `scripts/openhands_swebench_eval.py` with the selected endpoint and
     preset-defined OpenHands config. Exact subsets should use `--eval-ids`; the
     wrapper also writes OpenHands' benchmark-local `selected_ids` filter so old
     OpenHands versions run the requested IDs exactly.
 13. Prints `agent_tool_use` and the SWE-bench pass@1 summary. For SWE-Lego, the
     summary comes from the vendored `SWE-bench-4.0.4` grader report.
-
-For the 7B smoke, a healthy run should show `used_real_tools: true` and
-structured `tool_calls` in the preflight before reporting pass@1. `loop_errors`
-then describes the model trajectory quality for the sampled SWE-bench task; it
-is not, by itself, evidence that vLLM returned plain text instead of tool calls.

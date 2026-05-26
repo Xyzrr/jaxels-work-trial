@@ -1,73 +1,77 @@
 # Shell-to-Python Script Conversion Experiments
 
-Before replacing the shell launchers, lightweight behavior experiments were
-recorded under `tmp/uv-conversion-experiments/before/`. After conversion, the
-same experiments were rerun against the Python launchers under
-`tmp/uv-conversion-experiments/after/`.
+## Overview
 
-The raw scratch logs are intentionally ignored by git. This document records
-the reproducible experiment scope and normalized results.
+This document records the proof that replacing shell launchers with Python
+launchers preserved the launch contract for training, eval, and image prebuild
+workflows.
 
-The purpose of these experiments was not just to prove that Python printed the
-same help text as the old shell scripts. These launchers are the boundary
-between a cheap workstation command and expensive ML workloads running in the
-GPU pod. If the conversion changed an argument order, an environment variable,
-or the pod-side script path, a later training or eval run could silently use a
-different model preset, dataset, context window, vLLM topology, or grader. The
-checks below therefore focus on the launch contract that determines what ML
-experiment actually runs.
+The policy rationale lives in [`python_uv_project.md`](python_uv_project.md).
+This file is only the evidence record.
 
-## Normalization
+The experiments compare ignored scratch logs from:
 
-The comparison normalizes only intentional migration differences:
+- Before: `tmp/uv-conversion-experiments/before/`
+- After: `tmp/uv-conversion-experiments/after/`
 
-- `.sh` entrypoint paths became `.py`.
-- Temporary absolute paths under `tmp/uv-conversion-experiments/...` were
-  normalized to `<experiment-dir>`.
-- The after-run command prefix used the pinned local
-  `tmp/tools/uv-0.11.16/uv run`; the before-run command prefix used direct
-  shell execution.
-- `UV_PYTHON_INSTALL_DIR` appeared in two after-run fake `kubectl` calls only
-  because the local experiment harness invoked the Python launchers through the
-  pinned uv binary with that environment variable set.
+All normalized comparisons passed.
+
+## What Was Verified
+
+The checks focus on contract, not cosmetic output. A launcher contract includes
+the command path, argument order, forwarded environment variables, pod script
+path, branch guard, worker count, model-serving settings, and eval selectors.
+
+That matters because these workstation commands choose the expensive GPU-pod
+workload. A small launcher drift could silently change the model preset,
+dataset, context window, vLLM topology, OpenHands worker count, or grader.
+
+## Normalization Rules
+
+Only intentional migration differences were normalized:
+
+- `.sh` entrypoints became `.py`.
+- Temporary absolute paths under `tmp/uv-conversion-experiments/...` became
+  `<experiment-dir>`.
+- After-run commands used the pinned local `tmp/tools/uv-0.11.16/uv run`;
+  before-run commands used direct shell execution.
+- `UV_PYTHON_INSTALL_DIR` appeared in two after-run fake `kubectl` calls because
+  the harness invoked Python launchers through the pinned `uv` binary.
 
 No behavior-specific output was normalized away.
 
-In particular, the normalization did not remove model-serving settings,
-forwarded secrets, branch guards, worker counts, or eval selectors. Those values
-are part of the experiment contract: they decide which checkpoint is served,
-which pod checkout is used, how many OpenHands tasks run concurrently, and
-whether the evaluator grades the same SWE-bench instances.
-
 ## Result Summary
 
-| Experiment | Behavior checked | Result |
+| Experiment | Contract checked | Result |
 | --- | --- | --- |
-| `run_midtraining_eval_fake_kubectl` | Workstation meta-launcher builds the same `kubectl exec` command for eval, with the same namespace, pod, branch guard env, workspace env, forwarded workload args, and pod-side script path changed only from `.sh` to `.py`. | Pass |
-| `run_midtraining_prebuild_fake_kubectl` | Workstation meta-launcher builds the same prebuild `kubectl exec` command, preserves selected forwarded env vars (`HF_TOKEN`, `VLLM_FORCE_RESTART`), default namespace/pod, and workload args. | Pass |
-| `run_midtraining_help` | Help text, options, defaults, and workload mapping are preserved with `.py` script names. | Pass |
+| `run_midtraining_eval_fake_kubectl` | Eval meta-launcher preserved `kubectl exec` shape, namespace, pod, branch guard env, workspace env, forwarded args, and pod script path except `.sh` to `.py`. | Pass |
+| `run_midtraining_prebuild_fake_kubectl` | Prebuild meta-launcher preserved `kubectl exec`, selected env forwarding, namespace/pod defaults, and workload args. | Pass |
+| `run_midtraining_help` | Meta-launcher help, options, defaults, and workload mapping were preserved with `.py` names. | Pass |
 | `run_midtraining_missing_workload` | Missing workload still prints usage and exits `2`. | Pass |
-| `run_qwen_wrapper_fake_venv` | TorchTitan pod wrapper still calls setup with `--venv` and then executes `scripts/qwen_swehero_train.py` through the venv Python with original args unchanged. | Pass |
-| `run_qwen_wrapper_help` | Without a fake setup override, local `--help` still fails before training help because the pod uv bootstrap runtime is unavailable on the workstation, prints the same uv requirement, and exits `1`. | Pass |
+| `run_qwen_wrapper_fake_venv` | TorchTitan pod wrapper still calls setup with `--venv`, then executes `scripts/qwen_swehero_train.py` through the venv Python with original args. | Pass |
+| `run_qwen_wrapper_help` | Local `--help` still fails before training help when pod uv bootstrap runtime is unavailable, prints the same uv requirement, and exits `1`. | Pass |
 | `prebuild_invalid_eval_limit` | Prebuild launcher rejects `--eval-limit 0` before pod checks and exits `1`. | Pass |
 | `prebuild_invalid_parallel_builds` | Prebuild launcher rejects `--parallel-builds 0` before pod checks and exits `1`. | Pass |
-| `prebuild_help` | Help text, options, env docs, and defaults are preserved with `.py` script names. | Pass |
-| `setup_torchtitan_help` | TorchTitan venv setup help text, options, and defaults are preserved with `.py` script names. | Pass |
+| `prebuild_help` | Prebuild help, options, env docs, and defaults were preserved with `.py` names. | Pass |
+| `setup_torchtitan_help` | TorchTitan venv setup help, options, and defaults were preserved with `.py` names. | Pass |
 | `setup_torchtitan_unknown` | Unknown setup arg still prints the unknown argument, usage, and exits `2`. | Pass |
 | `openhands_eval_conflicting_selectors` | Eval launcher still rejects simultaneous `--eval-limit` and `--eval-ids` before pod checks and exits `1`. | Pass |
-| `openhands_eval_help` | Eval launcher help text, options, env docs, and defaults are preserved with `.py` script names. | Pass |
+| `openhands_eval_help` | Eval launcher help, options, env docs, and defaults were preserved with `.py` names. | Pass |
 | `openhands_eval_worker_selection` | Worker selection helper returns `7`, `3`, `3`, `16` for the SWE-Lego/current OpenHands smoke cases. | Pass |
 | `openhands_eval_llm_key_selection` | LLM API key helper returns `dummy-key`, `explicit`, `local-llm` for SWE-Lego default, SWE-Lego explicit, and current OpenHands default cases. | Pass |
 
-The last two eval cases deserve special attention. Worker selection controls
-how many OpenHands agents submit tasks to the local model server at once; too
-many workers can make vLLM run out of GPU memory, while too few workers can make
-an eval appear slower than the configuration really is. The LLM key selection
-case keeps local pod inference distinct from provider-backed APIs: a dummy or
-local key is sufficient for the OpenAI-compatible vLLM endpoint, while real
-secrets should remain explicit runtime inputs.
+## Eval Helper Notes
 
-## Normalized Comparison Output
+The last two eval cases are high-risk despite being small helpers:
+
+- Worker selection controls how many OpenHands agents submit tasks to the local
+  model server at once. Too many workers can exhaust vLLM GPU memory; too few
+  can make an eval look slower than the selected configuration.
+- LLM key selection keeps local pod inference distinct from provider-backed
+  APIs. Dummy or local keys are valid for the OpenAI-compatible vLLM endpoint;
+  real secrets should remain explicit runtime inputs.
+
+## Normalized Output
 
 ```text
 run_midtraining_eval_fake_kubectl: PASS

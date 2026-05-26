@@ -1,43 +1,40 @@
-# Canonical GPU pod runtime for the vendored TorchTitan SWE-HERO trainer.
+# Canonical TorchTitan training runtime for the GPU pod.
 #
-# This file is the human-readable top-level input for the training venv. The pod
-# setup script resolves it into requirements/torchtitan-pod-cu128.lock and syncs
-# /workspace/venvs/torchtitan-swehero-cu128 from that lock before launching
-# training. Treat changes here as training-runtime changes, not routine package
-# refreshes.
+# This is the human-audited top-level input for the training venv. The pod setup
+# script resolves it into requirements/torchtitan-pod-cu128.lock, syncs
+# /workspace/venvs/torchtitan-swehero-cu128 from that lock, and runs runtime
+# checks before launch. Treat changes here as training-runtime changes, not
+# routine dependency refreshes.
 #
-# TorchTitan source tracks PyTorch APIs that were not available in the stable
-# release line when this prototype was built. That is why the trainer uses a
-# PyTorch nightly wheel rather than the pod's pre-existing /workspace/venv.
+# TorchTitan tracks PyTorch APIs ahead of the stable release line used when this
+# prototype was built. That is why the trainer uses PyTorch nightly wheels, not
+# the pod's pre-existing /workspace/venv.
 #
-# The CUDA 12.8 nightly index matches the current 8xH100 pod driver/runtime. The
-# CPU nightly index is present for companion packages that publish CPU-only
-# wheels, such as torchdata below.
+# CUDA 12.8 matches the current 8xH100 pod driver/runtime. The CPU nightly index
+# is present for companion packages that publish CPU-only wheels, such as
+# torchdata.
 --extra-index-url https://download.pytorch.org/whl/nightly/cu128
 --extra-index-url https://download.pytorch.org/whl/nightly/cpu
 
 # Keep these three pins in lockstep:
 #
-# * torch provides the distributed training APIs, compiler/Triton path, FSDP,
-#   CUDA kernels, and tensor math used during model training.
-# * torchao provides the FP8 recipe used by the direct-to-hero preset to make
-#   long-context training fit in GPU memory.
-# * torchdata provides the data-loading primitives expected by vendored
-#   TorchTitan.
+# * torch provides distributed training APIs, compiler/Triton paths, FSDP, CUDA
+#   kernels, and tensor math.
+# * torchao provides the FP8 recipe used by the direct-to-hero preset.
+# * torchdata provides data-loading primitives expected by vendored TorchTitan.
 #
-# Mixing different nightly dates can compile but fail later inside distributed
-# training, which is the most expensive place to discover a runtime mismatch.
+# Mixed nightly dates can compile but fail later inside distributed training.
 torch==2.12.0.dev20260408+cu128
 torchao==0.18.0.dev20260407+cu128
 torchdata==0.12.0.dev20260408+cpu
 
 # TorchTitan's own dependency contract for this vendored source tree. Keep this
-# reference rather than copying those packages here so updates to the vendored
-# TorchTitan tree stay tied to the requirement file it ships with.
+# reference so vendored TorchTitan updates stay tied to the requirement file
+# they ship with.
 -r ../torchtitan/.ci/docker/requirements.txt
 
-# Hugging Face packages are needed by the project-specific SWE-HERO data and
-# smoke paths: tokenizers/chat templates come from transformers, while
-# huggingface_hub downloads and verifies the pinned Qwen checkpoint assets.
+# Hugging Face packages support SWE-Hero data materialization and smoke paths:
+# transformers provides tokenizers/chat templates; huggingface_hub downloads and
+# verifies pinned Qwen checkpoint assets.
 transformers>=4.51.0
 huggingface_hub

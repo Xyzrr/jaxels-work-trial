@@ -1,39 +1,23 @@
 # TorchTitan Pod Runtime
 
-This repository vendors TorchTitan source directly under `torchtitan/`. That
-source expects a PyTorch nightly or a PyTorch source build, not the pod's
-pre-existing `/workspace/venv`.
+## Overview
 
-This document still uses the direct-to-hero SWE-Hero run as the canonical
-training example, but the pipeline is moving toward general preset-driven
-mid-training experiments. New training experiments should copy or add
-`configs/training/*.args` presets and keep dataset/model-specific choices in
-those presets or narrowly scoped helpers. Do not add new SWE-Hero-only defaults
-to shared TorchTitan launchers unless the behavior is explicitly part of the
-SWE-Hero reproduction.
+This is the GPU-pod runbook for TorchTitan training. It still uses the
+Qwen2.5-Coder-7B direct-to-hero SWE-Hero run as the canonical example, but new
+training experiments should be preset-driven rather than SWE-Hero hardcoded.
 
-Training concepts used throughout this runbook:
+Use this document when launching, reproducing, or debugging pod training. For
+shared ML vocabulary and project-wide configuration rules, see
+[`../AGENTS.md`](../AGENTS.md). For the local Python/uv boundary, see
+[`python_uv_project.md`](python_uv_project.md).
 
-- Supervised fine-tuning (SFT) means continuing training from an existing base
-  checkpoint while teaching the model to imitate desired assistant outputs. In
-  this project, the desired outputs are OpenHands assistant actions from SWE
-  coding traces; prompts and tool observations remain visible as context but are
-  masked out of the training loss.
-- A context window is the maximum number of tokens the model can attend to at
-  once. The Qwen2.5-Coder checkpoint is native 32k context, while the
-  direct-to-hero recipe intentionally trains with a 131,072-token context using
-  YaRN positional scaling. Changing the context setting changes the ML
-  experiment, not just memory usage.
-- Buckets group examples by token length so short traces are not padded to the
-  full 128k length. Context parallelism (CP) then splits long-token sequences
-  across GPUs for the larger buckets. The bucket/CP table is part of the
-  training recipe because it changes which distributed path each example uses.
-- FP8, bfloat16, activation checkpointing, chunked cross-entropy, and FSDP are
-  memory/throughput choices that make long-context training feasible on the
-  8xH100 pod. They should be changed only as explicit experiments because they
-  affect numerical behavior, checkpoint contents, or both.
+Do not modify `torchtitan/` unless explicitly asked. It is vendored source and
+expects the locked pod runtime below, not the pod's pre-existing
+`/workspace/venv`.
 
-The canonical pod runtime is:
+## Quick Commands
+
+Canonical production-shaped launch:
 
 ```bash
 scripts/run_midtraining_pod.py train \
@@ -42,60 +26,81 @@ scripts/run_midtraining_pod.py train \
   --hf-assets-path /workspace/assets/hf/Qwen2.5-Coder-7B-Instruct
 ```
 
-Run that command from the workstation checkout. The meta-wrapper pushes the
-current clean branch, enters `midtraining-dev` with
-`tmp/pod-creds/kubeconfig.yaml`, sets the legacy `SWEHERO_POD_GIT_BRANCH`
-runtime variable inside the pod, and starts the lower-level TorchTitan pod
-wrapper from `/workspace/jaxels-work-trial`.
+Paper-aligned production launch:
 
-The workstation wrapper is a Python `uv` entrypoint. Run it directly as shown
-or through `uv run`; do not add shell launchers for new training workflows.
+```bash
+scripts/run_midtraining_pod.py train \
+  @configs/training/qwen25-coder-7b-direct-to-hero.args \
+  --production-mode \
+  --enable-wandb
+```
 
-The `@configs/training/qwen25-coder-7b-direct-to-hero.args` file is the
-canonical experiment preset for the Qwen2.5-Coder-7B direct-to-hero run. It
-contains the paper-aligned model, dataset, context, optimizer, bucket, CP,
-checkpoint, and launch settings that used to be implicit defaults in the
-launcher. The Python entrypoint still prepends this preset when no `@...` file
-is supplied for backward-compatible direct invocations, but new commands should
-name the preset explicitly.
-
-For a different training experiment, copy that preset, edit the copied file,
-and swap the `@...` argument. Use CLI flags after the preset for one-off
-overrides; later flags win through normal argparse ordering. Keep secrets and
-pod/runtime plumbing as environment only: `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
-`WANDB_API_KEY`, `TORCHTITAN_POD_VENV`, `TORCHTITAN_POD_SUPERVISOR`, and
-tmux-related controls are not experiment settings and do not belong in presets.
-The meta-wrapper owns the branch synchronization contract and forwards selected
-runtime environment variables to the pod. `SWEHERO_POD_GIT_BRANCH` remains a
-pod-side legacy compatibility name; new shared controls should use neutral
-names.
-
-The launcher runs `scripts/setup_torchtitan_pod_venv.py` itself before the
-training entrypoint starts. On a fresh pod it creates the canonical venv; on a
-pod with stale or incompatible Python packages it syncs the same pinned lock
-back into place. Run the setup script directly only when you intentionally want
-to prewarm or recreate the venv:
+Recreate the TorchTitan pod venv intentionally:
 
 ```bash
 scripts/setup_torchtitan_pod_venv.py --recreate
 ```
 
-When this wrapper is run from an interactive pod terminal, it creates or
-attaches to a `tmux` session named from `--out-dir`. The training process stays
-inside that pod-local session if the `kubectl exec` connection drops, and
-rerunning the same wrapper command reconnects to the existing session instead
-of starting a duplicate job. The wrapper also records the outer launcher
-transcript under `/workspace/runlogs/<session>.tmux.log`.
+List or attach to supervised pod sessions:
+
+```bash
+tmux ls
+tmux attach-session -t swehero-qwen25-coder7b-swehero-torchtitan
+```
+
+## Runtime Contract
+
+Run `scripts/run_midtraining_pod.py train` from the workstation checkout. The
+meta-wrapper pushes the current clean branch, enters `midtraining-dev` with
+`tmp/pod-creds/kubeconfig.yaml`, sets the legacy `SWEHERO_POD_GIT_BRANCH`
+runtime variable inside the pod, and starts the lower-level TorchTitan wrapper
+from `/workspace/jaxels-work-trial`.
+
+The default experiment preset is:
+
+```text
+configs/training/qwen25-coder-7b-direct-to-hero.args
+```
+
+It contains the paper-aligned model, dataset, context, optimizer, bucket,
+context-parallelism, checkpoint, and launch settings that used to be implicit
+launcher defaults. New experiments should copy a preset, edit the copy, and
+pass that preset explicitly with `@configs/training/...`.
+
+The direct-to-hero preset pins the base checkpoint to:
+
+```text
+Qwen/Qwen2.5-Coder-7B-Instruct@c03e6d358207e414f1eca0bb1891e29f1db0e242
+```
+
+That revision is passed to Hugging Face asset downloads, recorded in the data
+manifest and run spec, and checked during preflight.
+
+CLI flags after the preset are valid one-off overrides; normal argparse order
+means later values win. Keep secrets and pod/runtime plumbing as environment
+only: `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `WANDB_API_KEY`,
+`TORCHTITAN_POD_VENV`, `TORCHTITAN_POD_SUPERVISOR`, and tmux controls are not
+experiment settings and do not belong in presets.
+
+`SWEHERO_POD_GIT_BRANCH` is a pod-side legacy compatibility name. New shared
+controls should use neutral names.
+
+## Supervised Sessions
+
+When the pod wrapper runs from an interactive pod terminal, it creates or
+attaches to a `tmux` session named from `--out-dir`. Training continues inside
+that pod-local session if `kubectl exec` disconnects. Rerunning the same
+wrapper command reconnects instead of starting a duplicate job.
+
+The wrapper records the outer launcher transcript under:
+
+```text
+/workspace/runlogs/<session>.tmux.log
+```
 
 Useful controls:
 
 ```bash
-# List supervised launches.
-tmux ls
-
-# Reattach directly when you know the session name.
-tmux attach-session -t swehero-qwen25-coder7b-swehero-torchtitan
-
 # Override the derived session name for a launch.
 SWEHERO_POD_TMUX_SESSION=swehero-7b-prod \
   scripts/run_midtraining_pod.py train \
@@ -115,16 +120,16 @@ SWEHERO_POD_SUPERVISOR=0 \
     --dry-run
 ```
 
+## Pod And Git Access
+
 The host and container workspace root are both `/workspace`. The pod manifest
 uses `hostPath.path: /workspace` with `type: Directory`, so the GPU node must
 prepare `/workspace` as a real directory or mountpoint before the pod is
-created. Do not rely on a host symlink for this path.
-
-## Git Access
+created. Do not rely on a host symlink.
 
 The project remote currently uses GitHub SSH. To let the pod run the same Git
-remote operations as the workstation, create or refresh the Kubernetes Secret
-that the canonical pod manifest mounts:
+operations as the workstation, create or refresh the Kubernetes Secret mounted
+by `manifests/midtraining-hostpath.yaml`:
 
 ```bash
 mkdir -p tmp/pod-creds
@@ -147,14 +152,12 @@ KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
   | KUBECONFIG=tmp/pod-creds/kubeconfig.yaml kubectl apply -f -
 ```
 
-This deliberately keeps private key material in a cluster Secret and ignored
-local files, not in git. It grants the pod whatever GitHub SSH permissions that
-key has; use a repo-scoped deploy key instead if the pod should only access this
-repository. Running pods do not gain new volume mounts, so recreate
-`midtraining-dev` from `manifests/midtraining-hostpath.yaml` after creating the
-Secret when durable Git access is needed across pod restarts.
+This keeps private key material in a cluster Secret and ignored local files,
+not git. Use a repo-scoped deploy key if the pod should only access this repo.
+Running pods do not gain new volume mounts, so recreate `midtraining-dev` after
+creating the Secret when durable Git access is needed across pod restarts.
 
-Verify GitHub auth and repository access from the pod:
+Verify pod Git access:
 
 ```bash
 KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
@@ -162,77 +165,51 @@ KUBECONFIG=tmp/pod-creds/kubeconfig.yaml \
     bash -lc 'ssh -T git@github.com || true; git -C /workspace/jaxels-work-trial pull --ff-only'
 ```
 
-Before launching a new canonical training session from the workstation, use the
-meta-wrapper:
-
-```bash
-scripts/run_midtraining_pod.py train \
-  @configs/training/qwen25-coder-7b-direct-to-hero.args \
-  --production-mode \
-  --enable-wandb
-```
-
-For a new launch, `scripts/run_midtraining_pod.py` refuses to push if the local
-checkout has uncommitted changes, then pushes the selected branch and enters the
-pod. The pod-side shared startup guard refuses to launch unless
+For new launches, `scripts/run_midtraining_pod.py` refuses to push if the local
+checkout has uncommitted changes, then pushes the selected branch and enters
+the pod. The pod-side startup guard refuses to launch unless
 `/workspace/jaxels-work-trial` is clean, checked out to that branch, and
-fast-forwardable to the current `origin/<branch>` head. It fails instead of
-discarding dirty files or pod-local commits that have not been pushed. Lower
-level wrappers call the shared startup guard only at actual job-launch points,
-so reruns that only reconnect to an existing tmux session do not mutate the
-checkout.
+fast-forwardable to `origin/<branch>`.
 
-The CUDA base image does not include Python. The pod entrypoint uses the pinned
-`/workspace/uv/uv-0.11.16/uv` binary to install CPython 3.10.12 under
-`/workspace/python` before idling. It also installs `tmux`, `git`, the `ssh`
-client, a C/C++ toolchain, and `lspci` when the base image does not provide
-them, so reconnectable launches, production Git metadata checks, remote shell
-access, TorchInductor/Triton compilation, and hardware inventory are available
-before training.
-The persisted uv-managed venv under `/workspace/venvs/torchtitan-swehero-cu128`
-has a valid interpreter after every pod recreation without relying on
-apt-managed Python.
-
-The training preset pins the base checkpoint to
-`Qwen/Qwen2.5-Coder-7B-Instruct@c03e6d358207e414f1eca0bb1891e29f1db0e242`.
-That revision is passed to Hugging Face asset downloads, recorded in the data
-manifest and run spec, and checked during preflight before launch.
-
-Production launches require the canonical workspace root
-`/workspace/jaxels-work-trial`. The launcher records the configured root, the
-script root, and their resolved physical paths in `run_spec.json`,
-`resume_contract.json`, `launcher_plan.json`, and `runtime_metadata.json`.
-`launcher_plan.json` and `runtime_metadata.json` also record the current working
-directory for debugging. Override `--workspace-root` only for non-production
-local tests; `--production-mode` rejects any root other than the canonical pod
-path.
-
-Do not launch this job with bare `python`, bare `torchrun`, or
-`/workspace/venv`. The run wrapper creates or repairs the canonical venv first,
-prepends that venv to `PATH`, and launches the training entrypoint with the
-venv's Python so `torchrun` is resolved from the same runtime.
+Production launches require workspace root `/workspace/jaxels-work-trial`.
+Override `--workspace-root` only for non-production local tests.
 
 ## Locked Runtime
 
-The setup script bootstraps exactly `uv 0.11.16` under
-`/workspace/uv/uv-0.11.16` when that exact version is not already installed.
-The version is pinned inside `scripts/setup_torchtitan_pod_venv.py`; do not set
-`UV_VERSION` or use an unversioned installer URL. If `UV_BIN` is provided, the
-script verifies it reports `uv 0.11.16` before using it. The downloaded Linux
-x86_64 archive is also checked against its pinned SHA256.
+The CUDA base image does not include the required Python runtime. The pod
+entrypoint uses pinned `uv 0.11.16` to install CPython `3.10.12` under
+`/workspace/python`; the setup script then creates the canonical venv under:
 
-After `uv` is established, the setup script creates the venv with `uv venv`,
-syncs dependencies with `uv pip sync`, installs vendored TorchTitan with
-`uv pip install --no-deps -e torchtitan`, and verifies the result with
-`uv pip check`.
+```text
+/workspace/venvs/torchtitan-swehero-cu128
+```
 
-The fully resolved Linux pod lock is
-`requirements/torchtitan-pod-cu128.lock`. The setup script installs from that
-lock when it is present, so transitive dependencies are not floating between
-pod runs.
+Do not launch training with bare `python`, bare `torchrun`, or
+`/workspace/venv`. The wrapper creates or repairs the canonical venv, prepends
+it to `PATH`, and launches the training entrypoint with that venv's Python so
+`torchrun` resolves from the same runtime.
 
-The human-readable root requirement file,
-`requirements/torchtitan-pod-cu128.txt`, records the critical Torch stack pins:
+The setup script bootstraps exactly `uv 0.11.16` under:
+
+```text
+/workspace/uv/uv-0.11.16
+```
+
+Do not set `UV_VERSION` or use an unversioned installer URL. If `UV_BIN` is
+provided, the setup verifies that it reports `uv 0.11.16`. The downloaded
+Linux x86_64 archive is checked against its pinned SHA256.
+
+After `uv` exists, setup creates the venv with `uv venv`, syncs dependencies
+with `uv pip sync`, installs vendored TorchTitan with
+`uv pip install --no-deps -e torchtitan`, and verifies with `uv pip check`.
+
+The resolved Linux pod lock is:
+
+```text
+requirements/torchtitan-pod-cu128.lock
+```
+
+The human-readable root requirement file records the critical Torch stack:
 
 ```text
 torch==2.12.0.dev20260408+cu128
@@ -240,23 +217,18 @@ torchao==0.18.0.dev20260407+cu128
 torchdata==0.12.0.dev20260408+cpu
 ```
 
-Those three packages are ML runtime dependencies, not ordinary utility
-packages. `torch` supplies tensor math, FSDP distributed training, compiler
-paths, and CUDA kernels. `torchao` supplies the FP8 recipe used to reduce
-long-context memory pressure. `torchdata` supplies data-loading primitives
-expected by vendored TorchTitan. A date or CUDA-build mismatch can pass import
-checks and still fail only after distributed training starts, which is why the
-pod setup verifies them before launch.
+These pins are part of the ML runtime. `torch` supplies tensor math, FSDP,
+compiler paths, and CUDA kernels. `torchao` supplies the FP8 recipe.
+`torchdata` supplies data-loading primitives expected by vendored TorchTitan.
 
-The rest of the Python dependencies are installed from the vendored
-TorchTitan requirement file, `torchtitan/.ci/docker/requirements.txt`, plus the
-Hugging Face packages used by our SWE-HERO materialization scripts. Those
-resolved transitive versions are frozen in the lock file.
+The rest of the Python dependencies come from
+`torchtitan/.ci/docker/requirements.txt` plus Hugging Face packages used by the
+SWE-Hero materialization scripts. Resolved transitive versions are frozen in
+the lock file.
 
-This uses CUDA 12.8 wheels because the current 8xH100 pod driver is
-`570.195.03`. The newer CUDA 13.0 nightly index is not the canonical runtime
-for this pod unless the driver and the pinned requirement file are updated
-together and revalidated.
+This runtime uses CUDA 12.8 wheels because the current 8xH100 pod driver is
+`570.195.03`. Do not switch to CUDA 13.0 nightlies unless the driver and pinned
+requirement file are updated together and revalidated.
 
 ## Built-In Verification
 
@@ -265,41 +237,30 @@ together and revalidated.
 - import `DataParallelMeshDims` directly from `torch.distributed.fsdp`;
 - import TorchAO float8 support and construct the `rowwise` recipe;
 - run a CUDA smoke tensor on the H100;
-- import the vendored TorchTitan modules that require the exported FSDP API;
+- import vendored TorchTitan modules that require the exported FSDP API;
 - pass `uv pip check`.
 
-It also writes a venv-local metadata file at
-`$TORCHTITAN_POD_VENV/torchtitan-swehero-runtime.json` with the exact package
-versions, `uv` binary path/version, and critical imports used for the run.
+It writes:
 
-`scripts/qwen_swehero_train.py` also validates the active runtime before
-launching training, so dependency mismatches fail before data prep or
-distributed startup.
+```text
+$TORCHTITAN_POD_VENV/torchtitan-swehero-runtime.json
+```
+
+That file records exact package versions, `uv` binary path/version, and
+critical imports. `scripts/qwen_swehero_train.py` also validates the active
+runtime before data prep or distributed startup.
 
 ## Training Dataset
 
-The canonical training dataset artifact is the context-capped one-rollout
-SWE-Hero dataset under `datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/`.
-It is ignored by git locally under `datasets/`, so the pod workflow should
-refresh or rebuild the local artifact rather than depend on a developer having
-committed a large Parquet folder.
+The canonical training artifact is:
 
-The artifact is built in two steps:
+```text
+datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout/
+```
 
-1. `scripts/prepare_swehero_historical_one_rollout.py` selects one accepted
-   public rollout per `instance_id` from the pinned historical source revision.
-2. `scripts/refresh_swehero_context_capped_one_rollout.py` scans the selected
-   rows with the same Qwen/OpenHands serialization used by training. Rows whose
-   shifted input length exceeds the 131,072-token training context are replaced
-   by the best same-task accepted rollout that fits the cap, using the same rank
-   order: fewest `str_replace_editor` errors, fewest assistant turns, then
-   earliest source row. Tasks with no fitting accepted rollout are excluded.
-
-The 2026-05-22 refreshed artifact starts from 12,633 raw selected rows, replaces
-23 over-context rows, excludes 16 tasks with no fitting accepted rollout, and
-keeps 12,617 rows. Its `context_filter_report.json` records each replacement and
-exclusion; a streaming recomputation found zero final rows over 128k and a max
-shifted input length of 130,126.
+It is a context-capped one-rollout public approximation, not the exact paper
+manifest. Provenance and row-count caveats live in
+[`../notes/swe-hero-dataset-discrepancy.md`](../notes/swe-hero-dataset-discrepancy.md).
 
 On the pod, the trainer defaults to:
 
@@ -307,16 +268,14 @@ On the pod, the trainer defaults to:
 /workspace/datasets/swe-hero-openhands-trajectories-5b2ed21-one-rollout
 ```
 
-If that directory is missing, rebuild it out of band before a production launch.
-The raw one-rollout artifact is generated from the pinned source dataset:
+If that directory is missing, rebuild it out of band before a production
+launch. The raw source revision is:
 
 ```text
 nvidia/SWE-Hero-openhands-trajectories@5b2ed21270ad773a50163e2999c510f0cbb92cfa
 ```
 
-The raw builder writes a Hugging Face-style local Parquet dataset with
-`data/*.parquet`, `metadata.json`, and `selection_manifest.jsonl`. After a raw
-build, run the context-capping refresh before production tokenization:
+Build and refresh the local artifact:
 
 ```bash
 cd /workspace/jaxels-work-trial
@@ -331,23 +290,21 @@ $TORCHTITAN_POD_VENV/bin/python scripts/refresh_swehero_context_capped_one_rollo
   --overwrite
 ```
 
-The refreshed builder writes `context_filter_report.json` in addition to
-`metadata.json` and `selection_manifest.jsonl`. The training manifest records
-the dataset path, source revision, metadata hashes, selection manifest hash, and
-Parquet shard sizes/hashes. Do not point a production run at the raw uncapped
-artifact; it still contains selected rows that exceed the 128k training context.
+The 2026-05-22 refresh starts from 12,633 raw selected rows, replaces 23
+over-context rows, excludes 16 tasks with no fitting accepted rollout, and
+keeps 12,617 rows. The final max shifted input length is 130,126.
 
-For quick real-data GPU smoke tests, pass `--num-examples 64` or another cap.
-Do not combine those smoke caps with `--production-mode` unless you are running
-the explicit final acceptance path described below with
-`--production-acceptance-smoke`. The default `--num-examples 0` means
-materialize all usable examples from the cached one-rollout dataset.
+The refreshed artifact writes `metadata.json`, `selection_manifest.jsonl`, and
+`context_filter_report.json`. Do not point production at the raw uncapped
+artifact; it still contains rows that exceed the 128k training context.
+
+For quick real-data GPU smoke tests, use `--num-examples 64` or another cap.
+The default `--num-examples 0` materializes all usable examples.
 
 ## HF Logits Parity
 
-Before a real run, verify that the TorchTitan model definition and
-`Qwen25StateDictAdapter` load the same initial model as the Hugging Face
-reference:
+Before a real run, verify that TorchTitan and `Qwen25StateDictAdapter` load the
+same initial model as Hugging Face:
 
 ```bash
 cd /workspace/jaxels-work-trial
@@ -358,31 +315,21 @@ $TORCHTITAN_POD_VENV/bin/python scripts/qwen_swehero_logits_parity.py \
   --json-out /workspace/qwen25-coder7b-swehero-parity.json
 ```
 
-Logits are the model's raw next-token scores before softmax turns them into
-probabilities. Matching Hugging Face logits at selected positions proves more
-than "the file loaded": it checks that TorchTitan loaded the same weights, used
-the same tokenizer/config assumptions, and applied the same long-context YaRN
-position encoding. That makes it a cheap preflight for catching model-load or
-context-scaling drift before a multi-hour training job.
+Matching logits proves the weights, tokenizer/config assumptions, and 128k
+YaRN position encoding align before a multi-hour training job. Use
+`--reference-context standard-hf` only for the unmodified HF config, not the
+paper-aligned training recipe.
 
-`paper-yarn-128k` is the default because the SWE-HERO paper fine-tunes
-Qwen2.5-Coder-Instruct with YaRN extending the native 32k context to 128k.
-The script also supports `--reference-context standard-hf` for checking against
-the unmodified HF config, but that is not the training recipe used here.
-
-To make the training launcher run this preflight check before data prep and
-TorchTitan startup, add:
+To make the launcher run this preflight before data prep and TorchTitan
+startup, add:
 
 ```bash
 --verify-hf-logits-parity
 ```
 
-## Smoke Run Command
+## Smoke Runs
 
-For a launch-path smoke test that deterministically exercises every configured
-bucket and CP degree, use `--smoke-synthetic-buckets`. This mode materializes
-tiny synthetic tokenized records only; it is not a training dataset and should
-not be used for the paper-aligned run.
+Synthetic all-bucket/CP launch-path smoke:
 
 ```bash
 scripts/run_midtraining_pod.py train \
@@ -406,16 +353,14 @@ scripts/run_midtraining_pod.py train \
   --no-enable-fp8
 ```
 
-For a small capped smoke test against the real cached SWE traces, replace the
-synthetic flags with `--num-examples 64` and use the target bucket plan. That
-path is closer to the production data path, but it does not guarantee that
-every configured bucket is non-empty.
+This mode materializes tiny synthetic tokenized records only. It exercises
+configured buckets and CP degrees, but it is not a training dataset.
 
-To exercise the checkpoint/resume/export/validation lifecycle on the GPU pod,
-run the lifecycle smoke wrapper. It launches the same TorchTitan trainer with a
-single tiny synthetic bucket, requires the step-1 DCP validation report, checks
-the final DCP checkpoint plus Hugging Face export, then invokes the same
-immutable run spec with `--resume` and verifies the completed run again:
+For a small real-data smoke, replace the synthetic flags with
+`--num-examples 64` and use the target bucket plan. That path is closer to
+production data but does not guarantee every configured bucket is non-empty.
+
+Lifecycle smoke:
 
 ```bash
 cd /workspace/jaxels-work-trial
@@ -425,18 +370,12 @@ $TORCHTITAN_POD_VENV/bin/python scripts/qwen_swehero_gpu_lifecycle_smoke.py \
   --nproc-per-node 8
 ```
 
-This lifecycle smoke intentionally uses `--smoke-synthetic-buckets`,
-`--no-compile`, `--no-enable-fp8`, and lowered resource thresholds so it can
-run quickly and repeatedly. It does not change the production recipe or the
-paper-aligned launch gate.
+The lifecycle wrapper runs the trainer with a tiny synthetic bucket, requires
+the step-1 DCP validation report, checks final DCP checkpoint plus Hugging Face
+export, invokes the same immutable run spec with `--resume`, and validates the
+completed run again.
 
-For the final acceptance smoke, run the same wrapper with production mode and a
-bounded real SWE-HERO subset:
-
-The example below points at a one-row Parquet artifact under
-`/workspace/datasets/...-final-acceptance-subset`. That artifact must be built
-from the cached one-rollout dataset, not synthetic JSONL, and should include
-`metadata.json` and `selection_manifest.jsonl` identifying the source row.
+Final acceptance smoke:
 
 ```bash
 cd /workspace/jaxels-work-trial
@@ -451,43 +390,40 @@ $TORCHTITAN_POD_VENV/bin/python scripts/qwen_swehero_gpu_lifecycle_smoke.py \
   --nproc-per-node 8
 ```
 
-That path passes `--production-mode --production-acceptance-smoke` through to
-the launcher. It keeps the production Git provenance, canonical workspace,
+That artifact must be a real one-row Parquet subset built from the cached
+one-rollout dataset, not synthetic JSONL, and should include `metadata.json`
+and `selection_manifest.jsonl`.
+
+The final acceptance path keeps production Git provenance, canonical workspace,
 real dataset, first-step checkpoint validation, final checkpoint/export
-validation, resume contract, and durable W&B requirements enabled, while
-explicitly recording the subset, shortened bucket, and one-step cap as an
-acceptance-only deviation. The wrapper validates the fresh run, invokes
-`--resume`, then validates the completed run again and confirms `run_spec.json`,
-`run_spec.sha256`, `launcher_plan.json`, `resume_contract.json`,
-`stage_status.json`, `wandb_identity.json`, TorchTitan structured JSONL logs,
-the DCP checkpoint, and the Hugging Face export.
+validation, resume contract, and durable W&B requirements enabled. It records
+the subset, shortened bucket, and one-step cap as acceptance-only deviations.
 
-The production run should use the same wrapper with `--production-mode` and
-without `--num-examples`, so the trainer tokenizes the full cached one-rollout
-dataset and uses the full bucket plan. The production gate rejects dry runs,
-synthetic buckets, subset caps, step caps, shortened context, and alternate
-bucket curricula before launch.
+## Production Gates
 
-Production mode also rejects any bucket stage whose example count is smaller
-than its data-parallel degree. Tiny smoke runs may reuse tiny buckets on empty
-ranks to exercise distributed code paths, but the paper-aligned data run must
-not silently duplicate records because a length bucket is too small for the
-configured rank topology.
+The production run should use the canonical wrapper with `--production-mode`
+and no `--num-examples`, so it tokenizes the full cached one-rollout dataset
+and uses the full bucket plan.
 
-Production mode also requires `git` to be available in the launch environment
-and the repository worktree to be clean. The canonical pod manifest installs
-`git` at container startup; recreate older running pods from
-`manifests/midtraining-hostpath.yaml` before a paper-aligned production run.
-Commit or stash local edits before launch; non-production smoke runs record
-whatever Git state is available but do not enforce cleanliness.
+Production mode rejects:
 
-Production mode requires W&B metrics with a durable mode. Include
-`--enable-wandb` and do not set `--wandb-mode offline` or
+- dry runs;
+- synthetic buckets;
+- subset caps;
+- step caps;
+- shortened context;
+- alternate bucket curricula;
+- bucket stages whose example count is smaller than data-parallel degree;
+- non-canonical workspace roots;
+- missing `git`;
+- dirty repository state;
+- missing W&B metrics or non-durable W&B modes.
+
+Include `--enable-wandb` and do not set `--wandb-mode offline` or
 `--wandb-mode disabled` for the paper-aligned run.
 
-Before torchrun starts, the launcher also checks output-disk free space, free
-GPU memory, available CPU memory, and write throughput to the run filesystem.
-The defaults are conservative launch gates and are recorded in `run_spec.json`:
+Before `torchrun`, the launcher checks output disk, free GPU memory, CPU
+memory, and write throughput. Defaults:
 
 ```bash
 --min-free-disk-gb 100 \
@@ -497,23 +433,18 @@ The defaults are conservative launch gates and are recorded in `run_spec.json`:
 --write-throughput-probe-mb 64
 ```
 
-## Output Launch Lock
+## Output And Logs
 
-Every launcher invocation acquires an atomic sidecar lock before reading,
-rewriting, or resuming an output directory:
+Every launcher invocation acquires a sidecar lock:
 
 ```text
 <out-dir>.launch.lock
 ```
 
-This lock is outside `--out-dir`, so `--overwrite-output` cannot delete a lock
-held by another process. If a second launcher targets the same `--out-dir`, it
-fails before data prep or TorchTitan startup and reports the lock metadata
-(`pid`, `hostname`, and creation time). The lock is removed on normal exit and
-on handled exceptions; if the process is killed with `SIGKILL` or the pod dies,
-remove the sidecar only after confirming no matching launcher is still running.
-
-## Torchrun Logs
+The lock lives outside `--out-dir`, so `--overwrite-output` cannot delete a
+lock held by another process. If the process is killed with `SIGKILL` or the
+pod dies, remove the sidecar only after confirming no matching launcher is
+still running.
 
 Each bucket-stage attempt writes torchrun stdout and stderr under:
 
@@ -521,18 +452,14 @@ Each bucket-stage attempt writes torchrun stdout and stderr under:
 $OUT_DIR/torchrun_logs/
 ```
 
-The exact per-attempt paths are also recorded in `stage_status.json` under the
-stage attempt's `logs` field, so failed stages can be debugged after the
-terminal session or pod output scrollback is gone.
+Exact per-attempt paths are recorded in `stage_status.json`.
 
-## Recorded Training Environment Inputs
+Training-affecting TorchTitan environment controls should be launcher
+arguments, not ambient pod-only overrides. The launcher records them in
+`run_spec.json`, exports them to each `torchrun` stage, and rejects resume or
+relaunch attempts that drift from the original run spec.
 
-Training-affecting TorchTitan environment controls should be set as launcher
-arguments, not as ambient pod-only overrides. The launcher records these values
-in `run_spec.json`, exports them to each `torchrun` stage, and rejects resume
-or relaunch attempts that drift from the original run spec.
-
-The currently explicit controls are:
+Current direct-to-hero controls:
 
 ```bash
 --optimizer-impl foreach \
@@ -546,43 +473,41 @@ The currently explicit controls are:
 --torch-nccl-async-error-handling 1
 ```
 
-These preset values match the existing direct-to-hero TorchTitan config path.
-Change them only in a copied preset or through an explicit one-off CLI override
-for an intentional experiment or debugging run.
+With `--validate-first-step-checkpoint`, TorchTitan writes and validates a full
+DCP checkpoint at optimizer step 1, then writes:
 
-With `--validate-first-step-checkpoint` enabled, TorchTitan writes a full DCP
-checkpoint at optimizer step 1, validates its metadata and payload files before
-retention cleanup can remove it, and writes
-`first_step_checkpoint_validation.json` under the run directory. The launcher
-requires that report after the first stage, so broken checkpoint storage fails
-early instead of only being discovered at the final export.
+```text
+first_step_checkpoint_validation.json
+```
+
+Broken checkpoint storage therefore fails after the first stage instead of at
+final export.
 
 ## Bucket Curriculum
 
-The launcher defaults to `--bucket-curriculum short-to-long`, which preserves
-the current throughput-oriented staging order: shorter non-empty sequence
-buckets train first, then progressively longer buckets. This is an explicit
-engineering choice for the TorchTitan bucketed/CP implementation, not a
-training detail specified by the SWE-ZERO to SWE-HERO paper.
+The default `--bucket-curriculum short-to-long` trains shorter non-empty
+sequence buckets first, then progressively longer buckets. This is an explicit
+engineering choice for the TorchTitan bucketed/CP implementation, not a detail
+specified by the paper.
 
-For an ablation that removes the length-bucket curriculum, launch with a single
-configured bucket and `--bucket-curriculum single-bucket`, for example
-`--buckets 131072 --bucket-cp 131072:8`. The launcher rejects
-`single-bucket` when multiple buckets are configured, so the run spec cannot
-silently claim a no-curriculum setup while using staged bucket training.
+For a no-curriculum ablation, use one configured bucket and
+`--bucket-curriculum single-bucket`, for example:
+
+```bash
+--buckets 131072 --bucket-cp 131072:8
+```
+
+The launcher rejects `single-bucket` when multiple buckets are configured.
 
 ## Profiler And Soak Runs
 
-Profiler and memory snapshot capture are disabled by default, so the
-paper-aligned direct-to-hero run does not collect traces or change the training
-schedule unless these flags are explicitly provided.
+Profiler and memory snapshots are disabled by default.
 
-Use `--max-steps` to run a bounded soak without changing the dataset,
-tokenization, loss mask, optimizer, or bucket plan. The cap applies to total
-optimizer steps across all launcher stages and is recorded in the immutable
-run spec.
+Use `--max-steps` for a bounded soak without changing dataset, tokenization,
+loss mask, optimizer, or bucket plan. The cap applies to total optimizer steps
+across launcher stages and is recorded in the immutable run spec.
 
-To collect TorchTitan profiler traces during a short soak, add flags such as:
+Short profiler soak:
 
 ```bash
 scripts/run_midtraining_pod.py train \
@@ -611,20 +536,28 @@ scripts/run_midtraining_pod.py train \
   --no-enable-fp8
 ```
 
-Profiler traces are written under the TorchTitan dump folder, normally
-`$OUT_DIR/torchtitan/profiling/traces`. CUDA memory snapshots can be captured
-with `--enable-memory-snapshot`; by default those files are written under
-`$OUT_DIR/torchtitan/profiling/memory_snapshot`.
+Profiler traces are written under:
+
+```text
+$OUT_DIR/torchtitan/profiling/traces
+```
+
+CUDA memory snapshots use `--enable-memory-snapshot` and default to:
+
+```text
+$OUT_DIR/torchtitan/profiling/memory_snapshot
+```
 
 ## Multi-Node Controls
 
-The launcher defaults to the current single-node pod contract:
-`--nnodes 1 --node-rank 0 --rdzv-backend c10d --rdzv-endpoint localhost:0`.
-That preserves the existing 8xH100 launch path and the paper-aligned 7B
-scale-study recipe.
+Default single-node contract:
+
+```bash
+--nnodes 1 --node-rank 0 --rdzv-backend c10d --rdzv-endpoint localhost:0
+```
 
 Multi-node launch is opt-in. For `--nnodes > 1`, provide a stable rendezvous
-endpoint and id, for example:
+endpoint and id:
 
 ```bash
 --nnodes 2 \
@@ -636,5 +569,4 @@ endpoint and id, for example:
 Each node must use the same run spec, dataset artifact, model assets, bucket
 plan, and rendezvous settings, with only `--node-rank` changing per node. The
 launcher rejects multi-node settings that still point at `localhost:0` or omit
-`--rdzv-id`, so a multi-node attempt cannot silently fall back to a single-node
-rendezvous.
+`--rdzv-id`.
