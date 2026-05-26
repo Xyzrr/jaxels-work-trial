@@ -1,3 +1,14 @@
+"""Tests for the OpenHands SWE-bench runtime-image prebuild launcher.
+
+The prebuild job warms Docker images before the real model eval starts. That is
+an ML-eval concern, not just infrastructure: if image builds happen during the
+pass@1 run, timing and failure modes mix Docker work with model-serving and
+agent behavior. These tests document the launcher contracts that keep image
+prebuilds reproducible, idempotent, and aligned with the exact eval preset.
+"""
+
+from __future__ import annotations
+
 import py_compile
 import subprocess
 import sys
@@ -10,11 +21,15 @@ COMMON = REPO_ROOT / "scripts" / "pod_startup_common.py"
 
 
 class TestOpenHandsImagePrebuildPodLauncher:
-    def test_launcher_python_syntax_is_valid(self):
+    """Document prebuild behavior without starting Docker or OpenHands."""
+
+    def test_launcher_python_syntax_is_valid(self) -> None:
         py_compile.compile(str(SCRIPT), doraise=True)
         py_compile.compile(str(COMMON), doraise=True)
 
-    def test_launcher_rejects_nonpositive_parallel_builds_before_pod_checks(self):
+    def test_launcher_rejects_nonpositive_parallel_builds_before_pod_checks(
+        self,
+    ) -> None:
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "--foreground", "--parallel-builds", "0"],
             capture_output=True,
@@ -25,7 +40,7 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert result.returncode != 0
         assert "--parallel-builds must be positive" in result.stderr
 
-    def test_launcher_rejects_replace_session_in_foreground_mode(self):
+    def test_launcher_rejects_replace_session_in_foreground_mode(self) -> None:
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "--foreground", "--replace-session"],
             capture_output=True,
@@ -36,9 +51,14 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert result.returncode != 0
         assert "--replace-session only applies" in result.stderr
 
-    def test_launcher_uses_tmux_and_attaches_to_existing_session_by_default(self):
+    def test_launcher_uses_tmux_and_attaches_to_existing_session_by_default(
+        self,
+    ) -> None:
         script = SCRIPT.read_text()
 
+        # Prebuilds can take long enough to outlive the local SSH/session that
+        # kicked them off. tmux keeps Docker image builds running in the pod and
+        # lets a second invocation reconnect instead of duplicating work.
         assert 'self.tmux_session = "openhands-swebench-image-prebuild"' in script
         assert '"tmux", "has-session", "-t", self.tmux_session' in script
         assert "tmux session already exists: {self.tmux_session}" in script
@@ -53,9 +73,12 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert "exec > >(tee -a {shell_quote(self.tmux_log_path)}) 2>&1" in script
         assert "$command 2>&1 | tee" not in script
 
-    def test_launcher_can_replace_existing_tmux_session(self):
+    def test_launcher_can_replace_existing_tmux_session(self) -> None:
         script = SCRIPT.read_text()
 
+        # Replacing a prebuild session is intentionally explicit. Killing an
+        # active Docker build can leave child processes around, so the launcher
+        # has dedicated cleanup paths for supervised and foreground modes.
         assert '"--replace-session"' in script
         assert "self.replace_session = False" in script
         assert "replacing tmux session: {self.tmux_session}" in script
@@ -64,9 +87,13 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert "terminating foreground prebuild process groups" in script
         assert "--replace-session only applies to tmux-supervised launches" in script
 
-    def test_launcher_stores_and_compares_tmux_launch_context(self):
+    def test_launcher_stores_and_compares_tmux_launch_context(self) -> None:
         script = SCRIPT.read_text()
 
+        # A tmux session name alone is not enough to prove that an existing
+        # prebuild matches the requested eval. The stored context records the
+        # preset, dataset, OpenHands checkout, and requested parallelism so reruns
+        # attach only to compatible work.
         assert 'f"{self.tmux_session}.context.json"' in script
         assert "def write_tmux_context" in script
         assert "def compare_tmux_context" in script
@@ -89,12 +116,15 @@ class TestOpenHandsImagePrebuildPodLauncher:
             "pod_startup_common.prepare_pod_checkout"
         ) < launch_block.index("self.write_tmux_context(script_path, command)")
 
-    def test_launcher_context_compares_normalized_fields(self):
+    def test_launcher_context_compares_normalized_fields(self) -> None:
         script = SCRIPT.read_text()
         context_helper = script[
             script.index("def build_context") : script.index("def write_tmux_context")
         ]
 
+        # The comparable context should include ML/eval identity fields but avoid
+        # unstable or secret fields. That makes idempotence checks meaningful
+        # across reruns without leaking API keys into context files.
         assert '"kind": "openhands_swebench_image_prebuild"' in context_helper
         assert '"requested": {' in context_helper
         assert '"parallel_builds": self.parallel_builds' in context_helper
@@ -104,9 +134,12 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert '"foreground_command": foreground_command' in context_helper
         assert "LLM_API_KEY" not in context_helper
 
-    def test_existing_session_without_matching_context_fails_clearly(self):
+    def test_existing_session_without_matching_context_fails_clearly(self) -> None:
         script = SCRIPT.read_text()
 
+        # Attaching to a mismatched prebuild would make the operator believe the
+        # right eval images are warming when the session is actually for a
+        # different dataset, preset, or OpenHands revision.
         assert "launch context is missing" in script
         assert "different launch context" in script
         assert (
@@ -116,9 +149,12 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert "foreground prebuild process already exists" in script
         assert "ensure_no_foreground_prebuild" in script
 
-    def test_foreground_worker_cleans_up_child_process_group(self):
+    def test_foreground_worker_cleans_up_child_process_group(self) -> None:
         script = SCRIPT.read_text()
 
+        # Docker runtime builds spawn subprocesses. The foreground supervisor
+        # uses a separate process group so cancellation can stop the whole build
+        # tree rather than leaving stale image-build work in the pod.
         assert "--foreground-worker" in script
         assert "def run_supervised_foreground_worker" in script
         assert "subprocess.Popen(" in script
@@ -130,10 +166,13 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert "foreground prebuild received termination" in script
         assert '"--foreground-worker" not in tokens' in script
 
-    def test_launcher_is_pod_only_and_enforces_pod_git_checkout(self):
+    def test_launcher_is_pod_only_and_enforces_pod_git_checkout(self) -> None:
         script = SCRIPT.read_text()
         common = COMMON.read_text()
 
+        # Runtime-image selection depends on the OpenHands and SWE-bench code in
+        # the pod checkout. The git guard ensures the prebuild uses a pushed,
+        # reviewable branch rather than local workstation-only files.
         assert "pod_startup_common.require_pod_runtime" in script
         assert "this launcher is pod-only" in common
         assert 'Path("/workspace").is_dir()' in common
@@ -141,9 +180,14 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert "pod_startup_common.prepare_pod_checkout" in script
         assert "SWEHERO_POD_GIT_BRANCH" in script
 
-    def test_launcher_derives_images_from_eval_preset_and_openhands_code(self):
+    def test_launcher_derives_images_from_eval_preset_and_openhands_code(
+        self,
+    ) -> None:
         script = SCRIPT.read_text()
 
+        # Image tags must come from the same eval preset and OpenHands checkout
+        # that the model eval will use. Otherwise the cache could be warm for a
+        # different dataset split, task environment, or runtime layer.
         assert "from scripts import openhands_swebench_eval as eval_script" in script
         assert '"EVAL_STACK": args.eval_stack' in script
         assert '"DATASET": args.dataset' in script
@@ -158,9 +202,12 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert "from openhands import __version__ as openhands_version" in script
         assert "from openhands.version import get_version" not in script
 
-    def test_launcher_supports_swe_lego_vendored_openhands_checkout(self):
+    def test_launcher_supports_swe_lego_vendored_openhands_checkout(self) -> None:
         script = SCRIPT.read_text()
 
+        # SWE-Lego vendors its own OpenHands and SWE-bench revisions. The
+        # prebuild launcher has to honor that checkout so image generation
+        # matches SWE-Lego's grader rather than the current upstream stack.
         assert '"SWE_LEGO_REPO": args.swe_lego_repo' in script
         assert '"SWE_LEGO_REF": args.swe_lego_ref' in script
         assert (
@@ -178,9 +225,12 @@ class TestOpenHandsImagePrebuildPodLauncher:
             in script
         )
 
-    def test_launcher_parallelizes_missing_runtime_image_builds(self):
+    def test_launcher_parallelizes_missing_runtime_image_builds(self) -> None:
         script = SCRIPT.read_text()
 
+        # Building task runtime images is independent across image tags, so the
+        # launcher can parallelize missing builds. The default stays conservative
+        # because Docker builds compete for disk, network, and CPU on the pod.
         assert "self.parallel_builds = 4" in script
         assert '"--parallel-builds"' in script
         assert '"--parallel-builds"' in script
@@ -191,9 +241,12 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert "ThreadPoolExecutor(max_workers=active_workers)" in script
         assert "executor.submit(build_runtime_job, job)" in script
 
-    def test_launcher_skips_exact_local_runtime_image_before_building(self):
+    def test_launcher_skips_exact_local_runtime_image_before_building(self) -> None:
         script = SCRIPT.read_text()
 
+        # A local Docker tag derived from the SWE-bench base image and OpenHands
+        # source hash is the idempotence boundary. If that exact tag exists, the
+        # eval will use the same runtime layer and rebuilding is unnecessary.
         assert "target_image = runtime_target_image(base_image, source_hash)" in script
         assert "if local_image_exists(probe_client, target_image):" in script
         assert 'if local_image_exists(client, job["target_image"]):' in script
@@ -202,9 +255,12 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert "build_runtime_image(" in script
         assert 'if image_name != job["target_image"]:' in script
 
-    def test_launcher_keeps_cli_surface_deduplicated(self):
+    def test_launcher_keeps_cli_surface_deduplicated(self) -> None:
         script = SCRIPT.read_text()
 
+        # The prebuild CLI exposes only prebuild concerns plus the shared eval
+        # preset path. It should not grow duplicate model, context, or grader
+        # flags that would drift from the real eval launcher.
         assert '"--config"' in script
         assert '"--eval-limit"' in script
         assert '"--parallel-builds"' in script
@@ -212,9 +268,12 @@ class TestOpenHandsImagePrebuildPodLauncher:
         assert '"--replace-session"' in script
         assert "-h|--help" not in script
 
-    def test_docs_explain_concise_usage_and_idempotence(self):
+    def test_docs_explain_concise_usage_and_idempotence(self) -> None:
         doc = DOC.read_text()
 
+        # The docs need to tell operators how reruns behave, since the safest
+        # normal action is to attach to compatible work instead of starting a new
+        # image-build run with a different context.
         assert "scripts/run_midtraining_pod.py prebuild" in doc
         assert "openhands-swebench-image-prebuild" in doc
         assert "rerun attaches" in doc
