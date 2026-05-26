@@ -61,5 +61,8 @@ Ship the prototype quickly. Skip post-task full validation, parent-branch merges
 - Use argparse `@preset` files for experiment and reproducibility settings. Paper-faithful recipes belong in swappable preset files under `configs/`.
 - Reserve environment variables for secrets, credentials, pod/runtime plumbing, and process supervision. Do not use them for experiment settings such as model, dataset, context, optimizer, eval harness, vLLM sizing, or sampling.
 - Avoid aliases and convenience synonyms. Prefer primitive flags such as `--eval-limit 1` over named smoke/full shortcuts.
+- In general, a specific behavioral knob should only be controlled by a single setting.
+  Exceptions are allowed, but be extremely wary about implementing multiple settings that control the same thing.
+  Not only do they bloat the API surface, they also introduce conflict risk.
 - When changing training or eval config, update the workflow docs with the canonical preset-based command and preserve runnable behavior through preset contents or explicit CLI flags.
 - Existing names such as `SWEHERO_POD_GIT_BRANCH` are legacy compatibility names. Use neutral names for new shared controls.
